@@ -114,8 +114,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
         self._lwd_first_token_seen: set[str] = set()
         # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):
-        # 批内全部请求收到首 token 即整条移除;abort 时按请求摘除,
-        # 摘空即移除。云侧 pending_notify 的边侧本地镜像,免协议改动。
+        # 批内全部请求收到首 token 即整条移除;abort/finish 时按请求摘除,
+        # 摘空即移除(finish 摘除是死锁修复:_lwd_first_token_seen 完结即
+        # 移出,不摘除会让"短请求先完结"的批条目永不清除,pending 攒满
+        # 上限即永卡闸门)。云侧 pending_notify 的边侧本地镜像,免协议改动。
         self._lwd_batch_requests: dict[int, list[str]] = {}
         # pending 闸门状态(仅作开/关转换日志用)
         self._lwd_prefill_gate_held: bool = False
@@ -751,6 +753,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if finished:
             del self._lwd_awaiting[request_id]
             self._lwd_first_token_seen.discard(request_id)
+            # 死锁根因修复:完结请求必须像 abort 一样从批台账摘除。批清除
+            # 判据 all(rid in seen) 要求 seen 只增不减,而上一行的 discard
+            # 让完结请求永久缺席——同批"短请求先完结、长请求首 token 后到"
+            # 时该 seqno 条目永不清除;泄漏条目攒到 _LWD_MAX_PENDING_CHUNKS
+            # 个,prefill gate 永卡 HOLD,边侧停发新 chunk、云侧 mid-prefill
+            # 空转刷 c2e_meta=None(真机实录:bench 泄漏 8 条后全局死锁,
+            # 单请求/无 MTP 时序不踩中故难复现)。
+            for seqno, rids in list(self._lwd_batch_requests.items()):
+                if request_id not in rids:
+                    continue
+                remaining = [rid for rid in rids if rid != request_id]
+                if remaining and not all(
+                    rid in self._lwd_first_token_seen for rid in remaining
+                ):
+                    self._lwd_batch_requests[seqno] = remaining
+                else:
+                    del self._lwd_batch_requests[seqno]
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,
