@@ -2051,10 +2051,15 @@ class EngineArgs:
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
-        lwd_config = resolve_lwd_config(
-            self.additional_config,
-            api=LwdAPIConfig.from_namespace(self, headless=headless),
-        )
+        lwd_config = None
+        lwd_api = LwdAPIConfig.from_namespace(self, headless=headless)
+        if (
+            isinstance(self.additional_config, dict)
+            and "lwd_config" in self.additional_config
+        ):
+            lwd_config = resolve_lwd_config(self.additional_config, api=lwd_api)
+        else:
+            lwd_api.validate_topology(None)
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))

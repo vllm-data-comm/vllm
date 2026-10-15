@@ -1265,7 +1265,11 @@ class VllmConfig:
         self.instance_id = f"{time.time_ns()}"
 
         # EngineArgs supplies a complete snapshot; direct callers can use raw input.
-        if self.lwd_config is None:
+        if (
+            isinstance(self.additional_config, dict)
+            and "lwd_config" in self.additional_config
+            and self.lwd_config is None
+        ):
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
             log_lwd_config(logger, self.lwd_config)

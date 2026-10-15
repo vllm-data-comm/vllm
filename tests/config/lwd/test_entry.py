@@ -2,14 +2,123 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import ast
 import copy
 import pickle
+import time
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from lwd_config_under_test import LwdAPIConfig, resolve_lwd_config
 
 FIXTURE_NAME = "s3_cloud_share_2dp.yaml"
+StartupEntry = tuple[Callable[[], None], SimpleNamespace, Mock]
+
+
+@pytest.fixture(
+    params=[
+        ("config/vllm.py", "VllmConfig", "__post_init__"),
+        ("engine/arg_utils.py", "EngineArgs", "create_engine_config"),
+    ],
+    ids=["VllmConfig", "EngineArgs"],
+)
+def startup_entry(
+    request: pytest.FixtureRequest,
+) -> StartupEntry:
+    path, class_name, method_name = request.param
+    source = Path(__file__).resolve().parents[3] / "vllm" / path
+    cls = next(
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    # Execute the real entry method, stopping before unrelated model/device setup.
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(method)
+    stop = Mock(side_effect=StopIteration)
+    resolver = Mock(wraps=resolve_lwd_config)
+    scope = {
+        "time": time,
+        "logger": Mock(),
+        "log_lwd_config": Mock(),
+        "resolve_lwd_config": resolver,
+        "LwdAPIConfig": LwdAPIConfig,
+        "current_platform": SimpleNamespace(pre_register_and_update=stop),
+    }
+    exec(compile(module, str(source), "exec"), scope)
+    args = SimpleNamespace(
+        additional_config={}, lwd_config=None, _resolve_mm_encoder_only=stop
+    )
+
+    def run() -> None:
+        with pytest.raises(StopIteration):
+            scope[method_name](args)
+
+    return run, args, resolver
+
+
+@pytest.mark.parametrize("raw", [{}, {"enable_cpu_binding": True}, object()])
+def test_centralized_startup_does_not_call_lwd_parser(
+    startup_entry: StartupEntry, raw: object
+) -> None:
+    run, args, resolver = startup_entry
+    args.additional_config = raw
+    run()
+    assert args.lwd_config is None
+    resolver.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["edge", "cloud"])
+def test_explicit_lwd_startup_loads_selected_role(
+    startup_entry: StartupEntry, role: str, lwd_yaml_dir: Path, tmp_path: Path
+) -> None:
+    run, args, resolver = startup_entry
+    path = tmp_path / "topology.yaml"
+    path.write_bytes((lwd_yaml_dir / "s1_single_instance_1dp.yaml").read_bytes())
+    args.additional_config = {
+        "lwd_config": {"path": str(path), "role": role, "instance_id": 0}
+    }
+    run()
+    resolver.assert_called_once()
+    if args.lwd_config is not None:
+        snapshot = args.lwd_config
+        assert snapshot.role == role
+        path.unlink()
+        run()
+        assert args.lwd_config is snapshot
+        resolver.assert_called_once()
+
+
+@pytest.mark.parametrize("entry", [None, {}])
+def test_explicit_invalid_lwd_startup_is_not_treated_as_centralized(
+    startup_entry: StartupEntry, entry: object
+) -> None:
+    run, args, resolver = startup_entry
+    args.additional_config = {"lwd_config": entry}
+    with pytest.raises(ValueError):
+        run()
+    resolver.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "startup_entry",
+    [("engine/arg_utils.py", "EngineArgs", "create_engine_config")],
+    indirect=True,
+)
+def test_api_attachment_without_lwd_still_fails(startup_entry: StartupEntry) -> None:
+    run, args, resolver = startup_entry
+    args.api_server_attach = "10.0.0.1:25100"
+    with pytest.raises(ValueError, match="require lwd_config.path"):
+        run()
+    resolver.assert_not_called()
 
 
 def test_snapshot_survives_handoff_without_yaml_or_key_access(
