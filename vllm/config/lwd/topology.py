@@ -31,7 +31,7 @@ LwdString = Annotated[StrictStr, Field(pattern=r"\S")]
 def _address(value: str) -> str:
     address = ip_address(value)
     if address.is_unspecified or address.is_multicast:
-        raise ValueError("[LWD] addr must be a unicast endpoint IP")
+        raise ValueError("addr must be a unicast endpoint IP")
     return str(address)
 
 
@@ -45,9 +45,9 @@ class _UniqueKeyLoader(yaml.SafeLoader):
         for key_node, value_node in node.value:
             key = self.construct_object(key_node, deep=deep)
             if not isinstance(key, str):
-                raise ValueError("[LWD] YAML mapping keys must be strings")
+                raise ValueError("YAML mapping keys must be strings")
             if key in result:
-                raise ValueError(f"[LWD] duplicate YAML key: {key!r}")
+                raise ValueError(f"duplicate YAML key: {key!r}")
             result[key] = self.construct_object(value_node, deep=deep)
         return result
 
@@ -90,7 +90,7 @@ class LwdCoordination:
         if value is not None:
             url = urlsplit(value)
             if url.scheme not in ("http", "https") or not url.hostname:
-                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+                raise ValueError("control_url must be an HTTP(S) endpoint")
         return value
 
 
@@ -113,7 +113,7 @@ class LwdInstance:
     def order_dps(cls, dps: tuple[LwdDP, ...]) -> tuple[LwdDP, ...]:
         dps = tuple(sorted(dps, key=lambda dp: dp.dp_idx))
         if [dp.dp_idx for dp in dps] != list(range(len(dps))):
-            raise ValueError("[LWD] dp_idx must be unique and contiguous from 0")
+            raise ValueError("dp_idx must be unique and contiguous from 0")
         return dps
 
 
@@ -158,7 +158,7 @@ class LwdTopology:
             object.__setattr__(topology, "digest", sha256(file_bytes).hexdigest()[:16])
             return topology
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
-            raise ValueError(f"[LWD] Invalid topology file {path!r}: {exc}") from exc
+            raise ValueError(f"Invalid topology file {path!r}: {exc}") from exc
 
     @classmethod
     def from_dict(cls, raw: Any) -> "LwdTopology":
@@ -173,7 +173,7 @@ class LwdTopology:
     ) -> tuple[LwdInstance, ...]:
         instances = tuple(sorted(instances, key=lambda instance: instance.id))
         if [instance.id for instance in instances] != list(range(len(instances))):
-            raise ValueError("[LWD] Instance IDs must be unique and contiguous from 0")
+            raise ValueError("Instance IDs must be unique and contiguous from 0")
         return instances
 
     def validate_layout(self) -> None:
@@ -183,26 +183,26 @@ class LwdTopology:
             len(self.clouds),
         ):
             raise ValueError(
-                "[LWD] deployment instance counts do not match edges/clouds"
+                "deployment instance counts do not match edges/clouds"
             )
         if len(set(self.instance_links)) != len(self.instance_links):
-            raise ValueError("[LWD] duplicate instance link")
+            raise ValueError("duplicate instance link")
         if any(
             link.edge >= len(self.edges) or link.cloud >= len(self.clouds)
             for link in self.instance_links
         ):
-            raise ValueError("[LWD] instance_links: unknown edge/cloud instance")
+            raise ValueError("instance_links: unknown edge/cloud instance")
         for instances, cloud in ((self.edges, False), (self.clouds, True)):
             if any(
                 (dp.ctrl_port is not None) != cloud for i in instances for dp in i.dp
             ):
                 raise ValueError(
-                    "[LWD] ctrl_port is required on clouds and omitted on edges"
+                    "ctrl_port is required on clouds and omitted on edges"
                 )
         self._validate_scene()
         if len({len(instance.dp) for instance in (*self.edges, *self.clouds)}) != 1:
             raise ValueError(
-                "[LWD] Instances must have matching DP indices and the same DP count"
+                "Instances must have matching DP indices and the same DP count"
             )
         self._validate_ranks()
         self._validate_control_ports()
@@ -211,19 +211,19 @@ class LwdTopology:
         for edge in self.edges:
             if len({(dp.addr, dp.ranks) for dp in edge.dp}) != 1:
                 raise ValueError(
-                    "[LWD] Edge DPs must share their instance's ranks/address"
+                    "Edge DPs must share their instance's ranks/address"
                 )
         for cloud in self.clouds:
             if len({len(dp.ranks) for dp in cloud.dp}) != 1:
                 raise ValueError(
-                    "[LWD] Cloud instance must split its ranks equally among DPs"
+                    "Cloud instance must split its ranks equally among DPs"
                 )
         # Edge DPs reuse an allocation; edge_share also reuses it across instances.
         edges = self.edges
         if self.deployment.scene == "edge_share":
             if len({(edge.dp[0].addr, edge.dp[0].ranks) for edge in edges}) != 1:
                 raise ValueError(
-                    "[LWD] edge_share instances must share edge ranks/address"
+                    "edge_share instances must share edge ranks/address"
                 )
             edges = edges[:1]
         allocations = [edge.dp[0] for edge in edges]
@@ -232,13 +232,13 @@ class LwdTopology:
         for dp in allocations:
             if len(set(dp.ranks)) != len(dp.ranks) or ranks.intersection(dp.ranks):
                 raise ValueError(
-                    "[LWD] Separate allocations require distinct ranks; "
+                    "Separate allocations require distinct ranks; "
                     "duplicate or overlapping ranks"
                 )
             ranks.update(dp.ranks)
         if ranks != set(range(self.deployment.hccl_world_size)):
             raise ValueError(
-                "[LWD] Unique ranks must cover [0, hccl_world_size) without gaps"
+                "Unique ranks must cover [0, hccl_world_size) without gaps"
             )
 
     def _validate_control_ports(self) -> None:
@@ -249,17 +249,17 @@ class LwdTopology:
             for dp in dps:
                 if ports.setdefault(dp.dp_idx, dp.ctrl_port) != dp.ctrl_port:
                     raise ValueError(
-                        "[LWD] edge_share requires the same ctrl_port for "
+                        "edge_share requires the same ctrl_port for "
                         "the same DP across all cloud instances"
                     )
             if len(set(ports.values())) != len(ports):
                 raise ValueError(
-                    "[LWD] edge_share requires different ctrl_port values per DP"
+                    "edge_share requires different ctrl_port values per DP"
                 )
             return
         if len({(dp.addr, dp.ctrl_port) for dp in dps}) != len(dps):
             raise ValueError(
-                "[LWD] Cloud DPs on the same address must use "
+                "Cloud DPs on the same address must use "
                 "different ctrl_port values"
             )
 
@@ -268,48 +268,48 @@ class LwdTopology:
         scene = self.deployment.scene
         edge_count, cloud_count = len(self.edges), len(self.clouds)
         if scene == "single_instance" and (edge_count, cloud_count) != (1, 1):
-            raise ValueError("[LWD] single_instance requires one edge and one cloud")
+            raise ValueError("single_instance requires one edge and one cloud")
         if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
-            raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
+            raise ValueError("cloud_share requires multiple edges and one cloud")
         if scene == "lwd_cluster" and (edge_count < 2 or cloud_count < 2):
-            raise ValueError("[LWD] lwd_cluster requires multiple edges and clouds")
+            raise ValueError("lwd_cluster requires multiple edges and clouds")
         # coordination only exists for cloud_share, embedded in each instance
         if scene == "cloud_share":
             for edge in self.edges:
                 if edge.coordination is None or not edge.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each edge instance to have "
+                        "cloud_share requires each edge instance to have "
                         "an enabled coordination block"
                     )
             for cloud in self.clouds:
                 if cloud.coordination is None or not cloud.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each cloud instance to have "
+                        "cloud_share requires each cloud instance to have "
                         "an enabled coordination block"
                     )
         else:
             for instance in (*self.edges, *self.clouds):
                 if instance.coordination is not None:
                     raise ValueError(
-                        f"[LWD] coordination is only allowed in cloud_share scene, "
+                        f"coordination is only allowed in cloud_share scene, "
                         f"got scene={scene}"
                     )
         if scene == "edge_share":
             if edge_count != cloud_count or cloud_count < 2:
                 raise ValueError(
-                    "[LWD] edge_share requires equal multiple edge/cloud IDs"
+                    "edge_share requires equal multiple edge/cloud IDs"
                 )
             if (
                 len(self.instance_links) != edge_count
                 or len({link.edge for link in self.instance_links}) != edge_count
                 or len({link.cloud for link in self.instance_links}) != cloud_count
             ):
-                raise ValueError("[LWD] edge_share requires one-to-one instance links")
+                raise ValueError("edge_share requires one-to-one instance links")
         elif set(self.instance_links) != {
             LwdLink(edge.id, cloud.id) for edge in self.edges for cloud in self.clouds
         }:
             raise ValueError(
-                "[LWD] Scene requires full-mesh instance_links; "
+                "Scene requires full-mesh instance_links; "
                 "missing pair or isolated instance"
             )
 
@@ -337,11 +337,11 @@ class LwdTopology:
 
     def instance(self, role: str, instance_id: int) -> LwdInstance:
         if role not in ("edge", "cloud"):
-            raise ValueError("[LWD] role must be 'edge' or 'cloud'")
+            raise ValueError("role must be 'edge' or 'cloud'")
         instances = self.edges if role == "edge" else self.clouds
         for instance in instances:
             if instance.id == instance_id:
                 return instance
         raise ValueError(
-            f"[LWD] Instance not found: role={role}, instance_id={instance_id}"
+            f"Instance not found: role={role}, instance_id={instance_id}"
         )

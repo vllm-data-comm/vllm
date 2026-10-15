@@ -15,22 +15,22 @@ def _endpoint(value: str | None, flag: str) -> None:
     if value is None:
         return
     if not isinstance(value, str):
-        raise ValueError(f"[LWD] {flag} requires IP:port")
+        raise ValueError(f"{flag} requires IP:port")
     host, sep, port = value.rpartition(":")
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
     elif ":" in host:
-        raise ValueError(f"[LWD] {flag}: IPv6 must use [IP]:port")
+        raise ValueError(f"{flag}: IPv6 must use [IP]:port")
     if not sep or not port.isascii() or not port.isdecimal():
-        raise ValueError(f"[LWD] {flag} requires IP:port")
+        raise ValueError(f"{flag} requires IP:port")
     if not 1 <= int(port) <= 65535:
-        raise ValueError(f"[LWD] {flag}: port must be in [1, 65535]")
+        raise ValueError(f"{flag}: port must be in [1, 65535]")
     try:
         addr = ip_address(host)
     except ValueError as exc:
-        raise ValueError(f"[LWD] {flag}: invalid IP {host!r}") from exc
+        raise ValueError(f"{flag}: invalid IP {host!r}") from exc
     if addr.is_unspecified or addr.is_multicast:
-        raise ValueError(f"[LWD] {flag}: use a concrete unicast IP")
+        raise ValueError(f"{flag}: use a concrete unicast IP")
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class LwdAPIConfig:
         if requested and (
             headless or getattr(args, "headless", False) or getattr(args, "grpc", False)
         ):
-            raise ValueError("[LWD] API options require the HTTP frontend")
+            raise ValueError("API options require the HTTP frontend")
 
     @classmethod
     def from_namespace(cls, args: Any, *, headless: bool = False) -> "LwdAPIConfig":
@@ -85,18 +85,18 @@ class LwdAPIConfig:
             return
         if self.api_server_rpc_port is not None and self.api_server_attach is not None:
             raise ValueError(
-                "[LWD] --api-server-rpc-port and --api-server-attach "
+                "--api-server-rpc-port and --api-server-attach "
                 "are mutually exclusive"
             )
         _endpoint(self.api_server_rpc_port, "--api-server-rpc-port")
         _endpoint(self.api_server_attach, "--api-server-attach")
         if lwd is None:
-            raise ValueError("[LWD] API options require lwd_config.path")
+            raise ValueError("API options require lwd_config.path")
         if lwd.role != "edge":
-            raise ValueError("[LWD] API options apply to edge instances only")
+            raise ValueError("API options apply to edge instances only")
         if self.api_server_rpc_port is not None and lwd.instance_id != 0:
-            raise ValueError("[LWD] --api-server-rpc-port requires edge instance_id=0")
+            raise ValueError("--api-server-rpc-port requires edge instance_id=0")
         if self.api_server_attach is not None and lwd.instance_id == 0:
-            raise ValueError("[LWD] --api-server-attach requires a non-primary edge")
+            raise ValueError("--api-server-attach requires a non-primary edge")
         if lwd.topology.deployment.scene != "edge_share":
-            raise ValueError("[LWD] API attachment metadata requires scene=edge_share")
+            raise ValueError("API attachment metadata requires scene=edge_share")

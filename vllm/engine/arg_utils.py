@@ -85,6 +85,7 @@ from vllm.config.kernel import (
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
+from vllm.lwd_logger import lwd_logger
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
     ConvertOption,
@@ -2057,7 +2058,11 @@ class EngineArgs:
             isinstance(self.additional_config, dict)
             and "lwd_config" in self.additional_config
         ):
-            lwd_config = resolve_lwd_config(self.additional_config, api=lwd_api)
+            try:
+                lwd_config = resolve_lwd_config(self.additional_config, api=lwd_api)
+            except ValueError as exc:
+                lwd_logger.error("%s", exc)
+                raise SystemExit(1) from None
         else:
             lwd_api.validate_topology(None)
         current_platform.pre_register_and_update()
