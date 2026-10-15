@@ -29,11 +29,11 @@ def resolve_lwd_config(
     if not isinstance(additional_config, dict):
         additional_config = {}
     if "edge_cloud_config" in additional_config:
-        raise ValueError("[LWD] edge_cloud_config is retired; use lwd_config.path")
+        raise ValueError("edge_cloud_config is retired; use lwd_config.path")
     if "lwd_coordination" in additional_config:
         raise ValueError(
-            "[LWD] Top-level lwd_coordination is retired; "
-            "move it into lwd_config.coordination"
+            "Top-level lwd_coordination is retired; "
+            "it is now generated inside the topology yaml by gen_lwd_topology.py"
         )
     lwd = (
         LwdConfig.from_dict(additional_config["lwd_config"], api=api)
