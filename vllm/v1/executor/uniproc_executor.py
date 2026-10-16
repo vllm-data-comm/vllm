@@ -76,7 +76,11 @@ class UniProcExecutor(Executor):
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
-        if aiter_requires_tcp_store():
+        if self.vllm_config.lwd_config is not None:
+            from vllm.distributed.lwd import get_lwd_init_method
+
+            distributed_init_method = get_lwd_init_method(self.vllm_config.lwd_config)
+        elif aiter_requires_tcp_store():
             distributed_init_method = get_distributed_init_method(
                 get_ip(), get_open_port()
             )

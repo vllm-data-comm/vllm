@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,19 @@ from sample_topologies import PAYLOADS, topology_payload
 
 def cloud_reuse(dp: int = 2) -> dict:
     return topology_payload(f"s3_cloud_share_{dp}dp.yaml")
+
+
+def test_multicard_single_instance_has_the_same_key_at_both_ends() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    raw["edges"][0]["dp"][0]["ranks"] = [8, 0]
+    raw["clouds"][0]["dp"][0]["ranks"] = [7, 6, 5, 4, 3, 2, 1]
+    topology = LwdTopology.from_dict(raw)
+    edge = topology.connections("edge", 0)[0]
+    cloud = topology.connections("cloud", 0)[0]
+    assert edge.key == cloud.key
+    assert asdict(edge.key) == {"edge_id": 0, "cloud_id": 0, "dp_idx": 0}
+    assert edge.edge.ranks == (8, 0)
+    assert edge.cloud_leader_rank == 7
 
 
 @pytest.mark.parametrize("name", sorted(PAYLOADS))

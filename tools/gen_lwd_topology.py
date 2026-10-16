@@ -231,7 +231,9 @@ def main() -> None:
     parser.add_argument(
         "--control-url",
         default=None,
-        help="cloud_share only: edge->cloud control service URL; auto-derived if omitted",
+        help=(
+            "cloud_share only: edge->cloud control service URL; auto-derived if omitted"
+        ),
     )
     parser.add_argument(
         "--connect-timeout",

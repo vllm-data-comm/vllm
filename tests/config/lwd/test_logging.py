@@ -18,8 +18,12 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
 ) -> None:
     raw = topology_payload("s3_cloud_share_1dp.yaml")
     raw["feature_ctrl"] = {"enable_early_recv": True, "enable_scramble": True}
+    raw["control_plane"] = {
+        "send_queue_max": 17,
+        "hello_retry_interval_s": 1.5,
+        "handshake_timeout_s": 90.0,
+    }
     path = tmp_path / "topology.yaml"
-    path.write_text(yaml.safe_dump(raw))
     key = tmp_path / "tenant.key"
     key.write_text("local-key-content-must-not-be-logged")
     coordination: dict[str, Any] = {"enabled": True}
@@ -32,12 +36,15 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
         )
     else:
         coordination.update(listen_host="0.0.0.0", listen_port=9133)
+    raw["edges" if role == "edge" else "clouds"][identity]["coordination"] = (
+        coordination
+    )
+    path.write_text(yaml.safe_dump(raw))
     config = LwdConfig.from_dict(
         {
             "path": str(path),
             "role": role,
             "instance_id": identity,
-            "coordination": coordination,
         }
     )
     path.unlink()
@@ -58,6 +65,17 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     for edge in raw["edges"]:
         for dp in edge["dp"]:
             dp["ctrl_port"] = None  # Parsed edge DPs retain this unset default.
+    for instance in raw["edges"] + raw["clouds"]:
+        instance["coordination"] = {
+            "enabled": False,
+            "control_url": None,
+            "tenant_key_file": None,
+            "consumer_id": None,
+            "listen_host": "0.0.0.0",
+            "listen_port": 8100,
+            "connect_timeout": 10.0,
+            **instance["coordination"],
+        }
     assert topology == raw  # Includes all peers, ranks, ports, features and links.
     parsed = actual["coordination"]
     assert all(parsed[name] == value for name, value in coordination.items())

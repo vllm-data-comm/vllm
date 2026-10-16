@@ -11,9 +11,11 @@ def _instance(
     address: str,
     ranks: list[list[int]],
     ports: list[int] | None = None,
+    coordination: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": identity,
+        **({"coordination": coordination} if coordination is not None else {}),
         "dp": [
             {
                 "dp_idx": index,
@@ -49,6 +51,14 @@ def _payload(
 
 
 # Only repeated field names are assembled; ranks, ports and links stay explicit.
+EDGE_COORDINATION = {
+    "enabled": True,
+    "control_url": "http://10.1.0.1:8100/v1/chat/completions",
+    "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
+    "connect_timeout": 5.0,
+}
+CLOUD_COORDINATION = {"enabled": True, "listen_host": "0.0.0.0", "listen_port": 8100}
+
 PAYLOADS: dict[str, dict[str, Any]] = {
     "s1_single_instance_1dp.yaml": _payload(
         "single_instance",
@@ -102,11 +112,23 @@ PAYLOADS: dict[str, dict[str, Any]] = {
         "cloud_share",
         10,
         [
-            _instance(0, "10.0.0.1", [[0]]),
-            _instance(1, "10.0.0.2", [[1]]),
+            _instance(
+                0,
+                "10.0.0.1",
+                [[0]],
+                coordination={**EDGE_COORDINATION, "consumer_id": "edge0"},
+            ),
+            _instance(
+                1,
+                "10.0.0.2",
+                [[1]],
+                coordination={**EDGE_COORDINATION, "consumer_id": "edge1"},
+            ),
         ],
         [
-            _instance(0, "10.1.0.1", [[2, 3, 4, 5, 6, 7, 8, 9]], [5550]),
+            _instance(
+                0, "10.1.0.1", [[2, 3, 4, 5, 6, 7, 8, 9]], [5550], CLOUD_COORDINATION
+            ),
         ],
         [(0, 0), (1, 0)],
     ),
@@ -114,11 +136,27 @@ PAYLOADS: dict[str, dict[str, Any]] = {
         "cloud_share",
         10,
         [
-            _instance(0, "10.0.0.1", [[0], [0]]),
-            _instance(1, "10.0.0.2", [[1], [1]]),
+            _instance(
+                0,
+                "10.0.0.1",
+                [[0], [0]],
+                coordination={**EDGE_COORDINATION, "consumer_id": "edge0"},
+            ),
+            _instance(
+                1,
+                "10.0.0.2",
+                [[1], [1]],
+                coordination={**EDGE_COORDINATION, "consumer_id": "edge1"},
+            ),
         ],
         [
-            _instance(0, "10.1.0.1", [[2, 3, 4, 5], [6, 7, 8, 9]], [5550, 5551]),
+            _instance(
+                0,
+                "10.1.0.1",
+                [[2, 3, 4, 5], [6, 7, 8, 9]],
+                [5550, 5551],
+                CLOUD_COORDINATION,
+            ),
         ],
         [(0, 0), (1, 0)],
     ),

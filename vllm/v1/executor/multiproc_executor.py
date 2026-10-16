@@ -135,7 +135,11 @@ class MultiprocExecutor(Executor):
         )
         set_multiprocessing_worker_envs(num_local_procs)
 
-        if aiter_requires_tcp_store():
+        if self.vllm_config.lwd_config is not None:
+            from vllm.distributed.lwd import get_lwd_init_method
+
+            distributed_init_method = get_lwd_init_method(self.vllm_config.lwd_config)
+        elif aiter_requires_tcp_store():
             distributed_init_method = get_distributed_init_method(
                 get_loopback_ip(), get_open_port()
             )

@@ -45,6 +45,7 @@ def test_explicit_card_counts_reproduce_original_payloads(
         cloud_machines=clouds,
         cloud_cards="0:8" if prefix in ("s1", "s3") else "0:8,1:8",
         dp=str(dp),
+        consumer_ids="edge0,edge1" if scene == "cloud_share" else None,
     ).check_returncode()
     expected = topology_payload(f"{prefix}_{scene}_{dp}dp.yaml")
     assert yaml.safe_load(output.read_text()) == expected
@@ -57,6 +58,7 @@ def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> No
         output,
         scene="cloud_share",
         edge_machines="1@76.76.26.17,0@76.76.26.17",
+        consumer_ids="edge0,edge1",
         cloud_machines="76.76.26.232",
         cloud_cards="0:8",
         dp="2",
@@ -141,6 +143,7 @@ def test_cloud_size_is_not_inferred_from_host_address(
         edge_machines=edges,
         cloud_machines="10.1.0.1",
         cloud_cards=f"0:{cards}",
+        consumer_ids="edge0,edge1" if scene == "cloud_share" else None,
         dp=str(dp),
     ).check_returncode()
     topology = LwdTopology.from_file(str(output))
@@ -175,6 +178,7 @@ def test_allocation_rules_scale_beyond_two_instances_and_two_dps(
         cloud_cards=cards,
         dp=3,
         port_base=6201,
+        consumer_ids="edge0,edge1,edge2" if scene == "cloud_share" else None,
     )
     assert result.returncode == 0, result.stderr
     topology = LwdTopology.from_file(str(output))
@@ -209,6 +213,7 @@ _SCENE_INPUTS = {
 @pytest.mark.parametrize(
     "scene,overrides,match",
     [
+        ("cloud_share", {"consumer_ids": "edge0"}, "--consumer-ids count"),
         (
             "cloud_share",
             {"edge_machines": "0@10.0.0.1,0@10.0.0.2"},
@@ -279,6 +284,7 @@ def test_rejected_input_preserves_existing_yaml(
         "cloud_cards": cards,
         "dp": 1,
         "port_base": 6020,
+        "consumer_ids": "edge0,edge1" if scene == "cloud_share" else None,
     }
     output = tmp_path / "topology.yaml"
     output.write_text("keep existing yaml\n")

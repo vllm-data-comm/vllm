@@ -141,6 +141,13 @@ class LwdLink:
 
 
 @dataclass(frozen=True)
+class LwdConnectionKey:
+    edge_id: LwdId
+    cloud_id: LwdId
+    dp_idx: LwdId
+
+
+@dataclass(frozen=True)
 class LwdDPConnection:
     """One explicit instance link expanded at matching DP indices."""
 
@@ -149,6 +156,10 @@ class LwdDPConnection:
     dp_idx: int
     edge: LwdDP
     cloud: LwdDP
+
+    @property
+    def key(self) -> LwdConnectionKey:
+        return LwdConnectionKey(self.edge_id, self.cloud_id, self.dp_idx)
 
     @property
     def cloud_leader_rank(self) -> int:

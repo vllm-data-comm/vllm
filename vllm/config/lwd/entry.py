@@ -39,7 +39,7 @@ class LwdConfig:
                 "[LWD] coordination is retired from lwd_config; "
                 "it is now generated inside the topology yaml by "
                 "gen_lwd_topology.py. Remove the coordination block "
-                "from your lwd_config.yaml."
+                "from additional_config.lwd_config."
             )
         entry = TypeAdapter(_LwdEntry).validate_python(raw)
         path, role, identity = entry["path"], entry["role"], entry["instance_id"]

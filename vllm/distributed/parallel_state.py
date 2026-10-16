@@ -60,6 +60,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -1445,6 +1446,16 @@ class GroupCoordinator:
 
 
 _WORLD: GroupCoordinator | None = None
+_LWD_BOOTSTRAP_WORLD: GroupCoordinator | None = None
+
+
+def get_lwd_bootstrap_world() -> GroupCoordinator:
+    """Return the all-rank world used only to build and warm LWD channels."""
+    if _LWD_BOOTSTRAP_WORLD is not None:
+        return _LWD_BOOTSTRAP_WORLD
+    return get_world_group()
+
+
 _INNER_DP_WORLD: GroupCoordinator | None = None
 _NODE_COUNT: int | None = None
 
@@ -1791,6 +1802,12 @@ def init_distributed_environment(
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
+    if config is not None and config.lwd_config is not None:
+        from vllm.distributed.lwd import get_lwd_distributed_args
+
+        world_size, rank, distributed_init_method = get_lwd_distributed_args(
+            config, rank
+        )
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if (
         config is not None
@@ -1974,6 +1991,72 @@ def _engram_dp_shard_size(
     return shard_size
 
 
+def _initialize_lwd_model_parallel(config: "VllmConfig", backend: str | None) -> None:
+    """Port PR #33's asymmetric groups, keeping execution local to each side."""
+    from vllm.distributed.lwd import get_lwd_rank_groups
+
+    global _TP, _ETP, _PP, _DCP, _PCP, _DP, _EP, _EPLB
+    global _WORLD, _LWD_BOOTSTRAP_WORLD, _NODE_COUNT
+    assert config.lwd_config is not None
+    if config.engram_config is not None:
+        raise NotImplementedError(
+            "[LWD] Engram parallelism is not part of this migration"
+        )
+    groups = get_lwd_rank_groups(config.lwd_config)
+    world = get_world_group()
+    assert world.world_size == sum(map(len, groups))
+    assert _TP is None and _PP is None
+    backend = backend or torch.distributed.get_backend(world.device_group)
+    singleton_groups = [[rank] for group in groups for rank in group]
+    _TP = init_model_parallel_group(
+        groups,
+        world.local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="tp",
+    )
+    # ETP was added after the source PR; ordinary models use their TP group.
+    _ETP = _TP
+    _PP = init_model_parallel_group(
+        singleton_groups, world.local_rank, backend, group_name="pp"
+    )
+    _DCP = init_model_parallel_group(
+        singleton_groups,
+        world.local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="dcp",
+    )
+    _PCP = init_model_parallel_group(
+        singleton_groups, world.local_rank, backend, group_name="pcp"
+    )
+    _DP = init_model_parallel_group(
+        singleton_groups, world.local_rank, backend, group_name="dp"
+    )
+    if config.model_config is not None and config.model_config.is_moe:
+        _EP = init_model_parallel_group(
+            groups,
+            world.local_rank,
+            backend,
+            group_name="ep",
+            use_all2all=config.parallel_config.use_all2all,
+        )
+        if config.parallel_config.enable_eplb:
+            _EPLB = init_model_parallel_group(
+                groups, world.local_rank, backend, group_name="eplb"
+            )
+    _LWD_BOOTSTRAP_WORLD = _WORLD
+    _WORLD = _TP
+    _NODE_COUNT = _node_count(_WORLD.cpu_group)
+    logger.info(
+        "[LWD] no-PP groups ready: bootstrap=%s TP=%s PP=%s runtime_world=%s",
+        world.ranks,
+        groups,
+        singleton_groups,
+        _WORLD.ranks,
+    )
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -2010,6 +2093,9 @@ def initialize_model_parallel(
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
+    if config.lwd_config is not None:
+        _initialize_lwd_model_parallel(config, backend)
+        return
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
@@ -2369,7 +2455,7 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP, _ETP
+    global _TP, _ETP, _WORLD
 
     if _ETP and _ETP is not _TP:
         _ETP.destroy()
@@ -2377,6 +2463,8 @@ def destroy_model_parallel():
 
     if _TP:
         _TP.destroy()
+    if _WORLD is _TP:
+        _WORLD = None
     _TP = None
 
     global _ENGRAM_DP
@@ -2416,10 +2504,11 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _WORLD, _NODE_COUNT
+    global _WORLD, _NODE_COUNT, _LWD_BOOTSTRAP_WORLD
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+    _LWD_BOOTSTRAP_WORLD = None
     _NODE_COUNT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
