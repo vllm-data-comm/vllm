@@ -36,7 +36,7 @@ class LwdConfig:
     def from_dict(cls, raw: Any, *, api: LwdAPIConfig | None = None) -> "LwdConfig":
         if isinstance(raw, dict) and "coordination" in raw:
             raise ValueError(
-                "[LWD] coordination is retired from lwd_config; "
+                "coordination is retired from lwd_config; "
                 "it is now generated inside the topology yaml by "
                 "gen_lwd_topology.py. Remove the coordination block "
                 "from your lwd_config.yaml."
