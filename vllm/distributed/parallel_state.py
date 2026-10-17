@@ -60,6 +60,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -2010,6 +2011,9 @@ def initialize_model_parallel(
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
+    if config.lwd_config is not None:
+        _initialize_lwd_model_parallel(config, tensor_model_parallel_size, backend)
+        return
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
@@ -2277,6 +2281,88 @@ def initialize_model_parallel(
         _ETP.rank_in_group,
         _EP.rank_in_group if _EP is not None else "N/A",
         _EPLB.rank_in_group if _EPLB is not None else "N/A",
+    )
+
+
+def _initialize_lwd_model_parallel(
+    config: "VllmConfig", tensor_model_parallel_size: int, backend: str | None
+) -> None:
+    """Build the groups of the HCCL world shared by the LWD edge and cloud.
+
+    The edge and cloud rank counts differ, so the native uniform rank grid
+    does not apply; the groups come from the topology instead, see
+    `LwdParallelGroupsSpec`. The config was checked by
+    `check_lwd_parallel_config`; here only the launched world is checked.
+    """
+    from vllm.distributed.lwd import LwdParallelGroupsSpec
+
+    parallel_config = config.parallel_config
+    assert config.lwd_config is not None
+    spec = LwdParallelGroupsSpec.from_topology(config.lwd_config.topology)
+    world_size = torch.distributed.get_world_size()
+    if world_size != spec.world_size:
+        raise ValueError(
+            f"[LWD] torch world size {world_size} != topology "
+            f"hccl_world_size {spec.world_size}"
+        )
+    rank = torch.distributed.get_rank()
+    tp_group = spec.tp_group_of(rank)
+    if len(tp_group) != tensor_model_parallel_size:
+        raise ValueError(
+            f"[LWD] tensor parallel size {tensor_model_parallel_size} != "
+            f"{len(tp_group)} ranks {list(tp_group)} of rank {rank} in the topology"
+        )
+
+    global _TP, _ETP, _DCP, _PCP, _PP, _DP, _EP, _EPLB
+    assert _TP is None, "tensor model parallel group is already initialized"
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    local_rank = get_world_group().local_rank
+    tp_groups = [list(group) for group in spec.tp_groups]
+    singleton_groups = [list(group) for group in spec.singleton_groups]
+    _TP = init_model_parallel_group(
+        tp_groups,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="tp",
+    )
+    _ETP = _TP
+    _DCP = init_model_parallel_group(
+        singleton_groups,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="dcp",
+    )
+    _PCP = init_model_parallel_group(
+        singleton_groups, local_rank, backend, group_name="pcp"
+    )
+    _PP = init_model_parallel_group(
+        singleton_groups, local_rank, backend, group_name="pp"
+    )
+    # Non-MoE DP ranks run as independent engines, and MoE with DP is
+    # rejected before the engine starts, so no DP group spans several ranks.
+    _DP = init_model_parallel_group(
+        singleton_groups, local_rank, backend, group_name="dp"
+    )
+    if config.model_config is None or config.model_config.is_moe:
+        _EP = init_model_parallel_group(
+            tp_groups,
+            local_rank,
+            backend,
+            group_name="ep",
+            use_all2all=parallel_config.use_all2all,
+        )
+        if parallel_config.enable_eplb:
+            _EPLB = init_model_parallel_group(
+                tp_groups, local_rank, backend, group_name="eplb"
+            )
+    logger.info(
+        "[LWD] rank %d in world size %d: TP group %s, data-plane channels %s",
+        rank,
+        world_size,
+        list(tp_group),
+        spec.channel_endpoints_of(rank),
     )
 
 

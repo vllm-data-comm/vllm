@@ -24,6 +24,7 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
   | `tools/lwd_check_budget.py`, `log_analyze_tools/lwd_*` | kernel 预算检查 / 日志分析工具 |
 
 - **控制面通信已替换**: 老的 pub/sub `control_communication/` 已由 `vllm/v1/lwd_control/lwd_comm/` (ROUTER/DEALER) 取代, 引擎接入在 `control_scheduler/lwd_base_engine.py`; 设计见 `docs/design/lwd_control_plane.md`. `docs/refactor/lwd_control_*.md` 描述的是替换前的结构.
+- **数据面与两段 PP**: 边云共享一个 HCCL world, rank 即拓扑里的全局 rank (`hccl_world_size`、`dp[].ranks`); 建组由 `vllm/distributed/lwd/` 的 `LwdParallelGroupsSpec` 从拓扑推导, ascend 侧通道与 MC2 组在 `vllm_ascend/distributed/lwd_data_plane/`; 设计见 `docs/design/lwd_data_plane.md`. 老分支借 `[边0, 云0]` 两段 PP 组表达边云 (pp=2 + `_LWD_FULL_HEAD_TAIL` 改写首/尾 rank + 各处 `not enable_lwd` 的 PP 守卫), 已去除: 各侧按 pp=1 集中式运行, 代码里不再有首/中/尾 rank 的概念, 迁移老代码时不要把这些写法带回来.
 - **接入接缝**: 老代码经 `lwd_resolve_engine_cls` (engine 类按角色分流) 与 `lwd_serve_guard` (serve 入口注入云侧调度器) 两个钩子接入 vLLM; 另对 `v1/engine/core.py`、`v1/core/sched/scheduler.py`、`v1/worker/gpu_model_runner.py`、`distributed/parallel_state.py` 有侵入式改动.
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
 - **迁移/替换要一次做到位**: 替换一个模块后, 全仓 grep 旧设计的名字与术语 (类名、函数名、注释里的旧概念, 如 publish/HELLO/接收线程/`wire_version`), 残留的转发层、没人覆写的空默认实现、只为旧结构存在的辅助函数、过时注释, 与替换放在同一个 commit 里清掉, 不留到以后. 例: 控制面替换后删掉了 `_lwd_shutdown_comm` (失败清理已由基类 `shutdown` 统一承担) 与转发层 `_lwd_on_message`.

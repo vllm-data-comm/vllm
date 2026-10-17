@@ -1286,6 +1286,10 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+        if self.lwd_config is not None:
+            from vllm.distributed.lwd import check_lwd_parallel_config
+
+            check_lwd_parallel_config(self)
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
