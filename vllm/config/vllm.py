@@ -867,18 +867,10 @@ class VllmConfig:
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
-            # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
-            # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
-            # KV spec/MoE 切分等配置派生量与运行时组态对齐。
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if self.lwd_config.is_edge
-                else parallel_lwd.cloud_npu_count
-            )
-            # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
-            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
-            # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
-            # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
+            # Parallel sizes are derived from the edge/cloud topology, not
+            # the CLI. The world spans both sides; each side runs pp=1 like
+            # a centralized deployment, with tp = its own NPU count so that
+            # head counts, KV specs and MoE sharding match its TP group.
             if (self.parallel_config.tensor_parallel_size != 1
                     or self.parallel_config.pipeline_parallel_size != 1):
                 logger.warning(
@@ -890,7 +882,7 @@ class VllmConfig:
             self.parallel_config.world_size = (
                 parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
             )
-            self.parallel_config.pipeline_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
             self.parallel_config.tensor_parallel_size = (
                 parallel_lwd.edge_npu_count
                 if parallel_lwd.is_edge_node

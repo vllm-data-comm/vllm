@@ -348,26 +348,6 @@ direct_register_custom_op(
 )
 
 
-_LWD_FULL_HEAD_TAIL = False
-
-
-def _is_lwd_full_head_tail() -> bool:
-    """Whether LWD (layerwise disaggregated) mode is enabled.
-
-    In prefill_only LWD both the edge and cloud sides build the full head
-    (``embed_tokens``) and tail (``norm`` / ``lm_head``), so the PP
-    first/last-rank split must be neutralized: both sides act as first AND
-    last rank on the PP group.
-
-    The flag is set at group-creation time in the LWD branch of
-    ``initialize_model_parallel`` (every worker process passes through it),
-    because the runtime config context is unavailable on the worker
-    execute path (``get_current_vllm_config_or_none()`` returns None
-    there).
-    """
-    return _LWD_FULL_HEAD_TAIL
-
-
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -558,26 +538,12 @@ class GroupCoordinator:
 
     @property
     def is_first_rank(self):
-        """Return whether the caller is the first process in the group.
-
-        LWD prefill_only neutralizes the PP split on the PP group only:
-        both sides act as first rank so each builds the full
-        ``embed_tokens`` head.
-        """
-        if _is_lwd_full_head_tail() and self is _PP:
-            return True
+        """Return whether the caller is the first process in the group"""
         return self.rank == self.first_rank
 
     @property
     def is_last_rank(self):
-        """Return whether the caller is the last process in the group.
-
-        LWD prefill_only neutralizes the PP split on the PP group only:
-        both sides act as last rank so each builds the full ``norm`` /
-        ``lm_head`` tail.
-        """
-        if _is_lwd_full_head_tail() and self is _PP:
-            return True
+        """Return whether the caller is the last process in the group"""
         return self.rank == self.last_rank
 
     @property
@@ -1746,15 +1712,15 @@ def initialize_model_parallel(
     parallel_config = config.parallel_config
     coord_store: Store | None = None
 
-    # Lwd 边云模式:边云 rank 数不对称(edge_npu_count + cloud_npu_count),
-    # 排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后返回。
-    # 布局(以边 1 + 云 4、dp=1、world=5 为例):
-    #   TP: [[0], [1,2,3,4]]        边单例;云 4 卡合切一份权重
-    #   PP: [[0,1], [2], [3], [4]]  边 rank0 与云 rank1 组成两段流水线,
-    #                               其余云 rank 单例
-    #   DCP/PCP/DP: 全单例
-    #   EP(仅 MoE): [[0], [1,2,3,4]]
-    # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
+    # LWD edge-cloud: the edge and cloud rank counts are asymmetric and do
+    # not fit the native uniform rank grid, so the groups are built from the
+    # LWD layout directly. Each side runs like a centralized pp=1 deployment.
+    # Layout for 1 edge + 4 cloud, dp=1, world=5:
+    #   TP:          [[0], [1,2,3,4]]
+    #   PP/DCP/PCP:  [[0], [1], [2], [3], [4]]
+    #   DP:          singletons when dp=1
+    #   EP (MoE):    [[0], [1,2,3,4]]
+    # Group creation is a world collective, so every rank builds every list.
     if parallel_config.lwd_config.enable_lwd:
         global _TP, _PP, _DCP, _PCP, _DP, _EP
         assert not enable_elastic_ep, (
@@ -1788,28 +1754,16 @@ def initialize_model_parallel(
             group_name="tp",
         )
 
-        # PP:每实例边 rank0 与云 rank0 成两段 pp 对,其余 rank 单例
+        singleton_groups = [[r] for r in range(world_size)]
         assert _PP is None, "pipeline model parallel group is already initialized"
-        pp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            pp_groups.append([base + 0, base + edge_count])
-            for r in range(1, world_per_dp):
-                if r != edge_count:
-                    pp_groups.append([base + r])
         _PP = init_model_parallel_group(
-            pp_groups,
+            singleton_groups,
             get_world_group().local_rank,
             backend,
             group_name="pp",
         )
-        # prefill_only 下 PP 切分在运行期中性化(两侧皆 first/last rank);
-        # 建组时直接置位,运行期不依赖 current config 上下文。
-        global _LWD_FULL_HEAD_TAIL
-        _LWD_FULL_HEAD_TAIL = True
 
         # DCP/PCP:全单例(pcp_size = dcp_size = 1)
-        singleton_groups = [[r] for r in range(world_size)]
         assert _DCP is None, "decode context model parallel group is already initialized"
         _DCP = init_model_parallel_group(
             singleton_groups,
@@ -1855,14 +1809,13 @@ def initialize_model_parallel(
         logger.info(
             "Lwd edge-cloud mode initialized: rank %s, is_edge=%s, "
             "edge_npu_count=%s, cloud_npu_count=%s, world_size=%s, "
-            "TP groups=%s, PP groups=%s, DP groups=%s",
+            "TP groups=%s, DP groups=%s",
             rank,
             is_edge,
             edge_count,
             cloud_count,
             world_size,
             tp_groups,
-            pp_groups,
             dp_groups,
         )
         return

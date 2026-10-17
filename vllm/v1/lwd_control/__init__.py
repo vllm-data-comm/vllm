@@ -14,6 +14,14 @@ def lwd_resolve_engine_cls(vllm_config):
 
     if not is_lwd_prefill_only(vllm_config):
         return None
+    # The LWD schedulers derive from AsyncScheduler and the cloud engine
+    # relies on the batch queue; with pp=1 only async scheduling enables it.
+    if not vllm_config.scheduler_config.async_scheduling:
+        raise ValueError(
+            "[Lwd] prefill_only requires async scheduling, but it is "
+            "disabled (check --no-async-scheduling and the speculative "
+            "decoding method)"
+        )
     config = LwdConfig.from_env_and_config(vllm_config)
     from vllm.logger import init_logger
 

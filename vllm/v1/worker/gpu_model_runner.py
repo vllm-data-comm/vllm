@@ -4617,7 +4617,7 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
-        if self.use_async_scheduling and not self.parallel_config.lwd_config.enable_lwd:
+        if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
@@ -4857,7 +4857,7 @@ class GPUModelRunner(
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
-        assert not pp.is_last_rank and not self.parallel_config.lwd_config.enable_lwd
+        assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
