@@ -22,6 +22,7 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
@@ -71,7 +72,7 @@ else:
 
     KVCacheConfig = Any
 
-logger = init_logger(__name__)
+logger = lwd_logger
 
 # TODO(rocm): These models are either unsupported by MRV2 or slower with
 # MRV2 on AMD GPUs.
