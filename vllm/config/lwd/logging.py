@@ -3,13 +3,16 @@
 """Log the resolved LWD metadata without reading files or starting execution."""
 
 import json
-import logging
 from dataclasses import asdict
+
+from vllm.lwd_logger import lwd_logger
 
 from .entry import LwdConfig
 
+logger = lwd_logger
 
-def log_lwd_config(logger: logging.Logger, config: LwdConfig) -> None:
+
+def log_lwd_config(config: LwdConfig) -> None:
     """Emit one startup record with all fields, defaults and selected connections."""
     snapshot = {
         "metadata_only": True,
