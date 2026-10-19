@@ -1272,7 +1272,7 @@ class VllmConfig:
         ):
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
-            log_lwd_config(logger, self.lwd_config)
+            log_lwd_config(self.lwd_config)
 
         self._resolve_mm_encoder_only()
 

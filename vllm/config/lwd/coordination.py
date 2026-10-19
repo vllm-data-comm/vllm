@@ -30,7 +30,7 @@ class LwdCoordinationConfig:
         if value is not None:
             url = urlsplit(value)
             if url.scheme not in ("http", "https") or not url.hostname:
-                raise ValueError("control_url must be an HTTP(S) endpoint")
+                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
         return value
 
     @classmethod
@@ -47,5 +47,5 @@ class LwdCoordinationConfig:
             and (not self.control_url or not self.tenant_key_file)
         ):
             raise ValueError(
-                "edge coordination requires control_url and tenant_key_file"
+                "[LWD] edge coordination requires control_url and tenant_key_file"
             )
