@@ -21,8 +21,7 @@ import torch
 from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
-from vllm.logger import enable_trace_function_call
-from vllm.lwd_logger import lwd_logger
+from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
@@ -46,6 +45,7 @@ from .lwd import (
     log_lwd_config,
     resolve_lwd_config,
 )
+from vllm.lwd_logger import lwd_logger
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -72,7 +72,7 @@ else:
 
     KVCacheConfig = Any
 
-logger = lwd_logger
+logger = init_logger(__name__)
 
 # TODO(rocm): These models are either unsupported by MRV2 or slower with
 # MRV2 on AMD GPUs.
@@ -1273,7 +1273,7 @@ class VllmConfig:
         ):
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
-            log_lwd_config(logger,self.lwd_config)
+            log_lwd_config(lwd_logger, self.lwd_config)
 
         self._resolve_mm_encoder_only()
 
