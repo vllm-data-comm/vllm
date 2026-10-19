@@ -9,6 +9,8 @@ from vllm.lwd_logger import lwd_logger
 
 from .entry import LwdConfig
 
+logger = lwd_logger
+
 
 def log_lwd_config(config: LwdConfig) -> None:
     """Emit one startup record with all fields, defaults and selected connections."""
@@ -26,4 +28,4 @@ def log_lwd_config(config: LwdConfig) -> None:
         },
     }
     # Serialize the parsed snapshot only; tenant_key_file remains a path, not content.
-    lwd_logger.info("[config] resolved=%s", json.dumps(snapshot, ensure_ascii=False))
+    logger.info("[config] resolved=%s", json.dumps(snapshot, ensure_ascii=False))

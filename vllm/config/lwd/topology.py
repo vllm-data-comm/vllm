@@ -343,5 +343,5 @@ class LwdTopology:
             if instance.id == instance_id:
                 return instance
         raise ValueError(
-            f"Instance not found: role={role}, instance_id={instance_id}"
+            f"[LWD] Instance not found: role={role}, instance_id={instance_id}"
         )
