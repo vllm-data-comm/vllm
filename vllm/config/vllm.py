@@ -45,6 +45,7 @@ from .lwd import (
     log_lwd_config,
     resolve_lwd_config,
 )
+from vllm.lwd_logger import lwd_logger
 from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
@@ -1272,7 +1273,7 @@ class VllmConfig:
         ):
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
-            log_lwd_config(self.lwd_config)
+            log_lwd_config(lwd_logger, self.lwd_config)
 
         self._resolve_mm_encoder_only()
 
