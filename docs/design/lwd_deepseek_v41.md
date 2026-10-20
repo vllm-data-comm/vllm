@@ -19,6 +19,7 @@
 4. **DSpark 在昇腾 v1 runner 上可用，不是 v2 独占。** vLLM 上游 DSpark 只在 v2 runner 实现，但 vllm-ascend 默认走 v1，并在 v1 上放开了 DSpark（实证）。LWD 云侧只锁定 v1，所以这不构成阻塞。DSpark 只依赖云侧自己有的数据，比现有 MTP 更好接（第 3.3 节）。
 5. **DSv4.1 是 Causal Encoder-Decoder（CED），但对边云边界没有新增影响。** 前 20 层是 causal encoder，后 20 层 decoder 的全局 KV 由 encoder 最终 hidden state 投影得到（实证）。它在 vLLM 里按普通 causal LM 调度，Engram 两层都在 encoder 内。CED 的收益是 prefill 计算量减半，但原生 vLLM 与 vllm-ascend 目前都没吃到这个收益，"能跑"也不需要它（第 3.4 节）。
 6. **Engram 与 KV cache 无关。** 它是一个按门控写入残差流的查表模块（实证），"矫正机制"的直觉是对的。
+7. **边侧必须裁掉模型层才能拉起。** main 上边侧会加载完整模型（实证），V4.1 约 510 GB，其中 Engram 表约 203 GB，P0 无法启动。方案是 LWD 边侧投影加自有加载器：边侧按 0 层构建、不建 Engram，只读 checkpoint 中 3 个分片里的约 3.5 GB 权重（第 3.5 节）。
 
 ## 1. 背景
 
@@ -363,6 +364,43 @@ flowchart TB
 | 云侧 prefix cache | Encoder SWA Bounded Replay 需要重放已缓存前缀的最后 128 个 token。云侧不存 embedding 和 Engram 下标，重放时需要边侧重发这 128 个 token 的 UP payload | 云侧现在不开 prefix cache，不受影响；将来开启时要设计重发 |
 | DSpark | 目标层 37-39 在 decoder。官方实现在 prefill 时只用目标 hidden state 填草稿层的窗口 KV | 与 Decoder Bounded Replay 兼容（推断） |
 
+### 3.5 边侧模型构建
+
+#### 3.5.1 现状：main 上边侧加载完整模型
+
+- main 上边侧 `LwdEdgeModelRunner.load_model` 直接调用原生加载（vllm-ascend `lwd_edge_model_runner.py:60`），vllm 的 `make_layers` 也没有 LWD 分支（实证）。老分支靠 `make_lwd_layers` 把边侧所有层建成 `PPMissingLayer`，这部分未迁移，issue #18 已记录"main 上边侧会加载全量层"。
+- 对 V4.1，这意味着边侧要加载完整 checkpoint，约 510 GB（`model.safetensors.index.json` 的 `total_size`），其中 Engram 表约 203 GB，P0 无法拉起。边侧同样会解析出 `EngramConfig`，被 LWD 守卫拒绝。
+
+#### 3.5.2 边侧实际需要的部件（实证）
+
+| 部件 | 用途 | 依据 |
+| --- | --- | --- |
+| `embed_tokens` | prompt embedding | 边侧 `embed_input_ids`（`lwd_edge_model_runner.py:157`） |
+| `lm_head` | 按 rank 反查 token | 云侧返回的 hidden 已经过 hc 合并与最终 norm（vllm-ascend `deepseek_v41/model.py:1285`–`:1288`），`compute_logits` 只乘 `lm_head`（`:1414`） |
+| ViT、aligner、三个分隔向量 | 图片 embedding | 3.2.3 |
+| tokenizer、Engram 哈希参数 | 边侧哈希器 | 不需要 Engram 表 |
+
+按 checkpoint 索引统计：边侧需要的是 `embed`、`head`、`norm`、`vision`（259 个）、`aligner`（4 个）、`image_start/newline/end` 共 269 个张量，分布在 48 个分片中的 3 个；其余 93,403 个层张量（含 12 个 Engram 表张量）与 2,401 个 `mtp.` 张量边侧都不需要。按 config 推算，边侧权重约 3.5 GB：embedding 与 `lm_head` 各约 1.3 GB，ViT 约 0.8 GB（推断）。
+
+#### 3.5.3 方案
+
+| 方案 | 问题 | 结论 |
+| --- | --- | --- |
+| A. 迁回 `make_lwd_layers` | 改原生 `make_layers`，是老分支的侵入式改动 | 否决 |
+| B. 部署时用 `hf_overrides` 把 `num_hidden_layers` 设为 0 | 模型能构造（推断）。但 V4.1 加载权重只跳过 `mtp.`（vllm-ascend `deepseek_v41/model.py:321`），`layers.N.*` 会在 `params_dict[name]` 处报 `KeyError`（`:1525`，推断）；`engram_layer_ids` 仍非空，边侧仍被守卫拒绝；启动仍要读全部 510 GB | 不足 |
+| C. LWD 边侧投影 + 自有加载器 | 见下 | **推荐** |
+
+方案 C 三步：
+
+1. **边侧投影**：在 `vllm/engine/arg_utils.py` 已有的 LWD 接缝调用 LWD 的边侧投影函数。时机是 `:2060` 解析 LWD 配置之后、`:2086` 创建模型配置之前。投影用可调用的 `hf_overrides` 把文本 config 的 `num_hidden_layers` 设为 0，并清空 n-gram 层字段（按 `vllm/config/engram.py` 的 `_NGRAM_LAYER_FIELDS`），边侧因此不建 decoder 层、不建 Engram、不解析 `EngramConfig`；同时把 `load_format` 设为 `lwd_edge`。
+2. **边侧加载器**：用 vLLM 公开扩展点 `register_model_loader`（`vllm/model_executor/model_loader/__init__.py:69`）注册 `lwd_edge`，继承默认加载器，按模型族的权重前缀白名单过滤，并按索引只读包含白名单张量的分片。V4.1 的白名单为 `embed.`、`head.`、`norm.`、`vision.`、`aligner.`、`image_`，只读 3 个分片。白名单按模型族抽象，与 3.2.1 的位置元数据提取同一模式；V4、千问各写一份，顺带解决 #18 记录的边侧全量加载。
+3. **边侧哈希器取原始参数**：投影后 `engram_layer_ids` 为空，`LwdEngramHasher` 从未覆盖的原始 config 构造 Engram 参数。
+
+0 层下的检查点（推断，待边侧实测）：
+
+- **构造**：V4.1 的层规划对 0 层没有断言（vllm-ascend `deepseek_v41/model.py:506`–`:546`），MoE 参数提取处理了无 MoE 层的情况（`:334`）。
+- **forward**：边侧不调用模型 forward，预热与图捕获已跳过（`lwd_edge_worker.py:47`）。0 层下 forward 会在 hc 合并处断言失败（`:1276`），这是预期行为。
+
 ## 4. 改造后边云传输清单
 
 | 方向 | 内容 | 是否 token id |
@@ -387,6 +425,8 @@ flowchart TB
 | vllm | `vllm/v1/lwd_control/lwd_comm/lwd_messages.py` | `LwdRequestNotify` 加尾部乘积、尾部图片标记与图片占位区段字段；`LwdCloudParamsNotify` 加哈希参数指纹字段 |
 | vllm | `vllm/v1/lwd_control/control_edge_scheduler/lwd_edge_scheduler.py`、`lwd_edge_engine.py` | 准入时算尾部乘积、提取图片占位区段；位置元数据提取按模型族抽象，替代 `_lwd_compute_mrope_positions` 里的分支；`lwd_edge_engine.py:140` 比对哈希参数指纹 |
 | vllm | `vllm/distributed/lwd/lwd_parallel_groups.py` | 解除 Engram 拒绝，保留未验证组合的拒绝 |
+| vllm | `vllm/engine/arg_utils.py` 已有的 LWD 接缝，以及 `vllm/config/lwd/` | 边侧投影：`num_hidden_layers` 置 0、清空 n-gram 层字段、`load_format` 设为 `lwd_edge`（3.5.3） |
+| vllm | lwd 路径下新增 `lwd_edge` 加载器，具体目录见第 8 节 | 按模型族权重前缀白名单过滤，只读所需分片（3.5.3） |
 | vllm | lwd 路径下新增 `lwd_engram_hasher.py`，具体目录见第 8 节 | 边云共用的 `LwdEngramHasher`：prompt 模式算整段下标与尾部乘积；decode 模式算本批 decode 行，读 LWD 槽位缓存与尾部表 |
 | vllm-ascend | `vllm_ascend/worker/lwd_hash/` | UP payload 分段化，加 Engram 下标段 |
 | vllm-ascend | `lwd_edge_model_runner.py` | 调用 `LwdEngramHasher` prompt 模式；不加载 Engram 表 |
@@ -409,7 +449,7 @@ flowchart TB
 
 | 阶段 | 范围 | 完成标准 |
 | --- | --- | --- |
-| P0 | 文本 V4.1，无投机：哈希器 int64 微基准（第一项，其余部分动工前完成）、Engram 下标上行、尾部乘积、合成 `input_ids` 缓冲、`LwdEngramHasher` 与 LWD 槽位缓存、云侧合并、解除守卫 | 贪心输出与集中式一致；哈希器每步开销已实测 |
+| P0 | 文本 V4.1，无投机：哈希器 int64 微基准（第一项，其余部分动工前完成）、边侧投影与 `lwd_edge` 加载器、Engram 下标上行、尾部乘积、合成 `input_ids` 缓冲、`LwdEngramHasher` 与 LWD 槽位缓存、云侧合并、解除守卫 | 边侧只加载所需权重并拉起；贪心输出与集中式一致；哈希器每步开销已实测 |
 | P1 | 视觉：图片占位区段下发、`input_ids` 缓冲里的图片位置、Engram 门控掩码 | 图文 prompt 输出与集中式一致 |
 | P2 | DSpark | 能跑，接受率与集中式同量级 |
 
@@ -417,9 +457,9 @@ flowchart TB
 
 1. 桶下标与尾部乘积是否满足"传哈希"的要求（张晓枫口头已表示哈希可以接受）。
 2. 图片区间内注意力语义：官方参考与昇腾 V4.1 为因果，vLLM CUDA 版放宽滑窗。需向 vllm-ascend 维护者确认正确语义；若改为双向，LWD 需补下发注意力用的图片区间元数据，并在边侧保持图片区间不被切分。
-3. 边侧在 main 上如何构建模型、能否跳过 Engram 表与 decoder 层（老分支用 `make_lwd_layers`，main 上已不存在）。
+3. 边侧模型构建是否采用 3.5.3 的方案 C（边侧投影加 `lwd_edge` 加载器）。0 层构造与权重白名单需在边侧实测；本地 checkpoint 的 48 个分片均为 0 字节，尚无法本地验证。
 4. `stop_token_ids` 走控制面是否可接受。
 5. CED 的 prefill 减半收益本期不做，与原生保持一致，是否接受。
 6. 哈希器实现：边云共用 torch 实现的 `LwdEngramHasher`（倾向，边侧可在 CPU 上跑），与原生 NPU kernel 对拍。云侧 decode 模式先做 int64 算子微基准，再按 3.1.4 代价段的顺序处理，可接受阈值待定。
-7. `LwdEngramHasher` 放 vllm 仓：边侧 engine 进程准入时要用它算尾部乘积，vllm 不能依赖 vllm-ascend。具体目录待定：`vllm/distributed/lwd/`、`vllm/v1/lwd_control/`，或新建 lwd 包。
+7. `LwdEngramHasher` 与 `lwd_edge` 加载器放 vllm 仓：边侧 engine 进程准入时要用哈希器算尾部乘积，vllm 不能依赖 vllm-ascend；加载器只依赖 vLLM 的加载框架。具体目录待定：`vllm/distributed/lwd/`、`vllm/v1/lwd_control/`，或新建 lwd 包。
 8. UP payload 布局是否纳入握手校验：接收长度由两侧各自按 config 推算，config 不一致时 HCCL 更可能卡住而不是报错（推断）。建议与哈希参数指纹一起比对。
