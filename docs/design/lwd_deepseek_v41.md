@@ -196,11 +196,11 @@ decode token 是云侧自己采样的，云侧本来就用它算 decode 的 embe
 
 | 部件 | 位置 | 内容 |
 | --- | --- | --- |
-| `LwdEngramHasher` | LWD 目录，边云共用一个类 | 持有 `token_map`、乘子、素数、偏移，全部用上游 `EngramLayout`、`compute_hash_multipliers` 与 token_map 构造函数导出，不复制常量。边侧用 prompt 模式算整段 prompt 与尾部乘积；云侧用 decode 模式算本批行 |
-| LWD 槽位缓存 | 云侧 runner，int32 张量，长度 = SWA 层块数 × 块大小 | 每槽存该位置 token 的压缩 id，图片位置存 `DEAD_ID`。与原生 `hash_state._cache` 同尺寸同语义（实证，原生也是独立分配的 int32 张量），只是归 LWD 所有 |
+| `LwdEngramHasher` | vllm 仓的 lwd 路径下，边云共用一个类（具体目录见第 8 节） | 持有 `token_map`、乘子、素数、偏移，全部用上游 `EngramLayout`、`compute_hash_multipliers` 与 token_map 构造函数导出，不复制常量。边侧用 prompt 模式算整段 prompt 与尾部乘积；云侧用 decode 模式算本批行。尾部乘积在边侧 engine 进程准入时计算（`vllm/v1/lwd_control/control_edge_scheduler/lwd_edge_engine.py:214`），vllm 不能依赖 vllm-ascend，所以不能放进 vllm-ascend。图片截断规则从 config 的 `image_token_id` 与 `image_pad_token_id`（缺省 `image_token_id + 1`）读取，与昇腾一致（vllm-ascend `deepseek_v41/model.py:1123`）；不用上游 `image_sentinel_mask`，它只认 `image_token_id` |
+| LWD 槽位缓存 | 云侧 runner，int32 张量，长度 = SWA 层块数 × 块大小 | 每槽存该位置 token 的压缩 id，图片位置存 `DEAD_ID`。与原生 `hash_state._cache` 同尺寸同语义（实证，原生也是独立分配的 int32 张量），只是归 LWD 所有。显存 profile 会先绑定一块临时的较小 KV cache 再换成正式的，原生靠弱引用检测换绑并重新分配（上游 `common/engram.py:438`–`:462`，实证）；LWD 缓存照搬这个检测，或只在正式绑定后创建 |
 | 每请求尾部记录 | 云侧 CPU，按 req_id 存 | `P`、尾部乘积 `[2, 3, 4]` int64、尾部图片标记 `[3]`，来自 `LwdRequestNotify`，请求存活期间不变 |
 
-**行分类规则只有一条：位置 `< P` 的行用 UP 下标，位置 `≥ P` 的行用自算下标。** 不按"本步是 prefill 还是 decode"分，分块预填、投机验证块、抢占后重算落在同一条规则里（推断）。
+**行分类规则只有一条：位置 `< P` 的行用 UP 下标，位置 `≥ P` 的行用自算下标。** 不按"本步是 prefill 还是 decode"分，分块预填、投机验证块落在同一条规则里（推断）。规则的前提是：同一请求在本批的首位置 `chunk_start` 与 `P` 不跨界，即不会出现 `chunk_start < P ≤ pos` 的行，因为 prefill 块要先采样才有 decode 位置。云侧对此加断言，违反即报错。
 
 **每步流程**：
 
@@ -208,15 +208,15 @@ decode token 是云侧自己采样的，云侧本来就用它算 decode 的 embe
 | --- | --- |
 | CPU 准备输入 | 按本步 batch 行序从每请求记录取出 `P[R]`、`tail[R, 2, 3, 4]`、`tail_dead[R, 3]`，经 pinned 缓冲非阻塞上传。不依赖采样结果，异步调度下没有占位问题 |
 | `LwdCloudModelRunner._model_forward`，已有覆写 | 下方 ①-④ |
-| `_get_engram_device_inputs`，LWD 覆写 | 在原生返回的 `query_start_loc`、`slot_mapping`、`block_table` 之外多返回 `engram_hashes`。昇腾 runner 基类 `_model_forward` 把这个字典整个展开传给 `prepare_engram_inputs`（`model_runner_v1.py:3250`，实证），所以基类不改；LWD 也不能自己再调一次 `prepare_engram_inputs`，否则与基类的调用重复 |
+| `_get_engram_device_inputs`，LWD 覆写 | 在原生返回的 `query_start_loc`、`slot_mapping`、`block_table` 之外多返回 `engram_hashes`。昇腾 runner 基类 `_model_forward` 把这个字典整个展开传给 `prepare_engram_inputs`（`model_runner_v1.py:3250`，实证），所以基类不改；LWD 也不能自己再调一次 `prepare_engram_inputs`，否则与基类的调用重复。下标只对当前步有效：`_model_forward` 算好后暂存，本步取用后立即清空；没有注意力元数据时（dummy、profile 步）与原生一样返回空字典（`model_runner_v1.py:3210`，实证），不能带出上一步的下标 |
 | `prepare_engram`，昇腾覆写的 `models/deepseek_v41/model.py` | 新增可选参数 `engram_hashes`；传入时跳过 `hash_state(...)`，`mask = ~dead` 仍由 `input_ids` 算，跨 DP 收集与查表不变。默认 `None`，原生行为不变 |
 
 `_model_forward` 里的四步：
 
-1. **合成 `input_ids` 缓冲**：decode 行填云侧已有的真实 id，prompt 行填 0，图片位置填 129264。V4.1-Flash 带视觉塔，MoE 每层都有 `bias_vl`，模型 forward 无条件读取 `input_ids` 判断图片位置（`deepseek_v41/model.py:961`、`:1252`），纯文本请求也需要（推断）。此时设备上的 `input_ids` 已被上一步的采样结果填成真实 id，现有的 hash-MoE 路由代码正是从同一缓冲拷 id（实证）。
-2. **写 LWD 槽位缓存**：`val = where(dead, DEAD_ID, token_map[input_ids])`，`cache[slot_mapping[:T]] = val`。与原生写缓存 kernel 同语义。
-3. **算本批行**：对 `s = 0..3` 展开，按下面的规则取值、阻断、异或、取模，得 `[T, 2, 24]`。
-4. **合并**：`out = where(pos < P[req], UP 下标, 自算下标)`，与 `merge_hash_expert_ids` 同一模式。
+1. **合成 `input_ids` 缓冲**：decode 行填云侧已有的真实 id，prompt 行填 0，图片位置填 129264。V4.1-Flash 带视觉塔，MoE 每层都有 `bias_vl`，模型 forward 无条件读取 `input_ids` 判断图片位置（`deepseek_v41/model.py:961`、`:1252`），纯文本请求也需要（推断）。此时设备上的 `input_ids` 已被上一步的采样结果填成真实 id，现有的 hash-MoE 路由代码正是从同一缓冲拷 id（实证）。该缓冲作为 `input_ids` 传给基类 `_model_forward`：基类把它交给 `prepare_engram` 算 `mask = ~dead`，也交给模型的 MoE；传 `None` 会在这两处报错。
+2. **写 LWD 槽位缓存**：只对位置 `≥ P` 且槽位号 `≥ 0` 的行写入，`val = where(dead, DEAD_ID, token_map[input_ids])`。padding 行的槽位号是 `PAD_SLOT_ID = -1`（`vllm/v1/attention/backends/utils.py:46`），torch 的负下标会写到最后一个槽位；原生写缓存 kernel 同样有 `slot >= 0` 的判断（上游 `common/engram.py:229`，实证）。prompt 行的槽位从不被读到，不必写。
+3. **算本批 decode 行**：先挑出位置 `≥ P` 的行，按最大 decode 行数 padding 成静态形状，对 `s = 0..3` 展开，按下面的规则取值、阻断、异或、取模，得 `[T_d, 2, 24]`。
+4. **合并**：prompt 行取 UP 下标，decode 行写回自算下标，得 `[T, 2, 24]`，与 `merge_hash_expert_ids` 同一模式。
 
 第 3 步每格的取值规则，与原生 kernel 逐条对应，只有"prompt 位置"一支从回看窗口换成尾部表：
 
@@ -234,7 +234,7 @@ rolling ^= term
 s >= 1:  out[:, :, (s-1)*8 : s*8] = rolling % prime[层, s-1, :] + offset[层, s-1, :]
 ```
 
-`P-1-lb` 必落在 `0..2`，因为 `lb ≥ pos-3 ≥ P-3`；UP 行上该下标可为负，只需 clamp，结果在第 4 步被丢弃。
+`P-1-lb` 必落在 `0..2`，因为只算位置 `≥ P` 的行，`lb ≥ pos-3 ≥ P-3`。
 
 **边界情况**：
 
@@ -244,18 +244,18 @@ s >= 1:  out[:, :, (s-1)*8 : s*8] = rolling % prime[层, s-1, :] + offset[层, s
 | prompt 末尾有图片 | 边侧算 `tail_dead`，云侧在对应格阻断 |
 | 采样出图片 id | `engram_dead_mask` 作用在真实 id 上，写入 `DEAD_ID`，与原生一致 |
 | 分块预填 | 所有行 `pos < P`，全走 UP |
-| 抢占后重算 | `pos ≥ P` 的行按本批回看自算并重写缓存；`pos < P` 的行需边侧重发 UP，这是 LWD 既有问题，与 Engram 无关（推断） |
+| 抢占后重算 | 云侧调度器不支持抢占重算，部署须保证 KV 充足，违反时核验当场报错（`vllm/v1/lwd_control/control_cloud_scheduler/lwd_cloud_scheduler.py:10`，实证）。行分类规则本身对重算也成立 |
 | 请求结束、batch 换行 | 槽位按位置写，任何会被读到的槽位都先被同一请求写过，不需清理；`P`、`tail` 每步按行序重建，没有设备端每请求状态要搬 |
 | UP 行数与 `P` 不符、尾部记录缺失 | 准入时 fail-fast，不回退成 pad |
 
-**代价**（假设，需实测）：第 3 步按行展开约几十个小算子，在 NPU eager 路径上按每算子十几微秒估，每个 decode 步多 0.5-1.5 ms。缓解按顺序：先实测；形状由 `num_tokens_padded` 决定、是静态的，可单独捕获成小图；仍不够则把第 3 步写成 LWD 目录内的 triton 核，取值规则与等价 UT 不变。边侧只算一次 prompt，不受影响。
+**代价**（假设，需实测）：第 3 步按行展开约几十个小算子，在 NPU eager 路径上按每算子十几微秒估，每个 decode 步多 0.5-1.5 ms。这个估算可能偏乐观：第 3 步是 int64 的乘、异或、取模，昇腾上这些 int64 算子是否在 AI Core 执行没有找到依据，若回落到 AICPU，单个算子可能上百微秒。所以哈希器微基准是 P0 第一项，在其他部分动工前完成。缓解按顺序：先实测；按最大 decode 行数 padding 后形状是静态的，可单独捕获成小图；仍不够则把第 3 步写成 LWD 目录内的 triton 核，取值规则与等价 UT 不变，原生仍不改。边侧只算一次 prompt，不受影响。
 
 非 LWD 文件改动只有一处：`models/deepseek_v41/model.py` 的 `prepare_engram` / `prepare_engram_inputs` 新增可选参数 `engram_hashes`，在 vllm-ascend 覆写的包内（团队规范 7.8 允许）。`engram/hash_state.py` 与 runner 基类不改。
 
 其余两项：
 
 - 解除 `lwd_parallel_groups.py` 对 Engram 的拒绝，但继续拒绝 Engram DP 共享（`dp_shared_memory`）等未验证组合。
-- 拉起时校验边云哈希参数一致：压缩词表大小与乘子/素数表的指纹放进握手，不一致直接 fail-fast。否则桶下标会静默错位。
+- 拉起时校验边云哈希参数一致：压缩词表大小与乘子/素数表的指纹放进握手，不一致直接 fail-fast。否则桶下标会静默错位。指纹作为 `LwdCloudParamsNotify` 的新字段，由边侧在 `vllm/v1/lwd_control/control_edge_scheduler/lwd_edge_engine.py:140` 现有的调度参数比对处一起比对。
 
 #### 3.1.5 备选与否决的方案
 
@@ -384,20 +384,24 @@ flowchart TB
 
 | 仓 | 位置 | 改动 |
 | --- | --- | --- |
-| vllm | `vllm/v1/lwd_control/lwd_comm/lwd_messages.py` | `LwdRequestNotify` 加尾部乘积字段与图片区间列表 |
-| vllm | `vllm/v1/lwd_control/control_scheduler/` 边侧调度 | 准入时算尾部乘积、提取图片占位区段；位置元数据提取按模型族抽象，替代 `_lwd_compute_mrope_positions` 里的分支 |
-| vllm | `vllm/distributed/lwd/lwd_parallel_groups.py` | 解除 Engram 拒绝，保留未验证组合的拒绝；握手校验哈希参数指纹 |
+| vllm | `vllm/v1/lwd_control/lwd_comm/lwd_messages.py` | `LwdRequestNotify` 加尾部乘积、尾部图片标记与图片占位区段字段；`LwdCloudParamsNotify` 加哈希参数指纹字段 |
+| vllm | `vllm/v1/lwd_control/control_edge_scheduler/lwd_edge_scheduler.py`、`lwd_edge_engine.py` | 准入时算尾部乘积、提取图片占位区段；位置元数据提取按模型族抽象，替代 `_lwd_compute_mrope_positions` 里的分支；`lwd_edge_engine.py:140` 比对哈希参数指纹 |
+| vllm | `vllm/distributed/lwd/lwd_parallel_groups.py` | 解除 Engram 拒绝，保留未验证组合的拒绝 |
+| vllm | lwd 路径下新增 `lwd_engram_hasher.py`，具体目录见第 8 节 | 边云共用的 `LwdEngramHasher`：prompt 模式算整段下标与尾部乘积；decode 模式算本批 decode 行，读 LWD 槽位缓存与尾部表 |
 | vllm-ascend | `vllm_ascend/worker/lwd_hash/` | UP payload 分段化，加 Engram 下标段 |
-| vllm-ascend | `vllm_ascend/worker/lwd_hash/lwd_engram_hasher.py`（新增，位置待定，见第 8 节） | 边云共用的 `LwdEngramHasher`：prompt 模式算整段下标与尾部乘积；decode 模式算本批行，读 LWD 槽位缓存与尾部表 |
 | vllm-ascend | `lwd_edge_model_runner.py` | 调用 `LwdEngramHasher` prompt 模式；不加载 Engram 表 |
-| vllm-ascend | `lwd_cloud_model_runner.py` | `_model_forward` 合成 `input_ids` 缓冲、写 LWD 槽位缓存、`LwdEngramHasher` decode 模式算本批行、合并远端/本地下标；覆写 `_get_engram_device_inputs` 传 `engram_hashes`；每步上传 `P`、尾部乘积、尾部标记；按图片占位区段填写 id 与掩码 |
+| vllm-ascend | `lwd_cloud_model_runner.py` | `_model_forward` 合成 `input_ids` 缓冲并传给基类、写 LWD 槽位缓存、`LwdEngramHasher` decode 模式算本批 decode 行、合并远端/本地下标；覆写 `_get_engram_device_inputs` 传本步的 `engram_hashes`；每步上传 `P`、尾部乘积、尾部标记；按图片占位区段填写 id 与掩码 |
 | vllm-ascend | `vllm_ascend/spec_decode/llm_base_proposer.py` | LWD 首轮 embedding 钩子 `_lwd_build_first_pass_embeds` 只对 `method == "mtp"` 生效 |
 | vllm-ascend | `models/deepseek_v41/model.py` | `prepare_engram` / `prepare_engram_inputs` 新增可选参数 `engram_hashes`，传入时跳过算哈希。`engram/hash_state.py` 不改，只有备选方案才改 |
 
 ## 6. 测试要点
 
-- **哈希等价（核心 UT）**：随机 prompt 加随机生成序列，含图片区间与分块边界。"边侧 `LwdEngramHasher` prompt 模式的下标 + 云侧 decode 模式按步、按投机块逐步算出的下标"必须逐位等于 NPU 上真实的原生 `NgramHashState` 在完整序列上的输出，不能只对拍 Python 复刻。维度覆盖 `P ∈ {1, 2, 3, 8, 200}`、图片落在尾部与中部、分块边界、投机块含拒绝与全接受。
-- **哈希器开销**：云侧 decode 模式每步耗时的独立性能测试，以集中式 decode 步时延为基线，据此决定是否捕获成图或改 triton 核（3.1.4 代价段）。
+- **哈希等价，CPU 单测**：`LwdEngramHasher` 的 torch CPU 实现与纯 Python 参考实现逐位对比，维度同下，进 CI，快速覆盖边界情况。
+- **哈希等价，NPU 系统测试（核心）**：随机 prompt 加随机生成序列，含图片区间与分块边界。"边侧 `LwdEngramHasher` prompt 模式的下标 + 云侧 decode 模式按步、按投机块逐步算出的下标"必须逐位等于 NPU 上真实的原生 `NgramHashState` 在完整序列上的输出，不能只对拍 Python 复刻。维度覆盖 `P ∈ {1, 2, 3, 8, 200}`、图片落在尾部与中部、分块边界、投机块含拒绝与全接受。
+- **哈希器开销**：先做 int64 乘、异或、取模的算子微基准，确认是否在 AI Core 执行；再做云侧 decode 模式每步耗时的独立性能测试，以集中式 decode 步时延为基线，据此决定是否捕获成图或改 triton 核（3.1.4 代价段）。
+- **槽位缓存与跨步状态**：padding 行（槽位号 -1）不改动任何有效槽位；dummy、profile 步不带出上一步的下标；出现 `chunk_start < P ≤ pos` 的行时断言报错。
+- **图片占位区段与合成 `input_ids`**：用户文本直接写出占位字符串时，边侧提取的区段与昇腾原生判定一致；混批时 prompt、图片、decode 行在合成 `input_ids` 里的取值正确。
+- **DSpark 首轮输入**：不被 MTP 首轮钩子覆盖。
 - **失败分支**：哈希参数指纹不一致时拉起失败；payload 长度不符或 UP 下标行数与 `P` 不符时报错；尾部乘积缺失时 fail-fast，不能静默回退成 pad。
 - **端到端**：同一批 prompt 在集中式 V4.1 与 LWD 下贪心输出逐 token 比对；开 DSpark 时比较接受率。
 
@@ -405,7 +409,7 @@ flowchart TB
 
 | 阶段 | 范围 | 完成标准 |
 | --- | --- | --- |
-| P0 | 文本 V4.1，无投机：Engram 下标上行、尾部乘积、合成 `input_ids` 缓冲、`LwdEngramHasher` 与 LWD 槽位缓存、云侧合并、解除守卫 | 贪心输出与集中式一致；哈希器每步开销已实测 |
+| P0 | 文本 V4.1，无投机：哈希器 int64 微基准（第一项，其余部分动工前完成）、Engram 下标上行、尾部乘积、合成 `input_ids` 缓冲、`LwdEngramHasher` 与 LWD 槽位缓存、云侧合并、解除守卫 | 贪心输出与集中式一致；哈希器每步开销已实测 |
 | P1 | 视觉：图片占位区段下发、`input_ids` 缓冲里的图片位置、Engram 门控掩码 | 图文 prompt 输出与集中式一致 |
 | P2 | DSpark | 能跑，接受率与集中式同量级 |
 
@@ -416,5 +420,6 @@ flowchart TB
 3. 边侧在 main 上如何构建模型、能否跳过 Engram 表与 decoder 层（老分支用 `make_lwd_layers`，main 上已不存在）。
 4. `stop_token_ids` 走控制面是否可接受。
 5. CED 的 prefill 减半收益本期不做，与原生保持一致，是否接受。
-6. 哈希器实现：边云共用 torch 实现的 `LwdEngramHasher`（倾向，边侧可在 CPU 上跑），与原生 NPU kernel 对拍。云侧 decode 模式的 eager 开销按 3.1.4 代价段的顺序处理，可接受阈值待定。
-7. `LwdEngramHasher` 的文件位置：放现有 `vllm_ascend/worker/lwd_hash/`，还是新建独立包。
+6. 哈希器实现：边云共用 torch 实现的 `LwdEngramHasher`（倾向，边侧可在 CPU 上跑），与原生 NPU kernel 对拍。云侧 decode 模式先做 int64 算子微基准，再按 3.1.4 代价段的顺序处理，可接受阈值待定。
+7. `LwdEngramHasher` 放 vllm 仓：边侧 engine 进程准入时要用它算尾部乘积，vllm 不能依赖 vllm-ascend。具体目录待定：`vllm/distributed/lwd/`、`vllm/v1/lwd_control/`，或新建 lwd 包。
+8. UP payload 布局是否纳入握手校验：接收长度由两侧各自按 config 推算，config 不一致时 HCCL 更可能卡住而不是报错（推断）。建议与哈希参数指纹一起比对。
