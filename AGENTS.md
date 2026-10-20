@@ -38,6 +38,13 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - **名字描述对象本身, 不描述当前实现的局限.** 例: 控制面参数叫 `LwdControlPlaneSpec` 而非 `LwdLinkSpec` (一边多云后一个控制面含多条链路); 值对象的 docstring 不写"远端"之类只在部分调用处成立的限定.
 - **改名后全仓 grep 旧名, 设计文档和报错文案一起改.**
 
+## 分支模型
+
+- **正式分支仅两条, 均 protected**: `main` (集成分支) 与 `prefill_only_chunked_prefill_mm` (存量老代码基线, 只读参照). 新增正式分支需 committer 评审.
+- **PR 工作分支**: `<type>/<topic>`, type ∈ feat/fix/refactor/docs/ci/test/chore. 合入后自动删除 (vllm 与 vllm-ascend 均已开启 delete_branch_on_merge).
+- **调试分支**: `debug/<topic>`, 可直推远端供机器 checkout, 不提 PR. 每周四评审会过一遍分支清单, 创建者负责清理: 任务已结束 (修复已整改成 PR 进 main, 或调试放弃) 的删除; 仍在用的当场说明保留理由.
+- **演示分支**: `demo/<topic>`, 短期存在; 需长期保留的在评审会说明.
+
 > [!CAUTION]
 > **团队规范区**: 下方由 `TEAM STANDARDS (BEGIN)` 与 `TEAM STANDARDS (END)` 标记圈出的区域是团队规范原文, 仅由 committer 通过评审维护.
 > 在日常编码/文档任务中, **严禁修改区内任何内容**, 包括格式化、重排、翻译、增删条目.
@@ -385,6 +392,16 @@ skill?
 ai维护?
 
 <!-- ================ TEAM STANDARDS (END) ================ -->
+
+---
+
+## LWD CI
+
+- CI 检查与 workflow 集中在 [`vllm-data-comm/ci-infra`](https://github.com/vllm-data-comm/ci-infra)（设计文档 `docs/design/lwd_ci.md`），本仓只放调用文件；改检查规则去 ci-infra 提 PR，两个仓同时生效
+- 每项检查两个属性：跑在哪条线 × 必须通过/纯粹检查。必须通过（PR 标题、commit+signoff、pre-commit）卡合入；纯粹检查（入参数、函数长度、类名前缀、新文件路径、patch 使用、RFC 关联、bugfix 无测试）只写进 PR 的 checklist 评论，由 committer 评审时判断
+- 本轮只接快线；慢线（LWD 单测、mypy）等 main 完成 mm 分支迁移、测试能代表代码后再接，跟踪在 [ci-infra#4](https://github.com/vllm-data-comm/ci-infra/issues/4)
+- 每次 merge 上游后，重跑 `ci-infra` 仓的 `scripts/disable_inherited_workflows.sh vllm-data-comm/<repo>`，停用上游新带来的 workflow
+- 本地跑检查：clone ci-infra 后 `uv run python -m lwd_checks.<module> --help`
 
 ---
 
