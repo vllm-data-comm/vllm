@@ -228,7 +228,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         values["stop_token_ids"] = list(values["stop_token_ids"])
         sampling_params = SamplingParams(**values)
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
-        LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
+        LwdControlDiag.cloud_request_admitted(req_notify.request_id, sampling_params)
         return sampling_params
 
     def step_with_batch_queue(self):

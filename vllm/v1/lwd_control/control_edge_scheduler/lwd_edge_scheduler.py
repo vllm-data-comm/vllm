@@ -109,6 +109,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_chunk_unit: int = (
             threshold if threshold > 0 else self.max_num_scheduled_tokens
         )
+        self._lwd_diag = LwdControlDiag()
         self._lwd_check_deadlock_config()
 
     def _lwd_check_deadlock_config(self) -> None:
@@ -137,7 +138,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def schedule(self) -> SchedulerOutput:
         """EMBED 优先出批,否则消费 c2e 出 UNEMBED 批(先收尾再开新,
         防 EMBED 被 decode 回程挤出深度配额)。"""
-        LwdControlDiag.edge_step_activity(
+        self._lwd_diag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
         )
@@ -243,12 +244,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
-            LwdControlDiag.edge_tokens_delivered(
-                request_id,
-                sampled_token_ids,
-                finish_reason,
-                self.vllm_config,
-            )
             if not sampled_token_ids and not finished_now:
                 # [Lwd][eos-trace] B 点:kill 行留痕,按 down_seqno 与
                 # A(云零接受行)/C(worker 缺行)配对定案根因

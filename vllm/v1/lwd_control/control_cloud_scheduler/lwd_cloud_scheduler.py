@@ -76,10 +76,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carrier = getattr(model_runner_output, "lwd_down_carrier", None)
         if carrier is not None:
             meta = self._lwd_carrier_to_meta(carrier)
-            LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
             finish_reasons = self._lwd_c2e_finish_reasons(
                 meta.req_ids, engine_core_outputs
             )
+            LwdControlDiag.cloud_step(meta.req_ids, finish_reasons, self.requests)
             # [Lwd][eos-trace] A 点:零接受行留痕(kill 根因定位,
             # 打原始行集——零接受活行剔除已随 4 卡修复一并移除,此处
             # 仅作发生率观测)

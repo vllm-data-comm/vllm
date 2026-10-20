@@ -1,38 +1,41 @@
-"""LWD 控制面诊断中枢:开关现读、spec 接受率观测、诊断旁路的判定与
-载荷提取、debug 打点转发。
+"""LWD control-plane diagnostics: live-read switches, spec acceptance
+observation, bypass decisions and payloads, and diagnostic logs.
 
-功能类(调度器/引擎)只经本模块触达诊断——不散读 env 开关、不直接
-import vllm.v1.lwd_debug;诊断逻辑不与功能接口糅合,开关/旁路/观测
-的增删只改这里。边界:本模块只出"判定与数据"(开关布尔、旁路行
-集、累计读数),不持执行适配器(future/伪输出等 executor 边界契约
-归引擎)。
+Schedulers and engines only call into this module; adding or removing a
+switch, bypass or diagnostic log touches only this file. The module
+returns decisions and data (switch booleans, bypass rows, running
+totals) and owns no executor adapters (bypass futures and stub outputs
+belong to the engine).
 
-诊断行为定义(排障口径):
-  - SKIP_SAMPLE(边免采样):云侧把本步逐请求 accepted token ids 随
-    c2e 捎带,边侧跳过 lm_head 采样还原;
-  - DISABLE_DOWN(全直通):云不 collect、不发 DOWN 张量,c2e 以
-    hidden=0 携带 token ids 直传,边侧收割直接交付。
-两者均严格 == "1" 且按调用点现读(进程内改 env 即时生效,与
-vllm-ascend 侧 envs.py 读法同名同义)。
+Bypass semantics:
+  - SKIP_SAMPLE: the cloud piggybacks each request's accepted token ids
+    on c2e, and the edge skips lm_head sampling.
+  - DISABLE_DOWN: the cloud neither collects nor sends DOWN tensors; c2e
+    carries the token ids with hidden=0 and the edge delivers them as is.
+Both are on only when strictly == "1" and are read at each call site, so
+an in-process env change takes effect immediately.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import time
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+from vllm.lwd_logger import lwd_logger
+
+if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request
 
 _LWD_ENV_PREFIX = "VLLM_ASCEND_LWD_"
 
 # spec 接受率周期直出间隔(累计器常驻,周期打点)
 _SPEC_LOG_INTERVAL_S = 10.0
 
-
-def _lwd_debug_mods():
-    """lwd_debug 惰性进口:本模块顶层保持零重依赖(纯逻辑可测),
-    lwd_control 内对 lwd_debug 的 import 仍唯一收口在这里。"""
-    from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
-
-    return LwdControlLog, LwdDebug, LwdLogBase
+_EDGE_FLIGHT_LOG_INTERVAL_S = 5.0
 
 
 class LwdControlDiag:
@@ -55,51 +58,78 @@ class LwdControlDiag:
         """DISABLE_DOWN 诊断开关:云不 collect/不发 DOWN,边直通交付。"""
         return os.getenv(_LWD_ENV_PREFIX + "DISABLE_DOWN") == "1"
 
-    # ------------------------------------------------------------------ #
-    # debug 打点转发(lwd_debug 在 lwd_control 内的唯一进口)            #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def set_debug(enabled: bool) -> None:
-        """层日志总开关(env 已开则不动,config 段开则补开,仅本进程)。"""
-        _, _, log_base = _lwd_debug_mods()
-        log_base.set_debug(enabled)
-
-    @staticmethod
-    def edge_step_activity(running: int, awaiting: int) -> None:
-        """边侧每步活力度打点(running 数 / decode 相位驻留数)。"""
-        control_log, _, _ = _lwd_debug_mods()
-        control_log.flight(running, awaiting)
-
-    @staticmethod
-    def edge_tokens_delivered(
-        request_id, sampled_token_ids, finish_reason, vllm_config
-    ) -> None:
-        """边侧逐请求交付打点。"""
-        _, debug, _ = _lwd_debug_mods()
-        debug.edge_tokens_delivered(
-            request_id, sampled_token_ids, finish_reason, vllm_config
-        )
-
-    @staticmethod
-    def cloud_step(scheduler, meta, engine_core_outputs) -> None:
-        """云侧步元数据打点。"""
-        _, debug, _ = _lwd_debug_mods()
-        debug.cloud_step(scheduler, meta, engine_core_outputs)
-
-    @staticmethod
-    def cloud_request_admitted(wire, sampling_params) -> None:
-        """云侧请求过门打点。"""
-        _, debug, _ = _lwd_debug_mods()
-        debug.cloud_request_admitted(wire, sampling_params)
-
-    # ------------------------------------------------------------------ #
-    # spec 接受率观测(累计器住此类,原生同口径)                       #
-    # ------------------------------------------------------------------ #
     def __init__(self) -> None:
         self._spec_draft_tokens = 0
         self._spec_accepted = 0
         self._spec_last_log = time.monotonic()
+        self._edge_flight_last_log = float("-inf")
 
+    # ------------------------------------------------------------------ #
+    # Diagnostic logs                                                    #
+    # ------------------------------------------------------------------ #
+    def edge_step_activity(self, num_in_flight: int, num_decode: int) -> None:
+        """Rate-limited in-flight level of the edge scheduler.
+
+        Every request in the edge `running` list is in flight: prefill
+        rows still send embeds, decode rows await cloud results.
+        """
+        now = time.monotonic()
+        if now - self._edge_flight_last_log < _EDGE_FLIGHT_LOG_INTERVAL_S:
+            return
+        self._edge_flight_last_log = now
+        lwd_logger.info(
+            "[edge-flight] in_flight=%d prefill=%d decode=%d",
+            num_in_flight,
+            num_in_flight - num_decode,
+            num_decode,
+        )
+
+    @staticmethod
+    def cloud_request_admitted(
+        request_id: str, sampling_params: SamplingParams
+    ) -> None:
+        """Stop parameters the cloud rebuilt from the request notify."""
+        lwd_logger.debug(
+            "[cloud-finish] req=%s admitted: max_tokens=%s eos=%s "
+            "stop_ids=%s min_tokens=%s ignore_eos=%s",
+            request_id,
+            sampling_params.max_tokens,
+            sampling_params.eos_token_id,
+            sampling_params.stop_token_ids,
+            sampling_params.min_tokens,
+            sampling_params.ignore_eos,
+        )
+
+    @staticmethod
+    def cloud_step(
+        req_ids: list[str],
+        finish_reasons: list[int],
+        requests: Mapping[str, Request],
+    ) -> None:
+        """Per-row token progress and c2e finish code of one cloud step."""
+        if not lwd_logger.isEnabledFor(logging.DEBUG):
+            return
+        for request_id, finish in zip(req_ids, finish_reasons):
+            request = requests.get(request_id)
+            if request is None:
+                lwd_logger.debug(
+                    "[cloud-finish] req=%s finish=%d (not in scheduler)",
+                    request_id,
+                    finish,
+                )
+                continue
+            output_token_ids = request.output_token_ids
+            lwd_logger.debug(
+                "[cloud-finish] req=%s out_len=%d last_tok=%s finish=%d",
+                request_id,
+                request.num_output_tokens,
+                output_token_ids[-1] if output_token_ids else None,
+                finish,
+            )
+
+    # ------------------------------------------------------------------ #
+    # spec 接受率观测(累计器住此类,原生同口径)                       #
+    # ------------------------------------------------------------------ #
     def observe_spec_acceptance(
         self, scheduler_output, model_runner_output, requests
     ) -> None:
@@ -131,8 +161,6 @@ class LwdControlDiag:
         self._spec_last_log = now
         if not self._spec_draft_tokens:
             return
-        from vllm.lwd_logger import lwd_logger
-
         rate = self._spec_accepted / self._spec_draft_tokens * 100
         lwd_logger.info(
             "[spec] cumulative: rate=%.1f%% accepted=%d "
@@ -223,8 +251,6 @@ class LwdControlDiag:
             req_ids, accepted, finish_reasons
         )
         if rows:
-            from vllm.lwd_logger import lwd_logger
-
             lwd_logger.info(
                 "[eos-trace] cloud seqno=%s zero-accept rows "
                 "(rid,acc,fin)=%s",
@@ -244,8 +270,6 @@ class LwdControlDiag:
         A/C 日志配对。accepted 与 sampled_rows 是判定主证——
         accepted=0 → 云组行(零接受活行进了行集);accepted>0 且
         sampled_rows>0 → worker 单行缺;sampled_rows=0 → 整批空回填。"""
-        from vllm.lwd_logger import lwd_logger
-
         lwd_logger.info(
             "[eos-trace] edge kill seqno=%s rid=%s accepted=%d "
             "finish=%d batch_rows=%d sampled_rows=%d",
@@ -286,8 +310,6 @@ class LwdControlDiag:
             req_ids, accepts, result_req_ids, sampled_token_ids
         )
         if missing:
-            from vllm.lwd_logger import lwd_logger
-
             lwd_logger.info(
                 "[eos-trace] worker seqno=%s missing rows=%s",
                 seqno, missing,
