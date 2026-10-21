@@ -43,6 +43,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # 闸门一次性日志的 seqno 台账:HOLD 首查记一次,OPEN 时清掉再记一次
+        self._lwd_gate_logged: set[int] = set()
         # prefill 通知队列:引擎 ingest 线程投递边侧批量 RangeNotify,本线程每步
         # 至多消费队首一条;预告自带 seqno 即本批 UP 链配对号。引擎侧经
         # self.scheduler.prefill_notify_queue 借引用投递/清扫(线程纪律
@@ -245,12 +247,30 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """提前收闸门:该 seqno 的 UP 数据收完才放行;判据 = 通道水位(FIFO 完成序)。"""
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             is_irecv_complete,
+            watermark,
         )
         from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
         ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
         # [Lwd][pre-recv] 闸门读数:与 HINT/SUBMIT/DONE/REPORT/POST 用同一单调钟,
         # 可把"预告到达->worker挂recv->worker收完上报->引擎放行"四段直接相减。
+        # 每 seqno 只打一次(HOLD 首查与 OPEN),避免每步空转刷屏。
+        seen = self._lwd_gate_logged
+        if ready:
+            if notify.seqno in seen:
+                return True
+            seen.discard(notify.seqno)
+            lwd_logger.info(
+                "[cloud-sched] notify seqno=%d gate OPEN watermark=%d",
+                notify.seqno, watermark(LwdChannelType.UP),
+            )
+        elif notify.seqno not in seen:
+            seen.add(notify.seqno)
+            lwd_logger.info(
+                "[cloud-sched] notify seqno=%d gate HOLD watermark=%d "
+                "(UP 未收齐;后续静默重试)",
+                notify.seqno, watermark(LwdChannelType.UP),
+            )
         return ready
 
     def _lwd_preflight_ok(self, items: list[LwdRangeItem], num_decode: int) -> bool:
@@ -291,7 +311,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             return False
         return True
 
-    def schedule(self) -> SchedulerOutput:
+    def _lwd_schedule_step(self) -> SchedulerOutput:
         """混排调度:每步四道门决策——条目对账(all-or-nothing)→ 提前收
         水位 → preflight 三检 → 混排步;任一门不过即本步 decode-only,
         预告留队首下步重试。"""

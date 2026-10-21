@@ -99,3 +99,24 @@ def test_bypass_unembed_rows_gating(monkeypatch):
         batch_meta=SimpleNamespace(req_ids=["a"], token_ids=[]),
     )
     assert LwdControlDiag.bypass_unembed_rows(empty) is None
+
+
+def test_debug_forwarding_degrades_to_noop_without_lwd_debug_package():
+    """断点4回归(issue #18):vllm.v1.lwd_debug 未迁入 main 时,打点转发
+    降级为 no-op 而不是 ModuleNotFoundError——首个请求/首个 step 必然
+    经过这些转发点。包迁入后同一路径自动恢复真实打点。"""
+    from vllm.v1.lwd_control.lwd_control_diag.lwd_control_diag import (
+        _lwd_debug_mods,
+    )
+
+    control_log, debug, log_base = _lwd_debug_mods()
+    # 无论降级与否,三个入口都必须可调用且不抛异常
+    log_base.set_debug(True)
+    control_log.flight(3, 1)
+    debug.edge_tokens_delivered("req-1", [1, 2, 3], None, None)
+    debug.cloud_step(None, None, None)
+    debug.cloud_request_admitted(None, None)
+    # 功能侧转发点同样不抛
+    LwdControlDiag.set_debug(True)
+    LwdControlDiag.edge_step_activity(3, 1)
+    LwdControlDiag.cloud_request_admitted(None, None)

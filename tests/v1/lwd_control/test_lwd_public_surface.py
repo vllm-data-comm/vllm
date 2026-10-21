@@ -37,6 +37,7 @@ def test_module_inventory():
     """核心模块存在性(不触发 torch 依赖的执行)。"""
     for name in [
         "vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler",
+        "vllm.v1.lwd_control.control_scheduler.lwd_chunk_align",
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine",
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler",
         "vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine",

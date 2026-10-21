@@ -1792,9 +1792,18 @@ def init_distributed_environment(
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
+    if config is not None and config.lwd_config is not None:
+        # LWD: the incoming rank is the instance-local TP rank; join the one
+        # shared world the topology describes (global rank + wire store).
+        from vllm.distributed.lwd import get_lwd_distributed_args
+
+        world_size, rank, distributed_init_method = get_lwd_distributed_args(
+            config, rank
+        )
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if (
         config is not None
+        and config.lwd_config is None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
         and (
             config.parallel_config.nnodes > 1

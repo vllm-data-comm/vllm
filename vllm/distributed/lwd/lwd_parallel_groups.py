@@ -5,14 +5,15 @@
 Design: docs/design/lwd_data_plane.md.
 """
 
+from __future__ import annotations
+
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from vllm.config.lwd import LwdTopology
-
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.lwd import LwdTopology
 
 LwdRankGroup = tuple[int, ...]
 

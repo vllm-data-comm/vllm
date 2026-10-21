@@ -29,10 +29,40 @@ _SPEC_LOG_INTERVAL_S = 10.0
 
 def _lwd_debug_mods():
     """lwd_debug 惰性进口:本模块顶层保持零重依赖(纯逻辑可测),
-    lwd_control 内对 lwd_debug 的 import 仍唯一收口在这里。"""
-    from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
-
+    lwd_control 内对 lwd_debug 的 import 仍唯一收口在这里。
+    Fallback: vllm.v1.lwd_debug is not migrated to main yet (issue #18
+    breakpoint 4); until it lands, degrade to no-op shims so first-request
+    diagnostics do not crash — the real classes take over automatically
+    once the package exists."""
+    try:
+        from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
+    except ImportError:
+        return _LwdDebugNoOp, _LwdDebugNoOp, _LwdDebugNoOp
     return LwdControlLog, LwdDebug, LwdLogBase
+
+
+class _LwdDebugNoOp:
+    """No-op stand-in for the not-yet-migrated vllm.v1.lwd_debug classes."""
+
+    @staticmethod
+    def set_debug(enabled: bool) -> None:
+        pass
+
+    @staticmethod
+    def flight(running: int, awaiting: int) -> None:
+        pass
+
+    @staticmethod
+    def edge_tokens_delivered(*args: object, **kwargs: object) -> None:
+        pass
+
+    @staticmethod
+    def cloud_step(*args: object, **kwargs: object) -> None:
+        pass
+
+    @staticmethod
+    def cloud_request_admitted(*args: object, **kwargs: object) -> None:
+        pass
 
 
 class LwdControlDiag:

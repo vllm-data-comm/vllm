@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Generate one LWD deployment: topology yaml + edge/cloud serve scripts.
+
+Site-stable settings (HCCL/allocator/perf env vars) are fixed in
+``site_env_exports`` below; per-deployment values come from CLI args. The
+topology is produced by the vllm repo's ``tools/gen_lwd_topology.py`` so the
+file schema stays the single source of truth.
+
+Example (defaults match the 2026-10 1-edge + 8-cloud Qwen3.6 deployment):
+
+    python3 gen_lwd_serve.py \
+        --edge-ip 76.76.26.194 --cloud-ip 76.76.26.190 \
+        --edge-devices 3 --cloud-devices 0,1,2,3,4,5,6,7 \
+        -o /vllm-workspace/lwd_launch
+
+Outputs (sync the whole directory to BOTH nodes, same absolute path):
+    <out>/lwd_topology.yaml
+    <out>/serve_edge.sh
+    <out>/serve_cloud.sh
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+# The repo this script lives in; works for checkouts and deploy trees alike.
+DEFAULT_VLLM_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CODEBASE_DIR = "/vllm-workspace"
+
+
+def site_env_exports(
+    host_ip: str,
+    nic: str,
+    master_addr: str,
+    devices: str,
+    log_level: str,
+    codebase_dir: str,
+) -> str:
+    """Env block shared by edge and cloud; only the per-node values differ."""
+    pairs = [
+        ("VLLM_HOST_IP", host_ip),
+        ("GLOO_SOCKET_IFNAME", nic),
+        ("TP_SOCKET_IFNAME", nic),
+        ("HCCL_SOCKET_IFNAME", nic),
+        ("PYTORCH_NPU_ALLOC_CONF", '"expandable_segments:True"'),
+        ("HCCL_OP_EXPANSION_MODE", '"AIV"'),
+        ("MASTER_ADDR", master_addr),
+        ("TORCH_DISTRIBUTED_DETAIL", "DEBUG"),
+        ("VLLM_WORKER_MULTIPROC_METHOD", "spawn"),
+        ("HCCL_BUFFSIZE", "1024"),
+        ("OMP_PROC_BIND", "false"),
+        ("OMP_NUM_THREADS", "1"),
+        ("LD_PRELOAD", "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD"),
+        ("TASK_QUEUE_ENABLE", "1"),
+        ("CODEBASE_DIR", f'"{codebase_dir}"'),
+        (
+            "PYTHONPATH",
+            '"${CODEBASE_DIR}/vllm-ascend:${CODEBASE_DIR}/vllm:${PYTHONPATH}"',
+        ),
+        ("VLLM_ASCEND_ENABLE_PREFETCH_MLP", "1"),
+        ("VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE", "1"),
+        ("VLLM_ASCEND_ENABLE_NZ", "1"),
+        ("VLLM_ASCEND_ENABLE_FUSED_MC2", "1"),
+        ("VLLM_ASCEND_GDN_FAST_PATH", "1"),
+        ("VLLM_ASCEND_GDN_MAX_PADDING_RATIO", "2.0"),
+        ("VLLM_ASCEND_GDN_MAX_H_OVERALLOC_RATIO", "2.0"),
+        ("ASCEND_RT_VISIBLE_DEVICES", devices),
+        ("VLLM_LWD_LOG_LEVEL", log_level),
+    ]
+    return "".join(f"export {key}={value}\n" for key, value in pairs)
+
+
+def additional_config(topology_path: Path, role: str) -> str:
+    payload = {
+        "enable_cpu_binding": True,
+        "lwd_config": {
+            "path": str(topology_path),
+            "role": role,
+            "instance_id": 0,
+        },
+    }
+    return "'" + json.dumps(payload, separators=(",", ":")) + "'"
+
+
+def cudagraph_config(mode: str, sizes: list[int] | None) -> str:
+    payload: dict[str, object] = {"cudagraph_mode": mode}
+    if sizes is not None:
+        payload["cudagraph_capture_sizes"] = sizes
+    return "'" + json.dumps(payload) + "'"
+
+
+def speculative_config(method: str, tokens: int) -> str:
+    return (
+        "'"
+        + json.dumps(
+            {
+                "method": method,
+                "num_speculative_tokens": tokens,
+                "enforce_eager": True,
+            }
+        )
+        + "'"
+    )
+
+
+def flag(*parts: object) -> str:
+    """One CLI flag as a single line item, e.g. flag('--port', 9724)."""
+    return " ".join(str(part) for part in parts)
+
+
+def serve_cmd(model: str, flags: list[str]) -> str:
+    return " \\\n    ".join(["vllm serve " + shlex.quote(model)] + flags) + "\n"
+
+
+def common_flags(args: argparse.Namespace, topology: Path) -> list[str]:
+    return [
+        flag("--master-addr", args.master_addr),
+        flag("--master-port", args.master_port),
+        flag("--max-model-len", args.max_model_len),
+        flag("--served-model-name", args.served_name),
+        "--trust-remote-code",
+        flag("--max-num-seqs", args.max_num_seqs),
+        flag("--max-num-batched-tokens", args.max_num_batched_tokens),
+        "--async-scheduling",
+        flag("--gpu-memory-utilization", args.gpu_memory_utilization),
+    ]
+
+
+def edge_script(args: argparse.Namespace, topology: Path) -> str:
+    flags = [
+        flag("--host", "0.0.0.0"),
+        flag("--port", args.edge_http_port),
+        *common_flags(args, topology),
+        "--pipeline-parallel-size 1",
+        "--tensor-parallel-size 1",
+        flag("--additional-config", additional_config(topology, "edge")),
+        flag("--compilation-config", cudagraph_config("NONE", None)),
+    ]
+    header = site_env_exports(
+        args.edge_ip, args.nic, args.master_addr, args.edge_devices,
+        args.lwd_log_level, args.codebase_dir,
+    )
+    return "#!/bin/sh\n# LWD edge (generated by gen_lwd_serve.py)\n" + header + "\n" + serve_cmd(args.model, flags)
+
+
+def cloud_script(args: argparse.Namespace, topology: Path) -> str:
+    sizes = list(
+        range(args.capture_size_min, args.capture_size_max + 1, args.capture_size_step)
+    )
+    flags = [
+        *common_flags(args, topology),
+        "--pipeline-parallel-size 1",
+        flag("--tensor-parallel-size", len(args.cloud_devices.split(","))),
+        # NOT --headless: headless expects an external LB supervisor to answer
+        # the engine startup handshake; standalone, engines time out after 5
+        # minutes. A plain (unused) API server on its own port answers it.
+        flag("--port", args.cloud_http_port),
+        flag("--additional-config", additional_config(topology, "cloud")),
+        flag("--compilation-config", cudagraph_config(args.cloud_cudagraph_mode, sizes)),
+    ]
+    if args.spec_tokens > 0:
+        flags += [flag("--speculative-config", speculative_config(args.spec_method, args.spec_tokens))]
+    header = site_env_exports(
+        args.cloud_ip, args.nic, args.master_addr, args.cloud_devices,
+        args.lwd_log_level, args.codebase_dir,
+    )
+    return "#!/bin/sh\n# LWD cloud (generated by gen_lwd_serve.py)\n" + header + "\n" + serve_cmd(args.model, flags)
+
+
+def gen_topology(args: argparse.Namespace, topology: Path) -> None:
+    tool = args.vllm_dir / "tools" / "gen_lwd_topology.py"
+    if not tool.is_file():
+        raise SystemExit(f"[gen_lwd_serve] topology tool not found: {tool} (check --vllm-dir)")
+    cmd = [
+        sys.executable, str(tool),
+        "--scene", "single_instance",
+        "--edge-machines", args.edge_ip,
+        "--cloud-machines", args.cloud_ip,
+        "--cloud-cards", f"0:{len(args.cloud_devices.split(','))}",
+        "--dp", "1",
+        "--port-base", str(args.ctrl_port_base),
+        "-o", str(topology),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(
+            "[gen_lwd_serve] topology generation failed:\n"
+            + proc.stdout + proc.stderr
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    deploy = parser.add_argument_group("per-deployment values")
+    deploy.add_argument("--edge-ip", required=True)
+    deploy.add_argument("--cloud-ip", required=True)
+    deploy.add_argument("--edge-devices", default="3", help="ASCEND_RT_VISIBLE_DEVICES of the edge node")
+    deploy.add_argument("--cloud-devices", default="0,1,2,3,4,5,6,7")
+    deploy.add_argument("--master-addr", default=None, help="default: edge ip")
+    deploy.add_argument("--master-port", type=int, default=29600)
+    deploy.add_argument("--edge-http-port", type=int, default=9724)
+    deploy.add_argument("--cloud-http-port", type=int, default=9725,
+                        help="cloud's own API server port; unused by clients, "
+                        "but the front-end must run to answer the engine "
+                        "startup handshake")
+    deploy.add_argument("--ctrl-port-base", type=int, default=5550, help="cloud control-plane port in the topology")
+    deploy.add_argument("--model", default="/weight/Qwen3.6-27B/")
+    deploy.add_argument("--served-name", default="qwen3.6")
+    deploy.add_argument("--max-model-len", type=int, default=262144)
+    deploy.add_argument("--max-num-seqs", type=int, default=230)
+    deploy.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    deploy.add_argument("--gpu-memory-utilization", type=float, default=0.95)
+    deploy.add_argument("--spec-method", default="qwen3_5_mtp")
+    deploy.add_argument("--spec-tokens", type=int, default=3, help="0 disables the speculative config")
+    deploy.add_argument("--cloud-cudagraph-mode", default="FULL_DECODE_ONLY")
+    deploy.add_argument("--capture-size-min", type=int, default=8)
+    deploy.add_argument("--capture-size-max", type=int, default=800)
+    deploy.add_argument("--capture-size-step", type=int, default=8)
+    deploy.add_argument("--lwd-log-level", default="INFO")
+    site = parser.add_argument_group("site-stable values (rarely change)")
+    site.add_argument("--nic", default="enp189s0f0")
+    site.add_argument("--codebase-dir", default=DEFAULT_CODEBASE_DIR)
+    site.add_argument("--vllm-dir", type=Path, default=DEFAULT_VLLM_DIR)
+    parser.add_argument("--skip-topology", action="store_true",
+                        help="only regenerate the two serve scripts")
+    parser.add_argument("-o", "--out", type=Path, default=Path("lwd_launch"))
+    args = parser.parse_args()
+    if args.master_addr is None:
+        args.master_addr = args.edge_ip
+    return args
+
+
+def validate(args: argparse.Namespace) -> None:
+    for name in ("edge_ip", "cloud_ip", "master_addr"):
+        try:
+            ipaddress.ip_address(getattr(args, name))
+        except ValueError as exc:
+            raise SystemExit(f"[gen_lwd_serve] invalid --{name.replace('_', '-')}: {exc}")
+    for name, count in (("edge-devices", 1), ("cloud-devices", 8)):
+        value = getattr(args, name.replace("-", "_"))
+        devices = [d.strip() for d in value.split(",") if d.strip()]
+        if not devices or len(devices) != len(set(devices)):
+            raise SystemExit(f"[gen_lwd_serve] --{name} must be a comma list of unique device ids")
+        # The upstream topology tool gives one rank per edge instance today.
+        limit = 1 if name == "edge-devices" else None
+        if limit is not None and len(devices) != limit:
+            raise SystemExit(
+                f"[gen_lwd_serve] --{name} currently supports exactly {limit} device "
+                f"(gen_lwd_topology.py allocates one rank per edge instance), got {devices}"
+            )
+    if not 0 < args.gpu_memory_utilization <= 1:
+        raise SystemExit("[gen_lwd_serve] --gpu-memory-utilization must be in (0, 1]")
+    if args.spec_tokens < 0:
+        raise SystemExit("[gen_lwd_serve] --spec-tokens must be >= 0")
+    if args.capture_size_min > args.capture_size_max or args.capture_size_step < 1:
+        raise SystemExit("[gen_lwd_serve] invalid capture size range/step")
+
+
+def main() -> None:
+    args = parse_args()
+    validate(args)
+    out_dir = args.out.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    topology = out_dir / "lwd_topology.yaml"
+
+    if args.skip_topology:
+        if not topology.is_file():
+            raise SystemExit(f"[gen_lwd_serve] --skip-topology but {topology} is missing")
+    else:
+        gen_topology(args, topology)
+
+    (out_dir / "serve_edge.sh").write_text(edge_script(args, topology), encoding="utf-8")
+    (out_dir / "serve_cloud.sh").write_text(cloud_script(args, topology), encoding="utf-8")
+    for script in ("serve_edge.sh", "serve_cloud.sh"):
+        os.chmod(out_dir / script, 0o755)
+
+    print(f"[gen_lwd_serve] wrote {out_dir}/{{lwd_topology.yaml,serve_edge.sh,serve_cloud.sh}}")
+    print(f"[gen_lwd_serve] topology baked into both scripts: {topology}")
+    print(f"[gen_lwd_serve] open cloud firewall port {args.ctrl_port_base} (control plane ROUTER)")
+    print("[gen_lwd_serve] sync the whole directory to BOTH nodes at the SAME absolute path")
+
+
+if __name__ == "__main__":
+    main()

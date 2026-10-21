@@ -32,6 +32,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_chunk_align import (
+    lwd_apply_chunk_align_profile,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -61,6 +64,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
+
+    def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
+        # The prefill-only edge runs no transformer layers, so it holds zero
+        # cacheable KV groups; the KV cache coordinator (upstream and the
+        # Ascend patch) asserts "requires at least one cacheable group" while
+        # caching is on. Disable prefix caching before the native engine
+        # builds it — the same situation the upstream config handles for
+        # encoder-only instances, kept here to leave that file untouched.
+        cache_config = kwargs["vllm_config"].cache_config
+        if cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+        super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
 
     def _lwd_assemble(self) -> None:
         self._lwd_cloud_params: LwdCloudParamsNotify | None = None
@@ -113,6 +128,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, LwdC2eNotify):
+            lwd_logger.info(
+                "[edge] c2e received reqs=%d hidden_numel=%d",
+                len(msg.req_ids), msg.hidden_num_elements,
+            )
             self.scheduler.unembed_notify_queue.append(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
@@ -168,6 +187,22 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
                     f"increase max_num_batched_tokens or decrease max_num_seqs"
                 )
+        # Chunk-cutting profile: the cloud's native schedule() re-cuts chunks
+        # through branches the edge cannot derive locally (mamba block
+        # alignment, MTP prefill lookahead); without adopting them the edge
+        # sends chunk rows the cloud will not schedule verbatim (the INJECT
+        # window mismatch). Old clouds predate the field: fail fast instead
+        # of scheduling chunks the cloud would silently re-cut.
+        if params.chunk_align is None:
+            raise RuntimeError(
+                "[LWD] cloud sent no chunk alignment profile (cloud older "
+                "than the edge?); deploy matching versions on both sides"
+            )
+        lwd_apply_chunk_align_profile(
+            self.scheduler,
+            self.vllm_config.cache_config,
+            params.chunk_align,
+        )
         lwd_logger.info("[cloud-params] scheduling limits verified: %s", local)
 
     def _lwd_send_to_cloud(self, message: LwdEdgeToCloudMessage) -> None:
@@ -189,6 +224,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
         """边准入(校验+mrope,调度器本地账) -> 云请求预告(通信归引擎)
         -> 原生引擎入口(原生校验 + 入队 + abort_immediately 原生处理)。"""
+        lwd_logger.info(
+            "[edge] request received req=%s tokens=%d (admit + announce)",
+            request.request_id, request.num_prompt_tokens,
+        )
         self.scheduler.lwd_admit_request(request)
         self._lwd_notify_request(request)
         super().add_request(request)

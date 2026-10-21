@@ -21,11 +21,15 @@ from vllm.v1.engine.core import EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
+from vllm.v1.lwd_control.lwd_hash_chain import lwd_cloud_block_hasher
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
+)
+from vllm.v1.lwd_control.control_scheduler.lwd_chunk_align import (
+    lwd_build_chunk_align_profile,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -46,6 +50,7 @@ from vllm.v1.request import Request
 _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 
+
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
 
@@ -55,16 +60,51 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     lwd_scheduler_cls = LwdCloudScheduler
     scheduler: LwdCloudScheduler
 
+    def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
+        # Pre-recv hint MQ must exist before super().__init__ spawns the
+        # executor workers (same process): create_hint_mq() publishes the
+        # handle through the environment, and only processes spawned after
+        # that see it. The sideband MQ exists because rpc_broadcast_mq is
+        # drained by the worker's single-threaded busy loop, which sits
+        # inside a several-hundred-ms prefill forward - hints queued behind
+        # it would lose the whole point of pre-posting the receive.
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import create_hint_mq
+
+        self._lwd_hint_mq = create_hint_mq()
+        super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
+        # The cloud endpoint worker published its done-report MQ handle to
+        # the wire TCP store during init_device (same rendezvous the
+        # deployment already depends on); acquire the reader here - the
+        # workers are ready, so the key is set. This keeps the vllm
+        # executor entirely free of LWD plumbing.
+        from vllm.distributed.lwd import get_lwd_init_method
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import acquire_done_mq
+
+        assert self.vllm_config.lwd_config is not None
+        self._lwd_done_mq = acquire_done_mq(
+            get_lwd_init_method(self.vllm_config.lwd_config)
+        )
+        lwd_logger.info(
+            "[pre-recv] hint MQ created by engine, done MQ attached: %s",
+            "OK" if self._lwd_done_mq is not None else "NONE",
+        )
+
     def _lwd_assemble(self) -> None:
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits the edge checks (same inputs of the cap/preflight
-        # formulas on both sides).
+        # formulas on both sides); the chunk align profile carries the
+        # cloud-only chunk-cutting branches (mamba block alignment, MTP
+        # prefill lookahead) the edge adopts so its native schedule() cuts
+        # chunks exactly like this side will.
         self._lwd_cloud_params = LwdCloudParamsNotify(
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
+            chunk_align=lwd_build_chunk_align_profile(
+                self.scheduler, self.vllm_config.cache_config
+            ),
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -112,12 +152,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
 
     def _lwd_register_recv_hint(self) -> None:
-        """[Lwd][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker
-        通信线程。走 executor 上的旁路 MQ(不是 rpc_broadcast_mq:那条由
-        busy_loop 单线程消费,会被几百毫秒的 prefill 前向堵住,提示就
-        "早"不起来了)。引擎在 super().__init__ 里就把 executor 建好了,
-        故此处直接取。"""
-        hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
+        """[LWD][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker
+        通信线程。走本引擎在 __init__ 里建的旁路 MQ(不是 rpc_broadcast_mq:
+        那条由 busy_loop 单线程消费,会被几百毫秒的 prefill 前向堵住,提示就
+        "早"不起来了)。"""
+        hint_mq = self._lwd_hint_mq
         if hint_mq is not None:
             from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 register_hint_sender,
@@ -158,6 +197,10 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     ) -> None:
         """Ingest thread: range notify -> notify queue + pre-recv hint;
         request notify -> native ADD."""
+        lwd_logger.info(
+            "[cloud] ingest msg=%s seqno=%s",
+            type(msg).__name__, getattr(msg, "seqno", "-"),
+        )
         # TODO(lwd): several edges per cloud DP rank need requests tracked by
         # the peer that owns them, issue #8.
         if isinstance(msg, LwdRangeNotify):
@@ -181,10 +224,18 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             aux_rows = 0
             # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
             # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
+            lwd_logger.info(
+                "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
+                msg.seqno, num_tokens, time.monotonic(),
+            )
             post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
         elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+            lwd_logger.info(
+                "[cloud] request added req=%s tokens=%d",
+                msg.request_id, msg.num_prompt_tokens,
+            )
 
     def shutdown(self) -> None:
         # Before the executor goes: a pre-recv hint blocks on its queue.
@@ -216,6 +267,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
+            block_hasher=lwd_cloud_block_hasher(
+                self.vllm_config,
+                self.scheduler.kv_cache_config,
+                req_notify.block_hashes,
+            ),
         )
         return request
 
@@ -226,6 +282,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         判定;云侧无客户端 generation_config,传空)。"""
         values = {f: getattr(req_notify, f) for f in LWD_SAMPLING_DEFAULTS}
         values["stop_token_ids"] = list(values["stop_token_ids"])
+        lwd_logger.info(
+            "[LWD][sampler-probe] wire penalties req=%s rep=%s pres=%s freq=%s",
+            req_notify.request_id, req_notify.repetition_penalty,
+            req_notify.presence_penalty, req_notify.frequency_penalty,
+        )
         sampling_params = SamplingParams(**values)
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
@@ -245,7 +306,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
     def _lwd_drain_irecv_completions(self) -> None:
         """每步排空 done MQ,把 worker 收完的 UP recv 并进提前收水位(闸门就绪判据)。"""
-        done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
+        done_mq = getattr(self, "_lwd_done_mq", None)
         if done_mq is None:
             return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
@@ -264,7 +325,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 break
         if not items:
             return
-        record_irecv_completions(items)
+        advanced = record_irecv_completions(items)
+        lwd_logger.info(
+            "[Lwd][pre-recv] DRAIN n=%d seqnos=%s advanced=%s ts=%.3f",
+            len(items),
+            sorted({s for _ch, s in items}),
+            sorted({s for _ch, s in advanced}) if advanced else "[]",
+            time.monotonic(),
+        )
 
     def post_step(self, model_executed: bool) -> None:
         """Flush pending c2e to the edge at the end of the step (the

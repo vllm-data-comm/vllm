@@ -318,6 +318,29 @@ class ECConnectorOutput:
         )
 
 
+@dataclass
+class LwdC2eMeta:
+    """Prefill-only LWD cloud->edge step metadata.
+
+    Carried on ``ModelRunnerOutput``; the cloud scheduler's control plane
+    forwards it to the edge ahead of the DOWN hidden tensor. The data
+    plane carries only the tensor itself.
+    """
+
+    # Total bf16 element count of the DOWN hidden tensor for this step.
+    hidden_num_elements: int
+    # Per-request sampled-token rank within the step's logits ("top-id-th"),
+    # one row per request in hidden row order.
+    top_id_ths: list[list[int]]
+    # Per-request draft accept counts (0 for non-spec steps).
+    num_accepted_tokens: list[int]
+    # Request ids in hidden row order.
+    req_ids: list[str]
+    # DOWN channel seqno of this step's packet; the edge posts its matching
+    # irecv with this exact value for pairing on the tag-less HCCL wire.
+    down_seqno: int = -1
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -329,9 +352,12 @@ class ModelRunnerOutput:
 
     # num_reqs x num_generated_tokens
     # num_generated_tokens is the number of tokens
-    # generated in the current step. It can be different for
+    # generated in the current step. This can be different for
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
+
+    # Prefill-only LWD cloud->edge step metadata (None on non-LWD steps).
+    lwd_c2e_meta: LwdC2eMeta | None = None
 
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]

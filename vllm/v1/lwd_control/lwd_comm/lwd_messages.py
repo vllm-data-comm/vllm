@@ -100,6 +100,33 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     request_id: str
 
 
+class LwdChunkAlignProfile(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. The cloud scheduler's prefill chunk-cutting profile.
+
+    The edge is the chunk division authority (the cloud reproduces each
+    batch via clamp parameters), but the cloud's native schedule() applies
+    constraint branches the edge's own profile cannot derive: mamba block
+    alignment (the edge kv cache has no mamba groups) and the multi-module
+    MTP prefill lookahead (the edge has no speculative config). Shipping
+    these lets the edge's native schedule() run the same cuts, so both
+    sides reduce a chunk identically. Field names mirror the scheduler
+    attributes; semantics live in control_scheduler.lwd_chunk_align.
+    """
+
+    block_size: int
+    """Verify-only: must equal the edge's cache block size (both derive
+    from the same platform defaults; an unequal value means divergent
+    deployments and every reproduced cut would be wrong)."""
+    hash_block_size: int
+    need_mamba_block_aligned_split: bool
+    mamba_prefill_checkpoint_alignment: int | None
+    mamba_has_prefill_checkpoint_blocks: bool
+    mamba_partial_cache_hit: bool
+    mamba_fine_grained_prefix_cache: bool
+    use_eagle_block_drop: bool
+    num_prefill_lookahead: int
+
+
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """Cloud -> edge. Scheduling limits both sides must agree on.
 
@@ -111,6 +138,9 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     max_num_batched_tokens: int
     max_num_seqs: int
     num_speculative_tokens: int
+    chunk_align: LwdChunkAlignProfile | None = None
+    """None only when the cloud predates the field; the edge fails fast
+    instead of scheduling unaligned chunks the cloud would re-cut."""
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]

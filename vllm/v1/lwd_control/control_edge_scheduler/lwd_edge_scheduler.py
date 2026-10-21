@@ -134,7 +134,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (原生批队列契约,空批会以 None 结果炸收割路径)。"""
         return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
 
-    def schedule(self) -> SchedulerOutput:
+    def _lwd_schedule_step(self) -> SchedulerOutput:
         """EMBED 优先出批,否则消费 c2e 出 UNEMBED 批(先收尾再开新,
         防 EMBED 被 decode 回程挤出深度配额)。"""
         LwdControlDiag.edge_step_activity(
@@ -432,6 +432,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
         seqno = self._lwd_seqno
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
+        lwd_logger.info(
+            "[edge] range announced seqno=%d reqs=%d tokens=%d",
+            seqno, len(items), sum(i.num_tokens for i in items),
+        )
         self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1
         self._lwd_pending_batches[seqno] = set(req_ids)

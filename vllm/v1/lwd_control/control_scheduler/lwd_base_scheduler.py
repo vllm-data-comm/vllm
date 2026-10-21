@@ -43,6 +43,16 @@ class LwdReqPhase(Enum):
 class LwdBaseScheduler(AsyncScheduler):
     """边/云调度器公共基类(AsyncScheduler 子类)。"""
 
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        """原生兼容调度入口:step_with_batch_queue 按位置传
+        throttle_prefills,签名收口在此,边云子类只实现一步角色调度。
+        节流提示不消费——各角色的派发门自行决策(mm 平级)。"""
+        return self._lwd_schedule_step()
+
+    def _lwd_schedule_step(self) -> SchedulerOutput:
+        """One role-specific scheduling step; edge/cloud subclasses own it."""
+        raise NotImplementedError
+
     @staticmethod
     def _lwd_req_phase(request: Request) -> LwdReqPhase:
         """唯一相位判据,边云各处的队列×相位扫描共用。"""
