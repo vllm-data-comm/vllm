@@ -12,6 +12,7 @@ running 等云结果 -> 云结果终结(完成码映射原生 finish),迟到结�
 
 from __future__ import annotations
 
+import copy
 import time
 from collections import deque
 from collections.abc import Callable
@@ -52,6 +53,7 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
 LwdSendToCloud = Callable[[LwdEdgeToCloudMessage], None]
@@ -73,17 +75,31 @@ _LWD_FINISH_STATUS = {
 _LWD_MAX_PENDING_CHUNKS = 3
 
 
+def _lwd_without_prefix_caching(vllm_config: VllmConfig) -> VllmConfig:
+    """The scheduler's view of the config, with prefix caching off.
+
+    The edge holds no KV cache (no KV cache groups), so the KV cache manager
+    must not look up prefix hits: a hit would skip embedding blocks the edge
+    never computed. The engine keeps prefix caching on in its own config, so
+    it still builds the request block hasher whose hash chain the edge sends
+    to the cloud for cloud-side prefix hits.
+    """
+    scheduler_vllm_config = copy.copy(vllm_config)
+    scheduler_vllm_config.cache_config = copy.copy(vllm_config.cache_config)
+    scheduler_vllm_config.cache_config.enable_prefix_caching = False
+    return scheduler_vllm_config
+
+
 class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(RangeNotify/seqno)。"""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        super().__init__(
+            *args, vllm_config=_lwd_without_prefix_caching(vllm_config), **kwargs
+        )
         # Injected by the engine once the cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self._lwd_seqno = 0
-        # 前缀缓存:manager 级必须关命中(命中使首条 offset!=0、被命中
-        # 块从未写 KV 仍占块池);配置级保留使能以产出哈希链供云侧命中
-        self.kv_cache_manager.enable_caching = False
         # pending 台账(一本账):seqno -> 批内未到账请求集。一条 seqno
         # = 一个云步消费单位;请求首 token 到账即从其批中消除,批内
         # 全部消除则整条移除——prefill 闸门水位 = len(本表)
