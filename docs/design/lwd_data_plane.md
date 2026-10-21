@@ -48,6 +48,8 @@ flowchart LR
 | PP / DCP / PCP / DP | `[0]`, `[1]`, ..., `[5]` |
 | UP, DOWN | `[0, 2]` |
 
+Executors and workers number their ranks within the local instance DP, as in a centralized deployment, so the native message queues, driver worker and output rank apply unchanged. Only the torch world is shared: `init_distributed_environment` replaces the world size with `hccl_world_size`, maps local rank `i` to `dp[dp_index].ranks[i]` of the local instance, and joins through `master_addr:master_port`, the way native data parallelism offsets the rank. Global rank 0 hosts the rendezvous store, so `master_addr` is its host on both sides.
+
 Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `lwd_init_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `lwd_check_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
 
 ### No two-stage pipeline
@@ -78,7 +80,25 @@ Every channel op is issued on its channel's NPU stream and followed by an event;
 
 UP takes two hops on the cloud: the channel delivers to the cloud endpoint rank, and the cloud worker broadcasts the rows within its TP group on the compute stream.
 
-## Out of scope
+### Early receive
 
-- Starting workers with their global ranks and the topology world size: the executor and worker integration.
-- Early receive: the hint and completion side channels between the cloud engine and the cloud endpoint worker move together with that integration.
+`feature_ctrl.enable_early_recv` in the topology selects when the cloud endpoint posts its UP receive:
+
+| | Receive posted | Prefill batch dispatched |
+| --- | --- | --- |
+| off | when the batch's `SchedulerOutput` reaches the worker | with the next step; the forward waits for the data |
+| on | when the `LwdRangeNotify` reaches the cloud engine | only once its UP data has been received; decode steps run meanwhile |
+
+With it on, two side channels connect the cloud engine and the endpoint worker's comm thread, bypassing `rpc_broadcast_mq`, whose single-threaded consumer blocks for a whole prefill forward:
+
+```mermaid
+sequenceDiagram
+    participant E as cloud engine
+    participant W as endpoint worker comm thread
+    E->>W: hint MQ: seqno, token count (on LwdRangeNotify)
+    W->>W: post the exact-size UP irecv
+    W->>E: done MQ: (UP, seqno) once received
+    E->>E: advance the watermark; the scheduler gate releases the batch
+```
+
+The engine creates the hint MQ before it builds the executor and passes its handle to the workers through the environment; after the executor is up, it fetches the done MQ handle from the endpoint worker with `collective_rpc`. The executor itself is unchanged. The protocol (`lwd_pre_recv.py`) lives in vllm-ascend.

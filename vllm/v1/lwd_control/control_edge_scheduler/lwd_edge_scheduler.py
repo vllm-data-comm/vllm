@@ -12,6 +12,7 @@ running 等云结果 -> 云结果终结(完成码映射原生 finish),迟到结�
 
 from __future__ import annotations
 
+import copy
 import time
 from collections import deque
 from collections.abc import Callable
@@ -52,6 +53,7 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
 LwdSendToCloud = Callable[[LwdEdgeToCloudMessage], None]
@@ -73,17 +75,31 @@ _LWD_FINISH_STATUS = {
 _LWD_MAX_PENDING_CHUNKS = 3
 
 
+def _lwd_without_prefix_caching(vllm_config: VllmConfig) -> VllmConfig:
+    """The scheduler's view of the config, with prefix caching off.
+
+    The edge holds no KV cache (no KV cache groups), so the KV cache manager
+    must not look up prefix hits: a hit would skip embedding blocks the edge
+    never computed. The engine keeps prefix caching on in its own config, so
+    it still builds the request block hasher whose hash chain the edge sends
+    to the cloud for cloud-side prefix hits.
+    """
+    scheduler_vllm_config = copy.copy(vllm_config)
+    scheduler_vllm_config.cache_config = copy.copy(vllm_config.cache_config)
+    scheduler_vllm_config.cache_config.enable_prefix_caching = False
+    return scheduler_vllm_config
+
+
 class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(RangeNotify/seqno)。"""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        super().__init__(
+            *args, vllm_config=_lwd_without_prefix_caching(vllm_config), **kwargs
+        )
         # Injected by the engine once the cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self._lwd_seqno = 0
-        # 前缀缓存:manager 级必须关命中(命中使首条 offset!=0、被命中
-        # 块从未写 KV 仍占块池);配置级保留使能以产出哈希链供云侧命中
-        self.kv_cache_manager.enable_caching = False
         # pending 台账(一本账):seqno -> 批内未到账请求集。一条 seqno
         # = 一个云步消费单位;请求首 token 到账即从其批中消除,批内
         # 全部消除则整条移除——prefill 闸门水位 = len(本表)
@@ -109,6 +125,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_chunk_unit: int = (
             threshold if threshold > 0 else self.max_num_scheduled_tokens
         )
+        self._lwd_diag = LwdControlDiag()
         self._lwd_check_deadlock_config()
 
     def _lwd_check_deadlock_config(self) -> None:
@@ -134,10 +151,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (原生批队列契约,空批会以 None 结果炸收割路径)。"""
         return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """EMBED 优先出批,否则消费 c2e 出 UNEMBED 批(先收尾再开新,
         防 EMBED 被 decode 回程挤出深度配额)。"""
-        LwdControlDiag.edge_step_activity(
+        self._lwd_check_no_prefill_throttle(throttle_prefills)
+        self._lwd_diag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
         )
@@ -243,12 +261,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
-            LwdControlDiag.edge_tokens_delivered(
-                request_id,
-                sampled_token_ids,
-                finish_reason,
-                self.vllm_config,
-            )
             if not sampled_token_ids and not finished_now:
                 # [Lwd][eos-trace] B 点:kill 行留痕,按 down_seqno 与
                 # A(云零接受行)/C(worker 缺行)配对定案根因

@@ -13,6 +13,10 @@ decode-only,预告留队首重试;放行步 offset 对账 + 双钳制复现 +
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import torch
+
 from vllm.lwd_logger import lwd_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
@@ -37,6 +41,28 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
+LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
+"""`ModelRunnerOutput.lwd_down_carrier` set by the cloud worker: (pinned
+packed meta, req_ids, hidden numel, DOWN seqno)."""
+
+
+@dataclass
+class LwdC2eMeta:
+    """Step metadata unpacked from the cloud worker's DOWN carrier."""
+
+    hidden_num_elements: int
+    """Element count of the DOWN hidden tensor; the edge posts an exact-size
+    receive from it."""
+    top_id_ths: list[list[int]]
+    """Per request, the ranks of its accepted tokens within the step's
+    logits, in hidden row order."""
+    num_accepted_tokens: list[int]
+    req_ids: list[str]
+    """Request ids in hidden row order."""
+    down_seqno: int
+    """DOWN channel seqno of the hidden packet; pairs the edge's receive on
+    the tagless HCCL channel."""
+
 
 class LwdCloudScheduler(LwdBaseScheduler):
     """notify 门控的 prefill/decode 混排调度器(PD_mix,云侧唯一形态)。"""
@@ -48,6 +74,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # self.scheduler.prefill_notify_queue 借引用投递/清扫(线程纪律
         # 归通知队列)
         self.prefill_notify_queue = LwdPrefillNotifyQueue()
+        # Set by the engine from feature_ctrl.enable_early_recv: with it on, a
+        # prefill batch waits until its UP data is received.
+        self.lwd_early_recv = False
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 占预算与 KV);公式唯一住处 lwd_base_scheduler.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
@@ -76,10 +105,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carrier = getattr(model_runner_output, "lwd_down_carrier", None)
         if carrier is not None:
             meta = self._lwd_carrier_to_meta(carrier)
-            LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
             finish_reasons = self._lwd_c2e_finish_reasons(
                 meta.req_ids, engine_core_outputs
             )
+            LwdControlDiag.cloud_step(meta.req_ids, finish_reasons, self.requests)
             # [Lwd][eos-trace] A 点:零接受行留痕(kill 根因定位,
             # 打原始行集——零接受活行剔除已随 4 卡修复一并移除,此处
             # 仅作发生率观测)
@@ -133,7 +162,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
 
     @staticmethod
-    def _lwd_carrier_to_meta(carrier):
+    def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:
         """pinned 载荷解包为步元数据。
 
         载荷 = 云侧收集后 pinned 的扁平 int 张量,按"变长段在前、定长
@@ -151,8 +180,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         再按 seg_lens 把 ranks 切回逐请求的 top_id_ths 行
         (本例 [[r0,r1,r2],[r0]])。-2*n_req/-n_req 两个魔数即
         "counts 段 + seg_lens 段"两条定长尾巴的宽度。"""
-        from vllm.v1.outputs import LwdC2eMeta
-
         pinned, req_ids, hidden_numel, seqno = carrier
         n_req = len(req_ids)
         vals = pinned.tolist()
@@ -291,10 +318,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             return False
         return True
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """混排调度:每步四道门决策——条目对账(all-or-nothing)→ 提前收
         水位 → preflight 三检 → 混排步;任一门不过即本步 decode-only,
         预告留队首下步重试。"""
+        self._lwd_check_no_prefill_throttle(throttle_prefills)
         decode_ids = self._lwd_collect_decode_requests()
         notify = self.prefill_notify_queue.peek()
         if notify is not None:
@@ -311,7 +339,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                     notify.seqno,
                 )
                 notify = None
-            elif not self._lwd_up_recv_complete(notify):
+            elif self.lwd_early_recv and not self._lwd_up_recv_complete(notify):
                 # 提前收闸门:UP 张量还没收完 -> 本步不下发这个 prefill 批
                 # (notify 留队首,下步再判),本步只下 decode。收完的批优先,
                 # 没收完的批一直让 decode 自转,不把等待塞进 worker 前向。
