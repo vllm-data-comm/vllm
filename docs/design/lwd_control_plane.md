@@ -188,7 +188,7 @@ Callbacks run on the IO thread and only hand events over:
 | `on_peer_up` | `(WAKEUP, _LwdPeerUp)` on `input_queue` | engine thread; the cloud sends its scheduling limits |
 | Edge receives `LwdCloudParamsNotify` | event | edge startup |
 | Edge receives `LwdC2eNotify` | scheduler `unembed_notify_queue` + `WAKEUP` | `schedule()` |
-| Cloud receives `LwdRangeNotify` / `LwdRequestNotify` | ingest thread | range: `prefill_notify_queue` + pre-recv hint; request: built there, then native `ADD` |
+| Cloud receives `LwdRangeNotify` / `LwdRequestNotify` | ingest thread | range: `prefill_notify_queue` + early-receive hint when `enable_early_recv` is on (see [early receive](lwd_data_plane.md#early-receive)); request: built there, then native `ADD` |
 | Malformed payload or unknown type | dropped with a warning | — |
 | Handler exception, `on_fatal` | `(EXECUTOR_FAILED, _LwdControlPlaneFailed)` | engine thread raises; the engine fails |
 

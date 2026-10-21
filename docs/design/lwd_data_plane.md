@@ -80,6 +80,25 @@ Every channel op is issued on its channel's NPU stream and followed by an event;
 
 UP takes two hops on the cloud: the channel delivers to the cloud endpoint rank, and the cloud worker broadcasts the rows within its TP group on the compute stream.
 
-## Out of scope
+### Early receive
 
-- Early receive: the hint and completion side channels between the cloud engine and the cloud endpoint worker.
+`feature_ctrl.enable_early_recv` in the topology selects when the cloud endpoint posts its UP receive:
+
+| | Receive posted | Prefill batch dispatched |
+| --- | --- | --- |
+| off | when the batch's `SchedulerOutput` reaches the worker | with the next step; the forward waits for the data |
+| on | when the `LwdRangeNotify` reaches the cloud engine | only once its UP data has been received; decode steps run meanwhile |
+
+With it on, two side channels connect the cloud engine and the endpoint worker's comm thread, bypassing `rpc_broadcast_mq`, whose single-threaded consumer blocks for a whole prefill forward:
+
+```mermaid
+sequenceDiagram
+    participant E as cloud engine
+    participant W as endpoint worker comm thread
+    E->>W: hint MQ: seqno, token count (on LwdRangeNotify)
+    W->>W: post the exact-size UP irecv
+    W->>E: done MQ: (UP, seqno) once received
+    E->>E: advance the watermark; the scheduler gate releases the batch
+```
+
+The engine creates the hint MQ before it builds the executor and passes its handle to the workers through the environment; after the executor is up, it fetches the done MQ handle from the endpoint worker with `collective_rpc`. The executor itself is unchanged. The protocol (`lwd_pre_recv.py`) lives in vllm-ascend.
