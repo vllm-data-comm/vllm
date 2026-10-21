@@ -44,6 +44,17 @@ class LwdBaseScheduler(AsyncScheduler):
     """边/云调度器公共基类(AsyncScheduler 子类)。"""
 
     @staticmethod
+    def _lwd_check_no_prefill_throttle(throttle_prefills: bool) -> None:
+        """LWD gates its prefills itself (edge pending gate, cloud notify
+        gates). Only the DP engine core throttles prefills, and LWD engines
+        are not DP engine cores, so a True here means a wiring error."""
+        if throttle_prefills:
+            raise RuntimeError(
+                "[LWD] prefill throttling (DP prefill_schedule_interval) is not "
+                "supported; LWD engines gate their own prefills"
+            )
+
+    @staticmethod
     def _lwd_req_phase(request: Request) -> LwdReqPhase:
         """唯一相位判据,边云各处的队列×相位扫描共用。"""
         if request.num_computed_tokens < request.num_prompt_tokens:

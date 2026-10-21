@@ -291,10 +291,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             return False
         return True
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """混排调度:每步四道门决策——条目对账(all-or-nothing)→ 提前收
         水位 → preflight 三检 → 混排步;任一门不过即本步 decode-only,
         预告留队首下步重试。"""
+        self._lwd_check_no_prefill_throttle(throttle_prefills)
         decode_ids = self._lwd_collect_decode_requests()
         notify = self.prefill_notify_queue.peek()
         if notify is not None:
