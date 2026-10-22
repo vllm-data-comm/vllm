@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import torch
@@ -62,6 +63,7 @@ _LWD_SIM_KV_CACHE_LAYOUT = "LBNHC"
 _LWD_SIM_PAYLOAD_DTYPE = torch.float32
 _LWD_SIM_HINT_TIMEOUT_S = 0.0005
 _LWD_SIM_POLL_INTERVAL_S = 0.002
+_LWD_SIM_RECV_POLL_S = 0.05
 _LWD_SIM_THREAD_JOIN_TIMEOUT_S = 1.0
 
 
@@ -122,8 +124,9 @@ class _LwdSimWorkerBase(WorkerBase):
         return
 
     def _send(self, group: dist.ProcessGroup, seqno: int, numel: int) -> None:
-        """Post a stamped send without waiting, as the data plane does."""
-        self._sends = [(w, t) for w, t in self._sends if not w.is_completed()]
+        """Post a stamped send, keeping the buffer referenced until shutdown
+        (gloo isends may not report completion without a wait, so completed
+        ones are not pruned; a run holds a few buffers only)."""
         payload = torch.full((numel,), float(seqno), dtype=_LWD_SIM_PAYLOAD_DTYPE)
         work = dist.isend(payload, dst=self._peer, group=group)
         self._sends.append((work, payload))
@@ -341,9 +344,15 @@ class LwdSimCloudWorker(_LwdSimWorkerBase):
         with self._up_lock:
             pending = [(s, r) for s, r in self._up_recvs.items() if not r.reported]
         for seqno, recv in pending:
+            # An unwaited gloo work never reports completion through
+            # is_completed(); a timed wait drives the op, and only a work
+            # that then reports completed is done.
+            try:
+                recv.work.wait(timedelta(seconds=_LWD_SIM_RECV_POLL_S))
+            except Exception:  # noqa: BLE001 -- timeout; retried next round
+                continue
             if not recv.work.is_completed():
                 continue
-            recv.work.wait()
             self.trace.record(
                 "up_recv_done", seqno=seqno, stamp=_lwd_sim_stamp(recv.buffer)
             )
@@ -362,7 +371,10 @@ class LwdSimCloudWorker(_LwdSimWorkerBase):
         self.trace.record("up_consume", seqno=seqno, reported=reported)
         if recv is None:
             raise RuntimeError(f"UP seqno {seqno} dispatched before it was posted")
-        recv.work.wait()
+        if not recv.reported:
+            # Only the gate-missed path: waiting here is safe because the
+            # comm thread no longer touches a reported work.
+            recv.work.wait()
         with self._up_lock:
             recv.consumed = True
             if recv.reported:
