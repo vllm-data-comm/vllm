@@ -5,14 +5,15 @@
 Design: docs/design/lwd_data_plane.md.
 """
 
+from __future__ import annotations
+
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from vllm.config.lwd import LwdTopology
-
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.lwd import LwdTopology
 
 LwdRankGroup = tuple[int, ...]
 
@@ -46,7 +47,7 @@ class LwdParallelGroupsSpec:
     """One pair per DP connection, by edge rank."""
 
     @classmethod
-    def from_topology(cls, topology: LwdTopology) -> "LwdParallelGroupsSpec":
+    def from_topology(cls, topology: LwdTopology) -> LwdParallelGroupsSpec:
         """Derive the groups, or raise before any process creates one.
 
         Raises:
@@ -120,7 +121,7 @@ class LwdParallelGroupsSpec:
         return None
 
 
-def lwd_check_parallel_config(vllm_config: "VllmConfig") -> None:
+def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     """Reject at config time what the shared HCCL world cannot host.
 
     Every process reads the same topology, so both sides fail at startup,

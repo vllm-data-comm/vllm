@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""边侧调度器:chunk 化 prefill 组批 + 控制面出口(RangeNotify/seqno)。
+"""Edge scheduler: chunked prefill batch assembly + control-plane egress
+(RangeNotify/seqno).
 
-边侧只做 embedding(无 decode),请求生命周期全程留原生调度器:
-入队 -> EMBED(chunk 组批/范围预告)-> 嵌入完结转 decode 相位留
-running 等云结果 -> 云结果终结(完成码映射原生 finish),迟到结果
-幂等丢弃。schedule() 出批全量复用原生(可见集);步进与收割走引擎
-原生批队列路径。chunk 语义见 lwd_chunked_prefill_design.md §3.1。
+The edge side only does embedding (no decode); the request lifecycle stays
+with the native scheduler throughout: enqueue -> EMBED (chunk batch
+assembly / range announcement) -> on embedding completion, transition to
+decode phase and stay in running awaiting the cloud result -> the cloud
+result terminates the request (finish code mapped to native finish), and
+late results are idempotently dropped. schedule() batch emission fully
+reuses the native path (visible set); stepping and harvesting go through
+the engine's native batch-queue path. See lwd_chunked_prefill_design.md
+§3.1 for chunk semantics.
 """
 
 from __future__ import annotations
 
+import copy
 import time
 from collections import deque
 from collections.abc import Callable
@@ -52,12 +58,14 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
 LwdSendToCloud = Callable[[LwdEdgeToCloudMessage], None]
 """Sends one message to the cloud; raises instead of losing it."""
 
-# 云端完成码 -> 边侧终态(前端 reason 走输出通道;ERROR 落 ABORTED)
+# Cloud finish code -> edge terminal state (frontend reason goes through the
+# output channel; ERROR maps to ABORTED)
 _LWD_FINISH_STATUS = {
     FinishReason.STOP: RequestStatus.FINISHED_STOPPED,
     FinishReason.LENGTH: RequestStatus.FINISHED_LENGTH_CAPPED,
@@ -65,46 +73,74 @@ _LWD_FINISH_STATUS = {
     FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
 }
 
-# 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
-# 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
-# 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
-# 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
-# 排空后闸门自开。
+# Cloud-side pending cap, counted in unconsumed chunks (seqno): one seqno =
+# one cloud-step consumption unit. The edge records seqno -> in-batch request
+# list; once every request in a batch has received its first token, that
+# chunk is consumed; when the number of unconsumed chunks reaches the cap,
+# new prefill admission stops -- requests accumulate in the edge waiting
+# queue (picker FCFS prefix naturally forms multi-request batches), and the
+# gate reopens by itself once the cloud-side pending drains.
 _LWD_MAX_PENDING_CHUNKS = 3
 
 
-class LwdEdgeScheduler(LwdBaseScheduler):
-    """纯 prefill 调度语义 + 控制面出口(RangeNotify/seqno)。"""
+def _lwd_without_prefix_caching(vllm_config: VllmConfig) -> VllmConfig:
+    """The scheduler's view of the config, with prefix caching off.
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    The edge holds no KV cache (no KV cache groups), so the KV cache manager
+    must not look up prefix hits: a hit would skip embedding blocks the edge
+    never computed. The engine keeps prefix caching on in its own config, so
+    it still builds the request block hasher whose hash chain the edge sends
+    to the cloud for cloud-side prefix hits.
+    """
+    scheduler_vllm_config = copy.copy(vllm_config)
+    scheduler_vllm_config.cache_config = copy.copy(vllm_config.cache_config)
+    scheduler_vllm_config.cache_config.enable_prefix_caching = False
+    return scheduler_vllm_config
+
+
+class LwdEdgeScheduler(LwdBaseScheduler):
+    """Pure prefill scheduling semantics + control-plane egress
+    (RangeNotify/seqno)."""
+
+    def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        super().__init__(
+            *args, vllm_config=_lwd_without_prefix_caching(vllm_config), **kwargs
+        )
         # Injected by the engine once the cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self._lwd_seqno = 0
-        # 前缀缓存:manager 级必须关命中(命中使首条 offset!=0、被命中
-        # 块从未写 KV 仍占块池);配置级保留使能以产出哈希链供云侧命中
-        self.kv_cache_manager.enable_caching = False
-        # pending 台账(一本账):seqno -> 批内未到账请求集。一条 seqno
-        # = 一个云步消费单位;请求首 token 到账即从其批中消除,批内
-        # 全部消除则整条移除——prefill 闸门水位 = len(本表)
+        # Pending ledger (single account): seqno -> set of in-batch requests
+        # whose result has not yet arrived. One seqno = one cloud-step
+        # consumption unit; a request is removed from its batch once its
+        # first token arrives, and once a batch is fully drained the whole
+        # entry is removed -- prefill gate watermark = len(this table)
         self._lwd_pending_batches: dict[int, set[str]] = {}
-        # c2e 通告队列:控制面 IO 线程 append,调度步内消费出 UNEMBED 批
+        # c2e notify queue: appended by the control-plane IO thread, consumed
+        # within a scheduling step to produce an UNEMBED batch
         self.unembed_notify_queue: deque[LwdC2eNotify] = deque()
-        # pending 闸门状态(仅作开/关转换日志用)
+        # Pending gate state (only used for open/close transition logging)
         self._lwd_prefill_gate_held: bool = False
-        # MTP 预算系数(decode 每请求每步 1+k token);边云预算部署对齐,
-        # cap 直接读本地配置,公式唯一住处 lwd_base_scheduler.lwd_spec_factor
+        # MTP budget factor (decode consumes 1+k tokens per request per
+        # step); edge/cloud budgets are deployment-aligned, the cap reads the
+        # local config directly, the sole home of the formula is
+        # lwd_base_scheduler.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
-        # 多模态请求的整 prompt mrope positions([3,N] CPU 张量,准入时
-        # 一次性算好,按 chunk 切片随 LwdEmbedBatch 下发 worker);嵌入
-        # 完结/abort 时摘除。key 在 = 该请求各 chunk 的 has_mrope 恒真。
+        # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
+        # tensor, computed once at admission, sliced per chunk and sent to
+        # the worker with LwdEmbedBatch); removed on embedding
+        # completion/abort. Key present = has_mrope is always true for every
+        # chunk of that request.
         self._lwd_mrope_positions_dict: dict[str, torch.Tensor] = {}
-        # 惰性解析的模型类静态方法 _get_mrope_input_positions(直接缓存
-        # 方法本身而非模型类,语义直达;首用即验,不支持的族 fail-fast)。
+        # Lazily resolved model-class static method
+        # _get_mrope_input_positions (cache the method itself rather than
+        # the model class so the semantics stay direct; validated on first
+        # use, unsupported families fail fast).
         self._lwd_mrope_positions_fn = None
-        # chunk 单元 C = min(剩余, C):取本地 long_prefill_token_threshold
-        # (原生截断边界,双侧天然复现);未配置(≤0)退化为对齐预算
-        # max_num_scheduled_tokens。云侧不读本值,按批内 max(items) 覆写
+        # Chunk unit C = min(remaining, C): taken from the local
+        # long_prefill_token_threshold (native truncation boundary,
+        # naturally reproduced on both sides); when unset (<=0), falls back
+        # to the aligned budget max_num_scheduled_tokens. The cloud does not
+        # read this value; it overwrites per the in-batch max(items)
         threshold = self.scheduler_config.long_prefill_token_threshold
         self._lwd_chunk_unit: int = (
             threshold if threshold > 0 else self.max_num_scheduled_tokens
@@ -112,31 +148,38 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_check_deadlock_config()
 
     def _lwd_check_deadlock_config(self) -> None:
-        """活性 fail-fast:最坏在途(满员)下 cap 恒 < 1 即死锁配置
-        (设计 §2.6),拉起时直接拒绝。"""
+        """Liveness fail-fast: if the cap stays < 1 even at worst-case
+        inflight (full occupancy), it is a deadlock configuration
+        (design §2.6); reject at startup."""
         if (
             self.max_num_scheduled_tokens
             - self.max_num_running_reqs * self._lwd_spec_factor
             < 1
         ):
             raise RuntimeError(
-                f"[LWD] 死锁配置: max_num_batched_tokens("
+                f"[LWD] deadlock config: max_num_batched_tokens("
                 f"{self.max_num_scheduled_tokens}) - max_num_seqs("
                 f"{self.max_num_running_reqs}) * spec_factor("
-                f"{self._lwd_spec_factor}) < 1, 续传 chunk 永无可调度预算; "
-                "请增大 max_num_batched_tokens 或减小 max_num_seqs"
+                f"{self._lwd_spec_factor}) < 1, resume chunks would never "
+                "have a schedulable budget; please increase "
+                "max_num_batched_tokens or decrease max_num_seqs"
             )
 
     def has_requests(self) -> bool:
-        """原生步进的取活谓词:有可派发的批(EMBED 可派 / c2e 待消费 /
-        DISABLE_DOWN 直通积压)。闸门 HOLD 且无在飞时为 False,引擎经
-        has_work 睡眠——schedule() 被调用即必有真批,空批不上队列
-        (原生批队列契约,空批会以 None 结果炸收割路径)。"""
+        """Liveness predicate for native stepping: has a dispatchable batch
+        (EMBED dispatchable / c2e pending consumption / DISABLE_DOWN
+        passthrough backlog). False when the gate is HOLD with nothing in
+        flight; the engine then sleeps via has_work -- whenever schedule()
+        is called there must be a real batch, and empty batches never enter
+        the queue (native batch-queue contract; an empty batch would blow up
+        the harvest path with a None result)."""
         return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
 
-    def schedule(self) -> SchedulerOutput:
-        """EMBED 优先出批,否则消费 c2e 出 UNEMBED 批(先收尾再开新,
-        防 EMBED 被 decode 回程挤出深度配额)。"""
+    def _lwd_schedule_step(self) -> SchedulerOutput:
+        """Dispatch an EMBED batch first; otherwise consume c2e to produce an
+        UNEMBED batch (finish in-flight work before admitting new work, to
+        keep EMBED from being squeezed out of the depth quota by the decode
+        return trip)."""
         LwdControlDiag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
@@ -147,9 +190,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return self._lwd_schedule_unembed()
 
     def _lwd_embed_dispatchable(self) -> bool:
-        """EMBED 可派判定(含闸门转换日志):续传在飞豁免两道闸门;
-        否则要求满员检查通过、pending chunk 未达上限且 waiting 有货
-        (pending 达上限即 HOLD,请求在 waiting 攒批,云侧排空自开)。"""
+        """EMBED dispatchability check (with gate transition logging): a
+        resume in flight is exempt from both gates; otherwise the fullness
+        check must pass, pending chunks must be below the cap, and waiting
+        must be non-empty (at the pending cap the gate HOLDs, requests
+        accumulate in waiting, and the gate reopens once the cloud
+        drains)."""
         if self._lwd_has_prefill_chunk_inflight():
             self._lwd_log_gate_open()
             return True
@@ -174,7 +220,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return True
 
     def _lwd_log_gate_open(self) -> None:
-        """闸门开转换日志(HOLD -> OPEN 只打一次)。"""
+        """Gate open transition logging (HOLD -> OPEN logged only once)."""
         if self._lwd_prefill_gate_held:
             self._lwd_prefill_gate_held = False
             lwd_logger.info("[edge-sched] prefill gate OPEN")
@@ -196,17 +242,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return out
 
     def _lwd_schedule_unembed(self) -> SchedulerOutput:
-        """消费 c2e 通告出 UNEMBED 批;DISABLE_DOWN 直通(不派 worker)
-        由引擎 executor 代理以已完成 future 承接,调度器路径统一。"""
+        """Consume a c2e notify to produce an UNEMBED batch; DISABLE_DOWN
+        passthrough (no worker dispatch) is absorbed by the engine executor
+        proxy with an already-completed future, keeping the scheduler path
+        uniform."""
         if self.unembed_notify_queue:
             return lwd_build_unembed_batch(self.unembed_notify_queue.popleft())
         return SchedulerOutput.make_empty()
 
     def update_from_output(self, scheduler_output, model_runner_output):
-        """LWD 收割(返回值即引擎步输出,均不走原生入账):EMBED 批登记
-        执行进度(完结者留 running 转 decode 相位);UNEMBED 批按 worker 回填的
-        req_ids x sampled_token_ids 逐请求交付;无 lwd_batch 的占位批
-        (底层正常完成返回 None,经引擎代理替换为占位)为 no-op。"""
+        """LWD harvest (the return value is the engine step output; none of
+        it goes through native bookkeeping): EMBED batches register
+        execution progress (finished ones stay in running and transition to
+        decode phase); UNEMBED batches deliver per request via the
+        worker-filled req_ids x sampled_token_ids; placeholder batches
+        without lwd_batch (the underlying layer returns None on normal
+        completion, replaced by the engine proxy with a placeholder) are a
+        no-op."""
         batch = getattr(scheduler_output, "lwd_batch", None)
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
@@ -219,9 +271,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 else {}
             )
             outputs, finished = self._lwd_deliver_unembed(notify, sampled)
-        # EMBED 批无本地出账(进度已于调度期乐观推进,嵌入完结即自然
-        # 转 decode 相位);收割期统一对账清理 mrope positions(驻留
-        # 模型下请求终结才出 requests,显式逐点摘除改为对账式回收)
+        # EMBED batches have no local accounting (progress was already
+        # advanced optimistically during scheduling; on embedding completion
+        # they naturally transition to decode phase); the harvest phase
+        # uniformly reconciles and cleans up mrope positions (under resident
+        # models requests only leave `requests` upon termination, so the
+        # explicit per-point removal is replaced by reconciliation-style
+        # reclaim)
         self._lwd_purge_mrope_positions()
         if not outputs:
             return {}
@@ -232,34 +288,70 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
         }
 
+    @staticmethod
+    def _lwd_row_disposition(accepted: int, has_tokens: bool, finished: bool) -> str:
+        """Per-row delivery disposition (pad-and-skip, ported from the mm
+        branch 7ff2ddc3e):
+
+        - "skip": zero-accepted live row (accepted=0 and not finished) -- in
+          a mixed step, prefill requests occupy only reserved slots in the
+          sampling layout (Ascend MTP sampling only fills rows the draft
+          participated in), so the collector computes accepted=0 via
+          (sampled != -1).sum(). Such rows are protocol artifacts of the
+          mixed step; they are kept in the notify only for DOWN tensor
+          alignment: no delivery, no ERROR, no first-token marking (before
+          the fix this form used to kill requests as ERROR);
+        - "error": declares accepted>0 yet has no token = a real unembed
+          failure; ERROR takes precedence over the cloud finish code
+          (original semantics preserved);
+        - "deliver": everything else (including zero-accepted closing rows
+          that carry a finish code -- the termination signal must be passed
+          through; swallowing it would lose the completion)."""
+        if accepted == 0 and not finished:
+            return "skip"
+        if not has_tokens and not finished:
+            return "error"
+        return "deliver"
+
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
     ) -> tuple[list[EngineCoreOutput], set[str]]:
-        """逐请求交付:token 行缺席且未完结 = unembed 失败,ERROR 优先
-        于云侧完成码;不在 awaiting 的迟到结果幂等丢弃。"""
+        """Per-request delivery: row disposition goes through
+        _lwd_row_disposition (zero-accepted live rows are skipped; ERROR
+        only when accepted>0 yet token missing); late results not in
+        awaiting are idempotently dropped."""
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
+        # accepted is position-aligned with rows (same contract as
+        # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
+        # accepted, so token presence/absence is used instead
+        accepts = notify.num_accepted_tokens
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
+            accepted = accepts[index] if accepts else (1 if sampled_token_ids else 0)
+            disposition = self._lwd_row_disposition(
+                accepted, bool(sampled_token_ids), finished_now
+            )
+            if disposition == "skip":
+                # Zero-accepted live row: no delivery, no empty output, and
+                # no needless debug-tax logging
+                continue
             LwdControlDiag.edge_tokens_delivered(
                 request_id,
                 sampled_token_ids,
                 finish_reason,
                 self.vllm_config,
             )
-            if not sampled_token_ids and not finished_now:
-                # [Lwd][eos-trace] B 点:kill 行留痕,按 down_seqno 与
-                # A(云零接受行)/C(worker 缺行)配对定案根因
+            if disposition == "error":
+                # [Lwd][eos-trace] point B: leave a trace for kill rows;
+                # pair by down_seqno with A (cloud zero-accepted row) / C
+                # (worker missing row) to settle the root cause
                 LwdControlDiag.trace_edge_kill_row(
                     seqno=notify.down_seqno,
                     rid=request_id,
-                    accepted=(
-                        notify.num_accepted_tokens[index]
-                        if index < len(notify.num_accepted_tokens)
-                        else -1
-                    ),
+                    accepted=accepted,
                     finish_code=(
                         notify.finish_reasons[index] if notify.finish_reasons else -1
                     ),
@@ -276,11 +368,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
-            if not sampled_token_ids and not finished_now:
-                continue  # 无内容且未完结:不出空输出
             if finished_now:
-                # 云端判停的地面真相落地:原生 finish 清账(KV/缓存释放
-                # 与 finished_req_ids 交接全走原生)
+                # The ground truth of the cloud's stop decision lands here:
+                # native finish settles the account (KV/cache release and
+                # the finished_req_ids handover all go through the native
+                # path)
                 self.finish_requests(
                     [request_id],
                     _LWD_FINISH_STATUS.get(
@@ -300,20 +392,24 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     @staticmethod
     def _lwd_finish_code(notify: LwdC2eNotify, index: int) -> FinishReason | None:
-        """逐请求完成码:哨兵 = 未完结(None);与 req_ids 按位对齐,
-        错配 IndexError fail-fast。"""
+        """Per-request finish code: sentinel = not finished (None);
+        position-aligned with req_ids, a mismatch raises IndexError
+        fail-fast."""
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
     def _lwd_pick_prefill_batch(
         self,
     ) -> tuple[list[str], dict[str, int], int]:
-        """picker 适配层:组装候选、算 cap/free_seq、模型族折算独占参数。"""
+        """Picker adapter layer: assemble candidates, compute cap/free_seq,
+        and model-family conversion-specific parameters."""
         inflight = len(self.running)
         cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
         free_seq = self.max_num_running_reqs - inflight
-        # 续传候选只取 prefill 相位(decode 相位驻留者 remaining=0,
-        # picker 本也会跳过;过滤后候选举即续传判据本身)
+        # Resume candidates take only the prefill phase (decode-phase
+        # residents have remaining=0, which the picker would skip anyway;
+        # after the filter, a non-empty candidate list is itself the resume
+        # criterion)
         running = [
             LwdPrefillCandidate(
                 r.request_id, r.num_prompt_tokens, r.num_computed_tokens
@@ -340,8 +436,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return req_ids, expected, cap
 
     def _lwd_schedule_batch(self) -> SchedulerOutput:
-        """chunk 组批:picker 选批,经基类可见集机制(预算钳到 cap)调度
-        (chunk 划分由钳制参数保证被原生复现)。"""
+        """Chunk batch assembly: the picker selects the batch, scheduled via
+        the base-class visible-set mechanism (budget clamped to cap; the
+        chunk split is guaranteed by the clamping parameters to be
+        reproduced natively)."""
         req_ids, _expected, cap = self._lwd_pick_prefill_batch()
         return self._lwd_schedule(req_ids, token_budget_cap=cap)
 
@@ -353,12 +451,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
     ) -> tuple[list[int], int, int, list[int]]:
-        """边侧直通:encoder 执行与缓存由 worker 自管;原生回滚会破坏
-        chunk 契约,故不排不耗不回滚。"""
+        """Edge-side passthrough: encoder execution and caching are managed
+        by the worker itself; native rollback would break the chunk
+        contract, so nothing is scheduled, consumed, or rolled back."""
         return [], num_new_tokens, encoder_compute_budget, []
 
     def _lwd_has_prefill_chunk_inflight(self) -> bool:
-        """running 中是否有未发完的 embed 请求;与 picker 续传分支同判据,两处须一致。"""
+        """Whether running has an embed request not fully sent; same
+        criterion as the picker resume branch -- the two must stay
+        consistent."""
         return (
             next(
                 self._lwd_reqs_in_phase(LwdReqPhase.PREFILL, self.running),
@@ -368,23 +469,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
 
     def lwd_admit_request(self, request: Request) -> None:
-        """请求入口的调度器本地半段:模式边界校验 + mrope 预计算。
-        云预告(通信)与入队归引擎 add_request,abort_immediately 走
-        原生引擎路径(abort_requests 覆写里摘台账)。"""
+        """Scheduler-local half of request admission: mode boundary
+        validation + mrope precomputation. The cloud announcement
+        (communication) and enqueueing belong to the engine's add_request;
+        abort_immediately goes through the native engine path (the ledger
+        is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
 
     @staticmethod
     def _lwd_request_has_mm(request: Request) -> bool:
-        """请求是否带真实多模态数据(prompt_embeds passthrough 不算——
-        它没有 grid 元数据,mrope 按文本位置处理,与原生口径一致)。"""
+        """Whether the request carries real multimodal data (prompt_embeds
+        passthrough does not count -- it has no grid metadata, mrope is
+        handled as text positions, consistent with the native
+        definition)."""
         return any(
             feature.modality != "prompt_embeds" for feature in request.mm_features
         )
 
     def _lwd_compute_mrope_positions(self, request: Request) -> None:
-        """多模态准入时算全 prompt [3,N] mrope(边侧唯一持有真实
-        prompt/grid);模型族无 _get_mrope_input_positions 即拒绝。"""
+        """At multimodal admission, compute the whole-prompt [3,N] mrope
+        (only the edge holds the real prompt/grid); reject model families
+        lacking _get_mrope_input_positions."""
         if not self.vllm_config.model_config.uses_mrope:
             return
         if not self._lwd_request_has_mm(request):
@@ -420,8 +526,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"len {request.num_prompt_tokens} (request {request.request_id})"
         )
         self._lwd_mrope_positions_dict[request.request_id] = positions
-        # [Lwd][perf] mrope 全 prompt 计算逐请求耗时(在边引擎主线程上,
-        # 期间调度循环停转;MM 劣化归因)
+        # [Lwd][perf] per-request latency of whole-prompt mrope computation
+        # (runs on the edge engine main thread; the scheduling loop stalls
+        # meanwhile; used for MM degradation attribution)
 
     def lwd_edge_notify_range(self, scheduler_output: SchedulerOutput) -> None:
         """Send one batch RangeNotify and attach the EMBED batch; a seqno is
@@ -432,13 +539,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
         seqno = self._lwd_seqno
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
+        lwd_logger.info(
+            "[edge] range announced seqno=%d reqs=%d tokens=%d",
+            seqno,
+            len(items),
+            sum(i.num_tokens for i in items),
+        )
         self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1
         self._lwd_pending_batches[seqno] = set(req_ids)
-        # 发送成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的配对键
-        # (与云侧 RangeNotify 登记同值),embed 载荷为本批逐请求的
-        # token 片段(边 worker 按 req_ids 序扁平化);mrope positions
-        # 已随 RangeNotify 走控制面,边 worker 不再组 aux 帧
+        # On successful send, assemble the EMBED batch and attach it to SO:
+        # seqno is the pairing key of the data-plane tensor sent to the
+        # cloud (same value as registered by the cloud-side RangeNotify);
+        # the embed payload is this batch's per-request token slices (the
+        # edge worker flattens them in req_ids order); mrope positions
+        # already went to the control plane with the RangeNotify, so the
+        # edge worker no longer builds aux frames
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -456,9 +572,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         tuple[list[LwdRangeItem], list[str], list[list[int]], list[int], list[bool]]
         | None
     ):
-        """组批内逐请求的 RangeItem 与 EMBED 载荷切片;mrope 逐 chunk
-        列切片序列化为原始字节随 item 走控制面。
-        无条目返回 None。"""
+        """Assemble per-request RangeItems and EMBED payload slices for the
+        batch; per-chunk mrope column slices are serialized as raw bytes and
+        travel the control plane with the item.
+        Returns None when there are no entries."""
         items: list[LwdRangeItem] = []
         req_ids: list[str] = []
         token_slices: list[list[int]] = []
@@ -468,7 +585,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request = self.requests.get(request_id)
             if request is None:
                 continue
-            # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
+            # _update_after_schedule already advanced num_computed
+            # optimistically; the start offset must step back by this
+            # step's amount
             offset = request.num_computed_tokens - num_tokens
             positions = self._lwd_mrope_positions_dict.get(request_id)
             req_has_mrope = positions is not None
@@ -501,17 +620,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
 
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """abort 台账摘除(pending 水位防线,不摘会顶高 prefill 闸门);
-        云侧 abort 通告功能未上,终结清账走原生 abort_requests。"""
+        """Ledger removal on abort (a pending watermark defense; failing to
+        remove would push up the prefill gate); the cloud-side abort notify
+        feature is not yet available, terminal cleanup goes through native
+        abort_requests."""
         for request_id in request_ids:
             self._lwd_drop_pending_request(request_id)
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
     ) -> bool:
-        """云结果对账:请求仍在原生 requests(decode 相位)则认领,
-        首 token 到账即从 pending 台账消除(finished 再消除一次幂等,
-        不摘会泄漏水位顶高闸门);已终结/未知请求幂等丢弃。"""
+        """Cloud result reconciliation: the request is claimed if it is
+        still in native requests (decode phase); on first token arrival it
+        is removed from the pending ledger (removing again on finished is
+        idempotent; failing to remove would leak the watermark and push up
+        the gate); terminated/unknown requests are idempotently
+        dropped."""
         request = self.requests.get(request_id)
         if request is None or request.is_finished():
             lwd_logger.warning(
@@ -523,9 +647,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return True
 
     def _lwd_drop_pending_request(self, request_id: str) -> None:
-        """从 pending 台账消除请求(首 token 到账/终结/abort 共用):
-        各批剔除该请求,批内全部消除 -> 整条移除(pending 水位下降;
-        不摘会只涨不降,prefill 闸门永久 HOLD)。"""
+        """Remove a request from the pending ledger (shared by first-token
+        arrival/termination/abort): discard the request from each batch;
+        once a batch is fully drained -> the whole entry is removed (the
+        pending watermark drops; failing to remove would make it only ever
+        rise, leaving the prefill gate in permanent HOLD)."""
         for seqno in list(self._lwd_pending_batches):
             batch = self._lwd_pending_batches[seqno]
             batch.discard(request_id)
@@ -533,17 +659,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 del self._lwd_pending_batches[seqno]
 
     def _lwd_purge_mrope_positions(self) -> None:
-        """对账摘除 mrope positions:请求已出 requests(终结/abort)
-        或嵌入完结转 decode 相位(各 chunk 已全部发出,notify 不再读)。
-        驻留模型无"嵌入完结即出队"的天然摘除点,收割期统一对账。"""
+        """Reconcile and remove mrope positions: the request has left
+        requests (terminated/aborted) or finished embedding and
+        transitioned to decode phase (all chunks already sent, notify no
+        longer reads it). Resident models have no natural removal point of
+        "leave the queue on embedding completion", so the harvest phase
+        reconciles uniformly."""
         for rid in list(self._lwd_mrope_positions_dict):
             request = self.requests.get(rid)
             if request is None or self._lwd_req_phase(request) is LwdReqPhase.DECODE:
                 self._lwd_mrope_positions_dict.pop(rid, None)
 
     def _lwd_validate_request(self, request: Request) -> None:
-        """模式边界校验(边侧能力面):拒绝自带 prompt_embeds/pooling/
-        结构化输出/不上 wire 的采样参数;违规抛 ValueError 于入队前拒绝。"""
+        """Mode boundary validation (edge capability surface): reject
+        client-provided prompt_embeds/pooling/structured output/sampling
+        params not carried on the wire; violations raise ValueError and are
+        rejected before enqueueing."""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -580,8 +711,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
 
     def _lwd_validate_mm_request(self, request: Request) -> None:
-        """多模态白名单:仅 image(merge/mrope 链路按 image 语义实现,
-        其余模态未适配,静默放过即错算);拒绝 EVS(multimodal pruning)。"""
+        """Multimodal allowlist: image only (the merge/mrope chain is
+        implemented with image semantics; other modalities are unadapted,
+        silently letting them through would compute wrongly); reject EVS
+        (multimodal pruning)."""
         if not request.mm_features:
             return
         unsupported_mm = sorted(
@@ -607,7 +740,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
 
 def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
-    """组 UNEMBED 批:云结果不经原生排程,以 make_empty 为骨架挂 LwdUnembedBatch。"""
+    """Assemble the UNEMBED batch: cloud results bypass native scheduling;
+    use make_empty as the skeleton and attach LwdUnembedBatch."""
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.num_scheduled_tokens = dict(
         zip(notify.req_ids, notify.num_accepted_tokens)

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Lwd 边/云调度器公共基类:相位谓词与可见集调度原语(三队列剔除-
-调度-拼回)。
+"""Common base class for Lwd edge/cloud schedulers: phase predicates and
+the visible-set scheduling primitive (three-queue remove - schedule -
+reassemble).
 
-继承 AsyncScheduler,原生调度行为与 isinstance 判定不变。
+Inherits AsyncScheduler; native scheduling behavior and isinstance checks
+stay unchanged.
 """
 
 from __future__ import annotations
@@ -19,10 +21,12 @@ from vllm.v1.request import Request
 
 
 def lwd_spec_factor(vllm_config) -> int:
-    """MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token 占
-    预算与 KV),无 spec 配置恒 1。唯一住处(边云同源,spec 系数以云侧
-    LwdCloudParamsNotify 为准);main 的 vllm/config/lwd 是拓扑快照,无此派生值,
-    故随调度原语住在基类模块。"""
+    """MTP budget factor: each decode request consumes 1+k tokens per step
+    (draft tokens take budget and KV); constantly 1 without a spec config.
+    The sole home of it (edge/cloud share one source; the spec factor
+    follows the cloud-side LwdCloudParamsNotify); main's vllm/config/lwd is
+    a topology snapshot without this derived value, so it lives in the
+    base-class module alongside the scheduling primitive."""
     spec_config = getattr(vllm_config, "speculative_config", None)
     num_spec_tokens = (
         getattr(spec_config, "num_speculative_tokens", None)
@@ -33,32 +37,48 @@ def lwd_spec_factor(vllm_config) -> int:
 
 
 class LwdReqPhase(Enum):
-    """请求的工作相位(边云同判据):PREFILL = 嵌入未发完
-    (num_computed < num_prompt),DECODE = 等云侧采样回程。"""
+    """Working phase of a request (same criterion on edge and cloud):
+    PREFILL = embedding not fully sent (num_computed < num_prompt), DECODE
+    = waiting for the cloud-side sampling return."""
 
     PREFILL = auto()
     DECODE = auto()
 
 
 class LwdBaseScheduler(AsyncScheduler):
-    """边/云调度器公共基类(AsyncScheduler 子类)。"""
+    """Common base class for edge/cloud schedulers (an AsyncScheduler
+    subclass)."""
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        """Native-compatible scheduling entry: step_with_batch_queue passes
+        throttle_prefills positionally; the signature converges here, and
+        edge/cloud subclasses implement only one-step role scheduling. The
+        throttle hint is not consumed -- each role's dispatch gate decides
+        on its own (on par with mm)."""
+        return self._lwd_schedule_step()
+
+    def _lwd_schedule_step(self) -> SchedulerOutput:
+        """One role-specific scheduling step; edge/cloud subclasses own it."""
+        raise NotImplementedError
 
     @staticmethod
     def _lwd_req_phase(request: Request) -> LwdReqPhase:
-        """唯一相位判据,边云各处的队列×相位扫描共用。"""
+        """The sole phase criterion, shared by all queue-by-phase scans on
+        edge and cloud."""
         if request.num_computed_tokens < request.num_prompt_tokens:
             return LwdReqPhase.PREFILL
         return LwdReqPhase.DECODE
 
     def _lwd_reqs_in_phase(self, phase: LwdReqPhase, *queues) -> Iterator[Request]:
-        """按相位扫多队列(已终结请求跳过——账面可能同时满足判据)。"""
+        """Scan multiple queues by phase (terminated requests skipped -- the
+        books may still satisfy the criterion)."""
         for queue in queues:
             for request in queue:
                 if not request.is_finished() and self._lwd_req_phase(request) is phase:
                     yield request
 
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
-        """新建调度策略队列并装入 reqs。"""
+        """Create a new scheduling policy queue and load reqs into it."""
         queue = create_request_queue(self.policy)
         for req in reqs:
             queue.add_request(req)
@@ -71,19 +91,26 @@ class LwdBaseScheduler(AsyncScheduler):
         token_budget_cap: int | None = None,
         chunk_threshold: int | None = None,
     ) -> SchedulerOutput:
-        """隔离调度:只调度 req_ids 指定的请求——其余从三队列临时
-        摘出隐藏,步后按原队列拼回(可见集机制)。
+        """Isolated scheduling: schedule only the requests named by req_ids
+        -- the rest are temporarily removed from the three queues and
+        hidden, then reassembled into their original queues after the step
+        (visible-set mechanism).
 
-        waiting/skipped 来源走原生准入(allocate/状态迁移/记账一样
-        不少),running 来源走续跑。拼回:仍被调度的接在隐藏 running
-        之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。
+        waiting/skipped sources go through native admission
+        (allocate/state transition/accounting all intact), running sources
+        go through resume. Reassembly: still-scheduled requests are
+        appended after the hidden running, preempted ones go to the waiting
+        tail, skipped ones go to the skipped queue head.
 
-        token_budget_cap / chunk_threshold 仅收紧不放宽原生上限:
-        边侧传 cap 复现 picker 的 chunk 划分,云侧传双钳制复现批内
-        边界(阈值=批内最大条目 + 预算=decode 精确消耗+Σchunk)。
-        隐藏的 running 对原生并发准入不可见,名额按隐藏数扣减防
-        超发(边侧 picker free_seq、云侧 preflight 为第一道防线,
-        此处为纵深)。"""
+        token_budget_cap / chunk_threshold only tighten, never loosen, the
+        native limits: the edge side passes a cap to reproduce the picker's
+        chunk split, the cloud side passes the dual clamp to reproduce
+        in-batch boundaries (threshold = max item in the batch + budget =
+        decode exact consumption + Σchunk). Hidden running requests are
+        invisible to native concurrent admission; slots are deducted by the
+        hidden count to prevent over-issue (edge-side picker free_seq and
+        cloud-side preflight are the first line of defense; this is defense
+        in depth)."""
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
@@ -92,7 +119,7 @@ class LwdBaseScheduler(AsyncScheduler):
         self.waiting.remove_requests(from_waiting)
         self.skipped_waiting.remove_requests(from_skipped)
         saved = (self.running, self.waiting, self.skipped_waiting)
-        # 可见集归位后单独调度
+        # Put the visible set in place and schedule it alone
         self.running = from_running
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)

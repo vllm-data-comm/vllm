@@ -1,19 +1,26 @@
-"""LWD 控制面诊断中枢:开关现读、spec 接受率观测、诊断旁路的判定与
-载荷提取、debug 打点转发。
+"""LWD control-plane diagnostics hub: on-the-spot switch reads, spec
+acceptance-rate observation, diagnostic-bypass predicates and payload
+extraction, debug instrumentation forwarding.
 
-功能类(调度器/引擎)只经本模块触达诊断——不散读 env 开关、不直接
-import vllm.v1.lwd_debug;诊断逻辑不与功能接口糅合,开关/旁路/观测
-的增删只改这里。边界:本模块只出"判定与数据"(开关布尔、旁路行
-集、累计读数),不持执行适配器(future/伪输出等 executor 边界契约
-归引擎)。
+Functional classes (schedulers/engines) touch diagnostics only through
+this module — no scattered env reads, no direct import of
+vllm.v1.lwd_debug; diagnostic logic stays unmixed with functional
+interfaces, so adding/removing switches/bypasses/observations only
+changes this file. Boundary: this module only produces "predicates and
+data" (switch booleans, bypass row sets, cumulative counters); it holds
+no execution adapters (executor-boundary contracts such as futures and
+fake outputs belong to the engine).
 
-诊断行为定义(排障口径):
-  - SKIP_SAMPLE(边免采样):云侧把本步逐请求 accepted token ids 随
-    c2e 捎带,边侧跳过 lm_head 采样还原;
-  - DISABLE_DOWN(全直通):云不 collect、不发 DOWN 张量,c2e 以
-    hidden=0 携带 token ids 直传,边侧收割直接交付。
-两者均严格 == "1" 且按调用点现读(进程内改 env 即时生效,与
-vllm-ascend 侧 envs.py 读法同名同义)。
+Diagnostic behavior definitions (troubleshooting semantics):
+  - SKIP_SAMPLE (edge skips sampling): the cloud piggybacks this
+    step's per-request accepted token ids on c2e, and the edge skips
+    the lm_head sampling reconstruction;
+  - DISABLE_DOWN (full passthrough): the cloud does not collect and
+    sends no DOWN tensors; c2e carries the token ids directly with
+    hidden=0, and the edge harvests and delivers them as-is.
+Both are strictly == "1" and read on the spot at each call site
+(changing the env in-process takes effect immediately; same name and
+semantics as the read in vllm-ascend envs.py).
 """
 
 from __future__ import annotations
@@ -23,28 +30,62 @@ import time
 
 _LWD_ENV_PREFIX = "VLLM_ASCEND_LWD_"
 
-# spec 接受率周期直出间隔(累计器常驻,周期打点)
+# Periodic log interval for the spec acceptance rate (counters are
+# resident, logged periodically)
 _SPEC_LOG_INTERVAL_S = 10.0
 
 
 def _lwd_debug_mods():
-    """lwd_debug 惰性进口:本模块顶层保持零重依赖(纯逻辑可测),
-    lwd_control 内对 lwd_debug 的 import 仍唯一收口在这里。"""
-    from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
-
+    """Lazy import of lwd_debug: keeps this module's top level free of
+    heavy dependencies (pure logic stays testable); the import of
+    lwd_debug inside lwd_control is still funneled solely through here.
+    Fallback: vllm.v1.lwd_debug is not migrated to main yet (issue #18
+    breakpoint 4); until it lands, degrade to no-op shims so first-request
+    diagnostics do not crash — the real classes take over automatically
+    once the package exists."""
+    try:
+        from vllm.v1.lwd_debug import LwdControlLog, LwdDebug, LwdLogBase
+    except ImportError:
+        return _LwdDebugNoOp, _LwdDebugNoOp, _LwdDebugNoOp
     return LwdControlLog, LwdDebug, LwdLogBase
 
 
+class _LwdDebugNoOp:
+    """No-op stand-in for the not-yet-migrated vllm.v1.lwd_debug classes."""
+
+    @staticmethod
+    def set_debug(enabled: bool) -> None:
+        pass
+
+    @staticmethod
+    def flight(running: int, awaiting: int) -> None:
+        pass
+
+    @staticmethod
+    def edge_tokens_delivered(*args: object, **kwargs: object) -> None:
+        pass
+
+    @staticmethod
+    def cloud_step(*args: object, **kwargs: object) -> None:
+        pass
+
+    @staticmethod
+    def cloud_request_admitted(*args: object, **kwargs: object) -> None:
+        pass
+
+
 class LwdControlDiag:
-    """控制面诊断逻辑的唯一住处(功能类经此类/本模块触达诊断)。"""
+    """The single home of control-plane diagnostic logic (functional
+    classes reach diagnostics via this class / module)."""
 
     # ------------------------------------------------------------------ #
-    # 开关(调用点现读,严格 == "1")                                     #
+    # Switches (read on the spot at each call site, strictly == "1")     #
     # ------------------------------------------------------------------ #
     @staticmethod
     def token_passthrough_enabled() -> bool:
-        """云侧诊断旁路总开关:SKIP_SAMPLE(边免采样)/ DISABLE_DOWN
-        (全直通)任一开启即 True。"""
+        """Cloud-side master switch of the diagnostic bypass: True when
+        either SKIP_SAMPLE (edge skips sampling) / DISABLE_DOWN (full
+        passthrough) is on."""
         return (
             os.getenv(_LWD_ENV_PREFIX + "EDGE_SKIP_SAMPLE") == "1"
             or os.getenv(_LWD_ENV_PREFIX + "DISABLE_DOWN") == "1"
@@ -52,21 +93,24 @@ class LwdControlDiag:
 
     @staticmethod
     def disable_down_enabled() -> bool:
-        """DISABLE_DOWN 诊断开关:云不 collect/不发 DOWN,边直通交付。"""
+        """DISABLE_DOWN diagnostic switch: the cloud does not collect /
+        sends no DOWN; the edge delivers via passthrough."""
         return os.getenv(_LWD_ENV_PREFIX + "DISABLE_DOWN") == "1"
 
     # ------------------------------------------------------------------ #
-    # debug 打点转发(lwd_debug 在 lwd_control 内的唯一进口)            #
+    # Debug instrumentation forwarding (sole lwd_debug import point)     #
     # ------------------------------------------------------------------ #
     @staticmethod
     def set_debug(enabled: bool) -> None:
-        """层日志总开关(env 已开则不动,config 段开则补开,仅本进程)。"""
+        """Layer log master switch (left alone if env already enabled it,
+        turned on if the config section enables it, this process only)."""
         _, _, log_base = _lwd_debug_mods()
         log_base.set_debug(enabled)
 
     @staticmethod
     def edge_step_activity(running: int, awaiting: int) -> None:
-        """边侧每步活力度打点(running 数 / decode 相位驻留数)。"""
+        """Edge per-step activity instrumentation (running count /
+        decode-phase resident count)."""
         control_log, _, _ = _lwd_debug_mods()
         control_log.flight(running, awaiting)
 
@@ -74,7 +118,7 @@ class LwdControlDiag:
     def edge_tokens_delivered(
         request_id, sampled_token_ids, finish_reason, vllm_config
     ) -> None:
-        """边侧逐请求交付打点。"""
+        """Edge per-request delivery instrumentation."""
         _, debug, _ = _lwd_debug_mods()
         debug.edge_tokens_delivered(
             request_id, sampled_token_ids, finish_reason, vllm_config
@@ -82,18 +126,18 @@ class LwdControlDiag:
 
     @staticmethod
     def cloud_step(scheduler, meta, engine_core_outputs) -> None:
-        """云侧步元数据打点。"""
+        """Cloud step-metadata instrumentation."""
         _, debug, _ = _lwd_debug_mods()
         debug.cloud_step(scheduler, meta, engine_core_outputs)
 
     @staticmethod
     def cloud_request_admitted(wire, sampling_params) -> None:
-        """云侧请求过门打点。"""
+        """Cloud request gate-passage instrumentation."""
         _, debug, _ = _lwd_debug_mods()
         debug.cloud_request_admitted(wire, sampling_params)
 
     # ------------------------------------------------------------------ #
-    # spec 接受率观测(累计器住此类,原生同口径)                       #
+    # Spec acceptance observation (counters live here, native semantics) #
     # ------------------------------------------------------------------ #
     def __init__(self) -> None:
         self._spec_draft_tokens = 0
@@ -103,9 +147,11 @@ class LwdControlDiag:
     def observe_spec_acceptance(
         self, scheduler_output, model_runner_output, requests
     ) -> None:
-        """按原生口径累计草稿/接受数(num_draft = len(spec_ids),
-        num_accepted = len(generated) - 1 含 bonus 减一剔除非草稿行),
-        周期直出运行总计;跳过已终结/未知请求(与原生同款过滤)。"""
+        """Accumulate draft/accepted counts with native semantics
+        (num_draft = len(spec_ids), num_accepted = len(generated) - 1
+        where the minus one drops the bonus non-draft row), logging
+        running totals periodically; skips finished/unknown requests
+        (same filter as native)."""
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not spec_tokens:
             return
@@ -135,17 +181,19 @@ class LwdControlDiag:
 
         rate = self._spec_accepted / self._spec_draft_tokens * 100
         lwd_logger.info(
-            "[spec] cumulative: rate=%.1f%% accepted=%d "
-            "draft_tokens=%d",
-            rate, self._spec_accepted, self._spec_draft_tokens,
+            "[spec] cumulative: rate=%.1f%% accepted=%d draft_tokens=%d",
+            rate,
+            self._spec_accepted,
+            self._spec_draft_tokens,
         )
 
     # ------------------------------------------------------------------ #
-    # 诊断旁路载荷                                                        #
+    # Diagnostic bypass payloads                                         #
     # ------------------------------------------------------------------ #
     @staticmethod
     def step_token_ids(engine_core_outputs) -> dict[str, list[int]]:
-        """本步逐请求 new_token_ids(request_id 索引),旁路载荷共用。"""
+        """Per-request new_token_ids for this step (indexed by
+        request_id), shared by the bypass payloads."""
         ids_by_req: dict[str, list[int]] = {}
         for outputs in engine_core_outputs.values():
             for out in outputs.outputs:
@@ -156,16 +204,19 @@ class LwdControlDiag:
     def bypass_token_payload(
         req_ids: list[str], engine_core_outputs
     ) -> list[list[int]]:
-        """SKIP_SAMPLE 旁路:按 c2e 行集逐请求 accepted token ids,
-        缺席行补空(与 req_ids 按位对齐)。"""
+        """SKIP_SAMPLE bypass: per-request accepted token ids aligned to
+        the c2e row set; absent rows are padded empty (positionally
+        aligned with req_ids)."""
         ids_by_req = LwdControlDiag.step_token_ids(engine_core_outputs)
         return [ids_by_req.get(rid, []) for rid in req_ids]
 
     @staticmethod
     def disable_down_rows(engine_core_outputs) -> dict[str, list[int]]:
-        """DISABLE_DOWN 直通行集:本步逐请求 token + 仅进
-        finished_requests 的请求补空行(携带 ABORT 完成码);空步为空
-        dict(无可交付内容,不发空通告)。"""
+        """DISABLE_DOWN passthrough row set: this step's per-request
+        tokens + empty rows padded for requests that only appear in
+        finished_requests (carrying the ABORT finish code); an empty
+        step yields an empty dict (nothing to deliver, no empty notify
+        is sent)."""
         ids_by_req = LwdControlDiag.step_token_ids(engine_core_outputs)
         for outputs in engine_core_outputs.values():
             for rid in outputs.finished_requests or ():
@@ -173,10 +224,12 @@ class LwdControlDiag:
         return ids_by_req
 
     @staticmethod
-    def bypass_unembed_rows(batch) -> "tuple[list[str], list[list[int]]] | None":
-        """DISABLE_DOWN 直通判定与行集:UNEMBED 批且通告携带旁路
-        token(hidden=0)时返回 (req_ids, 旁路 token 行),否则 None。
-        只出数据不出执行适配器——直通 future/伪输出由边引擎包装。"""
+    def bypass_unembed_rows(batch) -> tuple[list[str], list[list[int]]] | None:
+        """DISABLE_DOWN passthrough predicate and row set: returns
+        (req_ids, bypass token rows) when the batch is UNEMBED and the
+        notify carries bypass tokens (hidden=0), else None. Produces
+        data only, no execution adapters — the passthrough future /
+        fake output is wrapped by the edge engine."""
         if batch is None:
             return None
         from vllm.v1.core.sched.output import LwdBatchType
@@ -194,7 +247,7 @@ class LwdControlDiag:
         return None
 
     # ------------------------------------------------------------------ #
-    # EOS 尾部 kill 根因定位([Lwd][eos-trace],正常流量零输出)         #
+    # EOS tail-kill root-cause localization ([Lwd][eos-trace], silent)   #
     # ------------------------------------------------------------------ #
     @staticmethod
     def zero_accept_rows(
@@ -202,8 +255,10 @@ class LwdControlDiag:
         accepted: list[int],
         finish_reasons: list[int],
     ) -> list[tuple[str, int, int]]:
-        """提取零接受行 (rid, accepted=0, finish_code)——云组行病灶的
-        判定数据:活行零接受(accepted=0 且 finish=-1)即 kill 候选。"""
+        """Extract zero-accept rows (rid, accepted=0, finish_code) — the
+        predicate data for the cloud row-assembly defect: a live row
+        with zero acceptance (accepted=0 and finish=-1) is a kill
+        candidate."""
         return [
             (rid, acc, fin)
             for rid, acc, fin in zip(req_ids, accepted, finish_reasons)
@@ -217,18 +272,18 @@ class LwdControlDiag:
         accepted: list[int],
         finish_reasons: list[int],
     ) -> None:
-        """[Lwd][eos-trace] A 点·云侧组 c2e 时:存在零接受行才留痕
-        (MTP 正常步每行至少接受根 token,零接受≈0,日志量可控)。"""
-        rows = LwdControlDiag.zero_accept_rows(
-            req_ids, accepted, finish_reasons
-        )
+        """[Lwd][eos-trace] Point A, cloud assembling c2e: leave a trace
+        only when zero-accept rows exist (a normal MTP step accepts at
+        least the root token per row, so zero-accept ~= 0 and the log
+        volume stays bounded)."""
+        rows = LwdControlDiag.zero_accept_rows(req_ids, accepted, finish_reasons)
         if rows:
             from vllm.lwd_logger import lwd_logger
 
             lwd_logger.info(
-                "[eos-trace] cloud seqno=%s zero-accept rows "
-                "(rid,acc,fin)=%s",
-                seqno, rows,
+                "[eos-trace] cloud seqno=%s zero-accept rows (rid,acc,fin)=%s",
+                seqno,
+                rows,
             )
 
     @staticmethod
@@ -240,16 +295,23 @@ class LwdControlDiag:
         batch_rows: int,
         sampled_rows: int,
     ) -> None:
-        """[Lwd][eos-trace] B 点·边侧 ERROR 转换时:按 down_seqno 与
-        A/C 日志配对。accepted 与 sampled_rows 是判定主证——
-        accepted=0 → 云组行(零接受活行进了行集);accepted>0 且
-        sampled_rows>0 → worker 单行缺;sampled_rows=0 → 整批空回填。"""
+        """[Lwd][eos-trace] Point B, edge converting to ERROR: pair with
+        the A/C logs by down_seqno. accepted and sampled_rows are the
+        primary evidence — accepted=0 -> cloud row assembly (a
+        zero-accept live row entered the row set); accepted>0 and
+        sampled_rows>0 -> a single worker row missing; sampled_rows=0
+        -> the whole batch backfilled empty."""
         from vllm.lwd_logger import lwd_logger
 
         lwd_logger.info(
             "[eos-trace] edge kill seqno=%s rid=%s accepted=%d "
             "finish=%d batch_rows=%d sampled_rows=%d",
-            seqno, rid, accepted, finish_code, batch_rows, sampled_rows,
+            seqno,
+            rid,
+            accepted,
+            finish_code,
+            batch_rows,
+            sampled_rows,
         )
 
     @staticmethod
@@ -259,17 +321,14 @@ class LwdControlDiag:
         result_req_ids: list[str],
         sampled_token_ids: list[list[int]],
     ) -> list[str]:
-        """worker 回填缺行判定:声明 accepted>0 的行却无 token 输出
-        (不在回填行集或 token 列表为空)——C 点数据。accepted=0 的行
-        worker 不产出属合法,不计缺。"""
-        filled = {
-            rid: toks
-            for rid, toks in zip(result_req_ids, sampled_token_ids)
-        }
+        """Worker backfill missing-row predicate: rows that declared
+        accepted>0 yet produced no token output (absent from the
+        backfill row set, or an empty token list) — Point C data. Rows
+        with accepted=0 are legitimately not produced by the worker
+        and do not count as missing."""
+        filled = {rid: toks for rid, toks in zip(result_req_ids, sampled_token_ids)}
         return [
-            rid
-            for rid, acc in zip(req_ids, accepts)
-            if acc > 0 and not filled.get(rid)
+            rid for rid, acc in zip(req_ids, accepts) if acc > 0 and not filled.get(rid)
         ]
 
     @staticmethod
@@ -280,8 +339,9 @@ class LwdControlDiag:
         result_req_ids: list[str],
         sampled_token_ids: list[list[int]],
     ) -> None:
-        """[Lwd][eos-trace] C 点·worker 回填后:声明有产出(accepted>0)
-        却没交 token 的行——出现即 worker 回填缺行坐实。"""
+        """[Lwd][eos-trace] Point C, after worker backfill: rows that
+        declared output (accepted>0) yet delivered no tokens — their
+        presence confirms the worker backfill dropped rows."""
         missing = LwdControlDiag.unembed_missing_rows(
             req_ids, accepts, result_req_ids, sampled_token_ids
         )
@@ -290,6 +350,6 @@ class LwdControlDiag:
 
             lwd_logger.info(
                 "[eos-trace] worker seqno=%s missing rows=%s",
-                seqno, missing,
+                seqno,
+                missing,
             )
-

@@ -1,9 +1,12 @@
-"""边侧 prefill 组批纯函数:续传优先 + FCFS 前缀 + 末位截断(PD_mix
-唯一形态;PD 分离的单请求逃生通道已随相位机删除)。
+"""Pure functions for edge-side prefill batch assembly: resume-first +
+FCFS prefix + tail truncation (PD_mix is the only supported form; the
+single-request escape hatch for PD-disaggregated mode was removed along
+with the phase machine).
 
-chunk 语义依据 lwd_chunked_prefill_design.md §3.1,由 LwdEdgeScheduler
-适配层组装候选后调用;输入输出全部 plain 值,不含调度器状态,表驱动
-可测。
+chunk semantics follow lwd_chunked_prefill_design.md §3.1; called by the
+LwdEdgeScheduler adapter layer after it assembles candidates. Inputs and
+outputs are all plain values with no scheduler state, so the logic is
+table-driven testable.
 """
 
 from __future__ import annotations
@@ -13,7 +16,8 @@ from typing import NamedTuple
 
 
 class LwdPrefillCandidate(NamedTuple):
-    """组批候选:调度器在调用点把 Request 抽成本三字段。"""
+    """Batch assembly candidate: the scheduler distills a Request into
+    these three fields at the call site."""
 
     request_id: str
     num_prompt_tokens: int
@@ -29,17 +33,21 @@ def lwd_pick_prefill_batch(
     chunk_unit: int,
     single_prefill_min_tokens: int = 0,
 ) -> tuple[list[str], dict[str, int]]:
-    """选下一步 embed 批,返回 (req_ids, expected)。
+    """Pick the next embed batch, returning (req_ids, expected).
 
-    running 为续传候选(保持 running 序,先收尾再开新);waiting 为开新
-    候选(调用方拼好 skipped 优先 + waiting 的 FCFS 序)。chunk_unit 即
-    chunk 单元 C,每块自限 c = min(剩余, C)。cap < 1 返回空批;新增
-    请求数受 free_seq 钳制;末位截断:批内最后一个条目允许被剩余额度
-    (cap − used)截尾,截断即收批。
+    running holds resume candidates (in running order: finish in-flight
+    requests before starting new ones); waiting holds new-start candidates
+    (the caller pre-joins skipped-first + the FCFS order of waiting).
+    chunk_unit is the chunk unit C; each piece self-limits to
+    c = min(remaining, C). cap < 1 returns an empty batch; the number of
+    new requests is clamped by free_seq; tail truncation: the last entry
+    in the batch may be cut short by the remaining budget (cap − used),
+    and a truncation closes the batch.
 
-    single_prefill_min_tokens:>0 时,总 prompt 长度达到该值的请求独占
-    prefill 批(含续传,批内该请求前后不再装别的条目);0 = 关闭
-    (DeepSeek V4 传 8000,其余模型传 0)。
+    single_prefill_min_tokens: when > 0, a request whose total prompt
+    length reaches this value takes the prefill batch exclusively
+    (resumes included; no other entries are packed before or after it in
+    the batch); 0 = disabled (DeepSeek V4 passes 8000, other models pass 0).
 
     """
     picked: list[str] = []
@@ -50,19 +58,24 @@ def lwd_pick_prefill_batch(
         running, picked, expected, cap, chunk_unit, single_prefill_min_tokens
     )
     _pick_new_requests(
-        waiting, picked, expected, used, cap, free_seq,
-        chunk_unit, single_prefill_min_tokens, single_prefill,
+        waiting,
+        picked,
+        expected,
+        used,
+        cap,
+        free_seq,
+        chunk_unit,
+        single_prefill_min_tokens,
+        single_prefill,
     )
     return picked, expected
 
 
-def _is_single_prefill(
-    single_prefill_min_tokens: int, num_prompt_tokens: int
-) -> bool:
-    """该请求是否触发独占规则(总 prompt 长度达标)。"""
+def _is_single_prefill(single_prefill_min_tokens: int, num_prompt_tokens: int) -> bool:
+    """Whether this request triggers the exclusive rule (total prompt
+    length reaches the threshold)."""
     return (
-        single_prefill_min_tokens > 0
-        and num_prompt_tokens >= single_prefill_min_tokens
+        single_prefill_min_tokens > 0 and num_prompt_tokens >= single_prefill_min_tokens
     )
 
 
@@ -74,9 +87,11 @@ def _append_chunk(
     request_id: str,
     chunk: int,
 ) -> tuple[int, bool]:
-    """往批里装一个 chunk;used + chunk 超预算走末位截断
-    (剩余额度 c = cap − used,c ≥ 1 才入批,截断块同样占预算),
-    截断即收批。返回 (新 used, 批是否已收口)。"""
+    """Pack one chunk into the batch; when used + chunk exceeds the
+    budget, fall back to tail truncation (remaining budget c = cap − used;
+    the entry joins only if c ≥ 1, and the truncated piece still consumes
+    budget). A truncation closes the batch. Returns (new used, whether
+    the batch is closed)."""
     if used + chunk > cap:
         c = cap - used
         if c >= 1:
@@ -97,11 +112,14 @@ def _pick_resumes(
     chunk_unit: int,
     single_prefill_min_tokens: int,
 ) -> tuple[int, bool]:
-    """续传循环:running 序逐请求取 c = min(剩余, C)。
+    """Resume loop: walk requests in running order, each taking
+    c = min(remaining, C).
 
-    独占规则:达标请求置 single_prefill 标志,批内已有条目即当场收批
-    (长请求不与短请求合批);标志跨循环传递(本批收口,开新循环不再
-    装)。返回 (used, single_prefill 标志)。"""
+    Exclusive rule: a qualifying request sets the single_prefill flag; if
+    the batch already has entries, close it on the spot (long requests
+    are never batched with short ones); the flag carries across loops
+    (this batch closes, and the new-start loop packs nothing more).
+    Returns (used, single_prefill flag)."""
     used = 0
     single_prefill = False
     for cand in running:
@@ -110,16 +128,22 @@ def _pick_resumes(
         remaining = cand.num_prompt_tokens - cand.num_computed_tokens
         if remaining <= 0:
             continue
-        # 独占判定用总 prompt 长度而非本 chunk 剩余:长请求后到达时先
-        # 收掉当前批,留给下一批独占,不用 waiting 的新开绕过它
+        # The exclusive check uses total prompt length, not this chunk's
+        # remaining tokens: when a long request arrives later, close the
+        # current batch first and leave the next batch to it alone, so
+        # waiting new-starts cannot bypass it
         single_prefill = _is_single_prefill(
             single_prefill_min_tokens, cand.num_prompt_tokens
         )
         if single_prefill and picked:
             break
         used, batch_closed = _append_chunk(
-            picked, expected, used, cap,
-            cand.request_id, min(remaining, chunk_unit),
+            picked,
+            expected,
+            used,
+            cap,
+            cand.request_id,
+            min(remaining, chunk_unit),
         )
         if batch_closed:
             break
@@ -137,11 +161,12 @@ def _pick_new_requests(
     single_prefill_min_tokens: int,
     single_prefill: bool,
 ) -> int:
-    """开新循环:waiting 序取 FCFS 前缀,c = min(prompt, C),新增数
-    ≤ free_seq;不跳过队首(保 FCFS 与 seqno 链次序)。single_prefill
-    由续传循环传入(True 即本批已收口)。返回 used。"""
-    new_count = 0
-    for cand in waiting:
+    """New-start loop: take the FCFS prefix of the waiting order,
+    c = min(prompt, C), new-start count ≤ free_seq; never skip the queue
+    head (preserves FCFS and seqno chain order). single_prefill is passed
+    in from the resume loop (True means this batch is already closed).
+    Returns used."""
+    for new_count, cand in enumerate(waiting):
         if single_prefill and picked:
             break
         single_prefill = _is_single_prefill(
@@ -157,5 +182,4 @@ def _pick_new_requests(
         )
         if batch_closed:
             break
-        new_count += 1
     return used
