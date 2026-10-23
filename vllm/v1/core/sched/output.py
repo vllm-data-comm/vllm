@@ -61,6 +61,14 @@ class LwdEmbedBatch:
     #   control-plane notify; the data-plane aux frame is retired).
     #   bytes is a native msgspec type, serialized with the SO to every
     #   cloud worker at no extra cost.
+
+
+    # NOTE (coordinate systems, do not conflate): len(token_ids[i]) is the
+    # EDGE BATCH transport fact (rows the edge put on the wire for the batch;
+    # HCCL P2P requires exact numel parity) - it is NOT "how many rows this
+    # step computes" (that is num_scheduled_tokens) and NOT the arrival
+    # high-water (that is recv_rows). Consumers use absolute prompt
+    # coordinates and the native schedule quantity only.
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)

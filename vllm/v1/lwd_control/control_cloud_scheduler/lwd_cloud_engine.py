@@ -89,6 +89,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 f"completions, got {len(handles)}"
             )
         self._lwd_done_mq = MessageQueue.create_from_handle(handles[0], 0)
+        # Arrival ledger + prompt lengths: defined before the scheduler
+        # wiring (shared by reference, cpu_offload pattern).
+        self._lwd_recv_rows: dict[str, int] = {}
+        self._lwd_prompt_len: dict[str, int] = {}
+        # Share the arrival ledger with the scheduler (by reference):
+        # the drain (this thread) writes, the scheduler's visible-set
+        # predicate reads on every step.
+        self.scheduler.lwd_recv_rows = self._lwd_recv_rows
         lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
 
     def _lwd_assemble(self) -> None:
@@ -206,13 +214,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         # TODO(lwd): several edges per cloud DP rank need requests tracked by
         # the peer that owns them, issue #8.
         if isinstance(msg, LwdRangeNotify):
-            # Range notify: the whole message enters the notify queue
-            # (duplicate notifies = duplicate listing; the scheduler
-            # drops them idempotently while classifying, no side
-            # effects). The notify carries its own seqno, used as the
-            # UP-chain pairing number when the batch goes out.
+            # Range notify: only drives the pre-recv hint (the worker
+            # posts the UP recv on it). The notify queue is deleted.
             items = msg.items
-            self.scheduler.prefill_notify_queue.append(msg)
             # [Lwd][pre-recv] Early receive step 1: the moment the
             # notify arrives, send the cloud worker a hint (seqno +
             # flat token count); the worker's comm thread posts an
@@ -232,6 +236,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             )
 
             num_tokens = sum(item.num_tokens for item in items)
+            hint_req_rows = [
+                (it.request_id, it.offset + it.num_tokens) for it in items
+            ]
             aux_rows = 0
             # Log before enqueueing: the worker comm thread can pick
             # the hint up within 0.5 ms; if the log came after the
@@ -243,15 +250,29 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 num_tokens,
                 time.monotonic(),
             )
-            post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
+            post_irecv_hint(make_recv_hint(
+                msg.seqno, num_tokens, aux_rows, req_rows=hint_req_rows))
         elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
+            # Message v2: full-prompt mrope arrives once at admission - stash
+            # it on the request for the runner to prime req_state (replaces
+            # the per-chunk slices carried by LwdRangeItem).
+            request.lwd_mrope_positions = msg.mrope_positions
+            self._lwd_prompt_len[msg.request_id] = msg.num_prompt_tokens
+            self._lwd_recv_rows.setdefault(msg.request_id, 0)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             lwd_logger.info(
-                "[cloud] request added req=%s tokens=%d",
-                msg.request_id,
-                msg.num_prompt_tokens,
-            )
+                "[LWD] request admitted req=%s prompt=%d",
+                msg.request_id, msg.num_prompt_tokens)
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        """Drop held (not-yet-arrived) requests from the hold gate; the rest
+        abort natively. Leaving hold entries in would never release (the
+        payload stream for an aborted request stops)."""
+        for rid in request_ids:
+            self._lwd_prompt_len.pop(rid, None)
+            self._lwd_recv_rows.pop(rid, None)
+        super().abort_requests(request_ids)
 
     def shutdown(self) -> None:
         # Before the executor goes: a pre-recv hint blocks on its queue.
@@ -346,6 +367,19 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         if not items:
             return
         advanced = record_irecv_completions(items)
+        # Per-request arrival ledger (A2 piggybacks absolute rows on the done
+        # messages): idempotent max(), full-arrival releases the held request
+        # into the native input_queue. Absent piggyback = no-op (old peers).
+        per_req = []
+        for it in items:
+            # Done reports are (channel, seqno, req_rows) 3-tuples from the
+            # worker piggyback (A2); bare 2-tuples from old peers carry none.
+            rows = it[2] if isinstance(it, tuple) and len(it) > 2 else ()
+            per_req.extend(rows or ())
+        for req_id, arrived in per_req:
+            self._lwd_recv_rows[req_id] = max(
+                self._lwd_recv_rows.get(req_id, 0), arrived)
+        # (hold-gate release removed: the scheduler's visible-set handles it)
         lwd_logger.info(
             "[Lwd][pre-recv] DRAIN n=%d seqnos=%s advanced=%s ts=%.3f",
             len(items),
