@@ -2334,9 +2334,24 @@ class EngineArgs:
                     "data_parallel_backend can only be ray or mp, got %s",
                     self.data_parallel_backend,
                 )
-                data_parallel_address = (
-                    self.master_addr or ParallelConfig.data_parallel_master_ip
-                )
+                lwd_enabled = "lwd_config" in (self.additional_config or {})
+                if lwd_enabled:
+                    # In an LWD deployment master_addr is the shared-world
+                    # rendezvous host (usually the edge): the engine-level
+                    # DP group of a multi-DP cloud would try to reach its
+                    # gloo store there and never connect. Default to the
+                    # local loopback instead; cross-node cloud DP ranks
+                    # must pass --data-parallel-address explicitly.
+                    data_parallel_address = ParallelConfig.data_parallel_master_ip
+                    logger.info(
+                        "LWD deployment: data parallel address defaults to %s; "
+                        "set --data-parallel-address for cross-node DP ranks",
+                        data_parallel_address,
+                    )
+                else:
+                    data_parallel_address = (
+                        self.master_addr or ParallelConfig.data_parallel_master_ip
+                    )
         else:
             data_parallel_address = self.data_parallel_address
 

@@ -1316,44 +1316,58 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
-                if vllm_config.lwd_config is not None:
-                    raise NotImplementedError(
-                        "[LWD] MoE models with data parallelism are not supported"
+            lwd = vllm_config.lwd_config
+            if lwd is not None:
+                # LWD cloud engines are one per DP rank regardless of MoE:
+                # a MoE cloud keeps the native DP semantics (wave state
+                # machine, dummy batches, DP collectives) on the DP engine
+                # base; non-MoE engines stay independent. The edge runs one
+                # process for all its DP connections.
+                lwd_dp_size = parallel_config.data_parallel_size
+                if lwd.role == "edge":
+                    if lwd_dp_size > 1:
+                        raise ValueError(
+                            "[LWD] one edge process serves every DP "
+                            "connection; start the edge with data parallel "
+                            f"size 1, got {lwd_dp_size}"
+                        )
+                    from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (  # noqa: E501
+                        LwdEdgeEngineCore,
                     )
-                # Set data parallel rank for this engine process.
+
+                    engine_core = LwdEdgeEngineCore(
+                        *args, engine_index=dp_rank, lwd_dp_size=lwd_dp_size, **kwargs
+                    )
+                elif lwd.role == "cloud" and vllm_config.model_config.is_moe and (
+                    lwd_dp_size > 1
+                ):
+                    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
+                        LwdCloudDPEngineCore,
+                    )
+
+                    parallel_config.data_parallel_rank = dp_rank
+                    engine_core = LwdCloudDPEngineCore(
+                        *args, lwd_dp_size=lwd_dp_size, **kwargs
+                    )
+                else:
+                    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
+                        LwdCloudEngineCore,
+                    )
+
+                    parallel_config.reconfigure_for_independent_dp_rank()
+                    engine_core = LwdCloudEngineCore(
+                        *args, engine_index=dp_rank, lwd_dp_size=lwd_dp_size, **kwargs
+                    )
+            elif vllm_config.model_config.is_moe and data_parallel:
+                # Native MoE DP: set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
-                # LWD checks the global DP size against its topology, so read
-                # it before the reset.
-                lwd_dp_size = parallel_config.data_parallel_size
                 parallel_config.reconfigure_for_independent_dp_rank()
-                # Lwd prefill-only engine selection (edge/cloud): no-op
-                # unless lwd_config was explicitly provided (vanilla
-                # EngineCoreProc). Gate follows main's resolve_lwd_config
-                # init-guard semantics — a parsed config means LWD is on;
-                # role picks the engine (schema restricts it to edge/cloud).
-                lwd = vllm_config.lwd_config
-                engine_cls = EngineCoreProc
-                if lwd is not None:
-                    if lwd.role == "edge":
-                        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (  # noqa: E501
-                            LwdEdgeEngineCore,
-                        )
-
-                        engine_cls = LwdEdgeEngineCore
-                    else:
-                        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
-                            LwdCloudEngineCore,
-                        )
-
-                        engine_cls = LwdCloudEngineCore
-                    kwargs["lwd_dp_size"] = lwd_dp_size
-                engine_core = engine_cls(*args, engine_index=dp_rank, **kwargs)
+                engine_core = EngineCoreProc(*args, **kwargs)
 
             assert engine_core is not None
 

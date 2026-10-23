@@ -1922,6 +1922,15 @@ def init_distributed_environment(
             "world group already initialized with a different world size"
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
+        if config.lwd_config is not None:
+            # The inner-DP world derives its rank grid from the native
+            # uniform (dp, tp) layout, which the LWD shared edge-cloud
+            # world does not follow; multi-node DP inside one LWD instance
+            # is rejected until the groups come from the topology.
+            raise NotImplementedError(
+                "[LWD] multi-node data parallel ranks of one instance are "
+                "not supported in edge-cloud mode"
+            )
         if parallel_config.data_parallel_size > 1:
             world_size_inner_dp = parallel_config.world_size
             group_ranks = [

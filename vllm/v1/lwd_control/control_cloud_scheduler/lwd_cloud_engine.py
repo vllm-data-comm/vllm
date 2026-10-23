@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Cloud engine core: serves the edge of the same DP rank over the control
+"""Cloud engine cores: serve the edge of the same DP rank over the control
 plane. Edge messages are handled on an ingest thread (range notifies feed the
 scheduler and the pre-recv hint, request notifies become native ADDs); step
-metadata is flushed to the edge in post_step."""
+metadata is flushed to the edge in post_step.
+
+The LWD seams live in LwdCloudEngineCoreMixin and are orthogonal to the
+engine base: LwdCloudEngineCore (EngineCoreProc) serves one DP rank of a
+cloud instance and non-MoE multi-DP deployments; LwdCloudDPEngineCore
+(DPEngineCoreProc) serves MoE multi-DP deployments, inheriting the native
+DP semantics (wave state machine, dummy batches, START_DP_WAVE, stats
+publishing) unchanged.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +26,7 @@ import torch
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine.core import EngineShutdownState
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
@@ -51,11 +59,8 @@ _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
 
-class LwdCloudEngineCore(LwdBaseEngineCore):
-    """Cloud PO engine: control plane + ingest thread, the rest is native."""
-
-    lwd_scheduler_cls = LwdCloudScheduler
-    scheduler: LwdCloudScheduler
+class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
+    """The LWD seams of a cloud engine, shared by both engine bases."""
 
     def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
         # Pre-recv hint MQ must exist before super().__init__ spawns the
@@ -378,3 +383,16 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 self._lwd_send_until_queued(self._lwd_edge, notify)
             self.scheduler.pending_c2e.clear()
         super().post_step(model_executed)
+
+
+class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
+    """Cloud PO engine of one DP rank (dp=1 and non-MoE multi-DP): the
+    engine processes of a multi-DP non-MoE cloud are independent, so the
+    native EngineCoreProc base is the whole story."""
+
+
+class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
+    """Cloud PO engine of a MoE multi-DP cloud: the native DP engine base
+    carries the wave state machine, dummy batches, START_DP_WAVE handling
+    and stats publishing, so the MoE engines stay in lockstep exactly as a
+    centralized DP deployment; the LWD seams come from the mixin."""

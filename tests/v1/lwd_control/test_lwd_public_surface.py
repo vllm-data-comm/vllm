@@ -221,8 +221,9 @@ def test_review_deleted_code_stays_deleted():
 
 def test_edge_add_request_communication_in_engine():
     """请求入口分工(评审:通信最好在 engine 里进行):引擎 add_request
-    编排 准入(lwd_admit_request)-> 云预告(_lwd_notify_request)->
-    原生 super().add_request(abort_immediately 走原生 abort_requests)。"""
+    编排 准入+路由(lwd_admit_request 返回 dp_idx)-> 按路由云预告
+    (_lwd_notify_request(dp_idx, ...))-> 原生 super().add_request
+    (abort_immediately 走原生 abort_requests)。"""
     edge_engine = (
         VLLM_DIR
         / "v1"
@@ -231,8 +232,8 @@ def test_edge_add_request_communication_in_engine():
         / "lwd_edge_engine.py"
     ).read_text()
     assert "def add_request" in edge_engine
-    assert "self.scheduler.lwd_admit_request(request)" in edge_engine
-    assert "self._lwd_notify_request(request)" in edge_engine
+    assert "dp_idx = self.scheduler.lwd_admit_request(request)" in edge_engine
+    assert "self._lwd_notify_request(dp_idx, request)" in edge_engine
     assert "super().add_request(request)" in edge_engine
     edge_sched = (
         VLLM_DIR
