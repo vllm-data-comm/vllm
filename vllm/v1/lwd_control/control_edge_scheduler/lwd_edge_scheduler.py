@@ -17,12 +17,9 @@ the engine's native batch-queue path. See lwd_chunked_prefill_design.md
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
-
-import torch
 
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import (
@@ -44,6 +41,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
+    lwd_draft_slots,
     lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -54,6 +52,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRangeNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
+    LwdModelFamily,
+    lwd_select_model_family,
+)
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -111,17 +113,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # local config directly, the sole home of the formula is
         # lwd_base_scheduler.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
-        # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
-        # tensor, computed once at admission, sliced per chunk and sent to
-        # the worker with LwdEmbedBatch); removed on embedding
-        # completion/abort. Key present = has_mrope is always true for every
-        # chunk of that request.
-        self._lwd_mrope_positions_dict: dict[str, torch.Tensor] = {}
-        # Lazily resolved model-class static method
-        # _get_mrope_input_positions (cache the method itself rather than
-        # the model class so the semantics stay direct; validated on first
-        # use, unsupported families fail fast).
-        self._lwd_mrope_positions_fn = None
+        # Parallel-drafting slots the cloud charges per scheduled request
+        # (lwd_base_scheduler.lwd_draft_slots); adopted from the cloud like
+        # the spec factor
+        self._lwd_draft_slots: int = lwd_draft_slots(self.vllm_config)
+        # Per-model-family request metadata: computed at admission from the
+        # real prompt (M-RoPE positions are sliced per chunk into the range
+        # notify; whole-request values ride the request notify), reclaimed
+        # by the harvest reconciliation once the prompt is fully sent.
+        self.lwd_model_family: LwdModelFamily = lwd_select_model_family(
+            self.vllm_config
+        )
         # Chunk unit C = min(remaining, C): taken from the local
         # long_prefill_token_threshold (native truncation boundary,
         # naturally reproduced on both sides); when unset (<=0), falls back
@@ -133,20 +135,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         self._lwd_check_deadlock_config()
 
+    @property
+    def _lwd_inflight_reservation(self) -> int:
+        """Budget reserved per in-flight request: its decode occupancy
+        (1+k) plus the cloud's per-request drafting slots."""
+        return self._lwd_spec_factor + self._lwd_draft_slots
+
     def _lwd_check_deadlock_config(self) -> None:
         """Liveness fail-fast: if the cap stays < 1 even at worst-case
         inflight (full occupancy), it is a deadlock configuration
-        (design §2.6); reject at startup."""
+        (design §2.6); reject at startup, and again once the cloud's spec
+        parameters are adopted."""
         if (
             self.max_num_scheduled_tokens
-            - self.max_num_running_reqs * self._lwd_spec_factor
+            - self.max_num_running_reqs * self._lwd_inflight_reservation
             < 1
         ):
             raise RuntimeError(
                 f"[LWD] deadlock config: max_num_batched_tokens("
                 f"{self.max_num_scheduled_tokens}) - max_num_seqs("
-                f"{self.max_num_running_reqs}) * spec_factor("
-                f"{self._lwd_spec_factor}) < 1, resume chunks would never "
+                f"{self.max_num_running_reqs}) * (spec_factor("
+                f"{self._lwd_spec_factor}) + draft_slots("
+                f"{self._lwd_draft_slots})) < 1, resume chunks would never "
                 "have a schedulable budget; please increase "
                 "max_num_batched_tokens or decrease max_num_seqs"
             )
@@ -260,11 +270,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # EMBED batches have no local accounting (progress was already
         # advanced optimistically during scheduling; on embedding completion
         # they naturally transition to decode phase); the harvest phase
-        # uniformly reconciles and cleans up mrope positions (under resident
-        # models requests only leave `requests` upon termination, so the
-        # explicit per-point removal is replaced by reconciliation-style
-        # reclaim)
-        self._lwd_purge_mrope_positions()
+        # uniformly reconciles and cleans up admission metadata (under
+        # resident models requests only leave `requests` upon termination,
+        # so the explicit per-point removal is replaced by
+        # reconciliation-style reclaim)
+        self._lwd_purge_admission_metadata()
         if not outputs:
             return {}
         return {
@@ -386,11 +396,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_pick_prefill_batch(
         self,
-    ) -> tuple[list[str], dict[str, int], int]:
+    ) -> tuple[list[str], dict[str, int]]:
         """Picker adapter layer: assemble candidates, compute cap/free_seq,
         and model-family conversion-specific parameters."""
         inflight = len(self.running)
-        cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
+        cap = self.max_num_scheduled_tokens - inflight * self._lwd_inflight_reservation
         free_seq = self.max_num_running_reqs - inflight
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
@@ -418,16 +428,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 == "deepseek_v4"
                 else 0
             ),
+            slot_overhead=self._lwd_draft_slots,
         )
-        return req_ids, expected, cap
+        return req_ids, expected
 
     def _lwd_schedule_batch(self) -> SchedulerOutput:
         """Chunk batch assembly: the picker selects the batch, scheduled via
-        the base-class visible-set mechanism (budget clamped to cap; the
-        chunk split is guaranteed by the clamping parameters to be
-        reproduced natively)."""
-        req_ids, _expected, cap = self._lwd_pick_prefill_batch()
-        return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        the base-class visible-set mechanism (budget clamped to the picked
+        chunk total -- the picker's cap also covers the cloud's drafting
+        slots, which the edge's native budget does not charge -- so the
+        chunk split is reproduced natively)."""
+        req_ids, expected = self._lwd_pick_prefill_batch()
+        return self._lwd_schedule(req_ids, token_budget_cap=sum(expected.values()))
 
     def _try_schedule_encoder_inputs(
         self,
@@ -456,65 +468,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def lwd_admit_request(self, request: Request) -> None:
         """Scheduler-local half of request admission: mode boundary
-        validation + mrope precomputation. The cloud announcement
+        validation + model-family precomputation. The cloud announcement
         (communication) and enqueueing belong to the engine's add_request;
         abort_immediately goes through the native engine path (the ledger
         is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
-        self._lwd_compute_mrope_positions(request)
-
-    @staticmethod
-    def _lwd_request_has_mm(request: Request) -> bool:
-        """Whether the request carries real multimodal data (prompt_embeds
-        passthrough does not count -- it has no grid metadata, mrope is
-        handled as text positions, consistent with the native
-        definition)."""
-        return any(
-            feature.modality != "prompt_embeds" for feature in request.mm_features
-        )
-
-    def _lwd_compute_mrope_positions(self, request: Request) -> None:
-        """At multimodal admission, compute the whole-prompt [3,N] mrope
-        (only the edge holds the real prompt/grid); reject model families
-        lacking _get_mrope_input_positions."""
-        if not self.vllm_config.model_config.uses_mrope:
-            return
-        if not self._lwd_request_has_mm(request):
-            return
-        if self._lwd_mrope_positions_fn is None:
-            from vllm.model_executor.models import ModelRegistry
-
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                self.vllm_config.model_config.architectures,
-                self.vllm_config.model_config,
-            )
-            fn = getattr(model_cls, "_get_mrope_input_positions", None)
-            if fn is None:
-                raise ValueError(
-                    f"[LWD] multimodal requests in prefill-only mode "
-                    f"require a model class exposing "
-                    f"_get_mrope_input_positions (Qwen3VL family, incl. "
-                    f"Qwen3.5); got {model_cls.__name__} "
-                    f"(request {request.request_id})"
-                )
-            self._lwd_mrope_positions_fn = fn
-        mrope_features = [
-            f for f in request.mm_features if f.modality != "prompt_embeds"
-        ]
-        _t_mrope = time.monotonic()
-        positions, _delta = self._lwd_mrope_positions_fn(
-            input_tokens=list(request.prompt_token_ids),
-            mm_features=mrope_features,
-            config=self.vllm_config.model_config.hf_config,
-        )
-        assert positions.shape[1] == request.num_prompt_tokens, (
-            f"[LWD] mrope positions width {positions.shape[1]} != prompt "
-            f"len {request.num_prompt_tokens} (request {request.request_id})"
-        )
-        self._lwd_mrope_positions_dict[request.request_id] = positions
-        # [Lwd][perf] per-request latency of whole-prompt mrope computation
-        # (runs on the edge engine main thread; the scheduling loop stalls
-        # meanwhile; used for MM degradation attribution)
+        self.lwd_model_family.admit(request)
 
     def lwd_edge_notify_range(self, scheduler_output: SchedulerOutput) -> None:
         """Send one batch RangeNotify and attach the EMBED batch; a seqno is
@@ -575,17 +534,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # optimistically; the start offset must step back by this
             # step's amount
             offset = request.num_computed_tokens - num_tokens
-            positions = self._lwd_mrope_positions_dict.get(request_id)
-            req_has_mrope = positions is not None
-            mrope_bytes = b""
-            if req_has_mrope:
-                assert positions is not None
-                mrope_bytes = (
-                    positions[:, offset : offset + num_tokens]
-                    .contiguous()
-                    .numpy()
-                    .tobytes()
-                )
+            mrope_bytes = self.lwd_model_family.chunk_mrope_positions(
+                request_id, offset, num_tokens
+            )
+            req_has_mrope = mrope_bytes is not None
+            if mrope_bytes is None:
+                mrope_bytes = b""
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
@@ -644,17 +598,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if not batch:
                 del self._lwd_pending_batches[seqno]
 
-    def _lwd_purge_mrope_positions(self) -> None:
-        """Reconcile and remove mrope positions: the request has left
-        requests (terminated/aborted) or finished embedding and
+    def _lwd_purge_admission_metadata(self) -> None:
+        """Reconcile and remove model-family admission metadata: the request
+        has left requests (terminated/aborted) or finished embedding and
         transitioned to decode phase (all chunks already sent, notify no
         longer reads it). Resident models have no natural removal point of
         "leave the queue on embedding completion", so the harvest phase
         reconciles uniformly."""
-        for rid in list(self._lwd_mrope_positions_dict):
+        for rid in self.lwd_model_family.held_request_ids():
             request = self.requests.get(rid)
             if request is None or self._lwd_req_phase(request) is LwdReqPhase.DECODE:
-                self._lwd_mrope_positions_dict.pop(rid, None)
+                self.lwd_model_family.release(rid)
 
     def _lwd_validate_request(self, request: Request) -> None:
         """Mode boundary validation (edge capability surface): reject

@@ -11,11 +11,19 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vllm.config.engram import model_has_engram_layers
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.lwd import LwdTopology
 
+logger = init_logger(__name__)
+
 LwdRankGroup = tuple[int, ...]
+
+_LWD_ENGRAM_ARCHITECTURES = ("DeepseekV41ForCausalLM",)
+"""Architectures whose Engram the edge hashes and the cloud looks up."""
 
 
 @dataclass(frozen=True)
@@ -128,13 +136,15 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     before any worker joins the world.
 
     Raises:
-        NotImplementedError: A parallel feature or the topology is unsupported.
+        NotImplementedError: A parallel feature, the topology or the Engram
+            placement is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance.
+            of the local instance, or the edge model kept n-gram layers.
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
     parallel_config = vllm_config.parallel_config
+    engram_config = vllm_config.engram_config
     unsupported = [
         name
         for name, enabled in (
@@ -148,7 +158,14 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
                 parallel_config.decode_context_parallel_size > 1,
             ),
             ("elastic EP", parallel_config.enable_elastic_ep),
-            ("Engram", vllm_config.engram_config is not None),
+            (
+                "Engram dp_shared_memory",
+                engram_config is not None and engram_config.dp_shared_memory,
+            ),
+            (
+                "Engram embedding_across_dp",
+                engram_config is not None and engram_config.embedding_across_dp,
+            ),
         )
         if enabled
     ]
@@ -156,6 +173,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             f"[LWD] not supported in edge-cloud mode: {', '.join(unsupported)}"
         )
+    _lwd_check_engram_layers(vllm_config)
     # Raises for topologies the shared HCCL world cannot host.
     LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     # The topology gives every DP of an instance the same rank count.
@@ -166,3 +184,35 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
             f"!= {len(dp_ranks)} ranks per DP of {lwd_config.role} instance "
             f"{lwd_config.instance_id}"
         )
+
+
+def _lwd_check_engram_layers(vllm_config: VllmConfig) -> None:
+    """Engram tables live on the cloud, for the architectures LWD hashes.
+
+    Reads the model, not `engram_config`: a platform may resolve the Engram
+    config after this check (Ascend does, in `check_and_update_config`).
+
+    Raises:
+        ValueError: The edge model kept its n-gram layers through the edge
+            projection.
+        NotImplementedError: The cloud model has n-gram layers of an
+            architecture LWD does not hash.
+    """
+    model_config = vllm_config.model_config
+    if model_config is None or not model_has_engram_layers(model_config):
+        return
+    lwd_config = vllm_config.lwd_config
+    assert lwd_config is not None
+    architecture = model_config.architecture
+    if lwd_config.role == "edge":
+        raise ValueError(
+            f"[LWD] the edge {architecture} model keeps its n-gram embedding "
+            "layers; the edge projection clears them unless hf_overrides is a "
+            "dict that updates a sub-config: pass flat keys or a callable"
+        )
+    if architecture not in _LWD_ENGRAM_ARCHITECTURES:
+        raise NotImplementedError(
+            f"[LWD] Engram of {architecture} is not supported in edge-cloud "
+            f"mode; supported: {_LWD_ENGRAM_ARCHITECTURES}"
+        )
+    logger.info("[LWD] cloud hosts the Engram tables of %s", architecture)

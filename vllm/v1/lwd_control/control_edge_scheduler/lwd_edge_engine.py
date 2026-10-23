@@ -127,53 +127,58 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         """(max_num_batched_tokens, max_num_seqs) must match the cloud: both
         feed the cap/preflight formulas, and a mismatch makes the cloud hold
         prefills behind decodes forever without any error. The speculative
-        factor is adopted from the cloud and liveness re-checked with it."""
+        factor and drafting slots are adopted from the cloud and liveness
+        re-checked with them."""
         params = self._lwd_cloud_params
         assert params is not None
         sched = self.vllm_config.scheduler_config
-        spec_config = getattr(self.vllm_config, "speculative_config", None)
-        local = (
-            sched.max_num_batched_tokens,
-            sched.max_num_seqs,
-            getattr(spec_config, "num_speculative_tokens", None) or 0,
-        )
-        remote = (
-            params.max_num_batched_tokens,
-            params.max_num_seqs,
-            params.num_speculative_tokens,
-        )
-        if local[:2] != remote[:2]:
+        local = (sched.max_num_batched_tokens, sched.max_num_seqs)
+        remote = (params.max_num_batched_tokens, params.max_num_seqs)
+        if local != remote:
             raise RuntimeError(
                 f"[LWD] edge/cloud scheduling config mismatch: "
-                f"(max_num_batched_tokens, max_num_seqs) edge={local[:2]} != "
-                f"cloud={remote[:2]}; a mismatch makes the cloud hold prefills "
+                f"(max_num_batched_tokens, max_num_seqs) edge={local} != "
+                f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 f"behind decodes forever, so start both sides with the same values"
             )
-        if local[2] != remote[2]:
-            # The factor reserves draft budget of cloud decode steps; the edge
-            # has no legitimate local source (a spec config on the edge would
-            # start the draft machinery), so it adopts the cloud's.
-            spec_factor = remote[2] + 1
-            lwd_logger.warning(
-                "[cloud-params] adopt cloud spec_factor=%d over edge local %d",
-                spec_factor,
-                local[2] + 1,
-            )
-            self.scheduler._lwd_spec_factor = spec_factor
-            # The scheduler checked liveness with the local factor.
-            if (
-                self.scheduler.max_num_scheduled_tokens
-                - self.scheduler.max_num_running_reqs * spec_factor
-                < 1
-            ):
-                raise RuntimeError(
-                    f"[LWD] deadlock config: with the cloud spec_factor="
-                    f"{spec_factor} the cap is always < 1 (budget "
-                    f"{self.scheduler.max_num_scheduled_tokens} - max_num_seqs "
-                    f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
-                    f"increase max_num_batched_tokens or decrease max_num_seqs"
-                )
+        self._lwd_adopt_cloud_spec(params)
         lwd_logger.info("[cloud-params] scheduling limits verified: %s", local)
+        self._lwd_check_engram_fingerprint(params.engram_fingerprint)
+
+    def _lwd_adopt_cloud_spec(self, params: LwdCloudParamsNotify) -> None:
+        """Adopt the cloud's spec budget terms: they reserve draft budget of
+        cloud steps, and the edge has no legitimate local source (a spec
+        config on the edge would start the draft machinery)."""
+        scheduler = self.scheduler
+        local = (scheduler._lwd_spec_factor, scheduler._lwd_draft_slots)
+        remote = (params.num_speculative_tokens + 1, params.num_draft_slots)
+        if local == remote:
+            return
+        lwd_logger.warning(
+            "[cloud-params] adopt cloud (spec_factor, draft_slots)=%s over "
+            "edge local %s",
+            remote,
+            local,
+        )
+        scheduler._lwd_spec_factor, scheduler._lwd_draft_slots = remote
+        # The scheduler checked liveness with the local terms.
+        scheduler._lwd_check_deadlock_config()
+
+    def _lwd_check_engram_fingerprint(self, remote: str) -> None:
+        """The edge's Engram bucket indices must address the cloud's tables:
+        both sides derive the hash parameters from their own tokenizer and
+        config, and a mismatch would hash every prompt into wrong rows
+        without any error."""
+        local = self.scheduler.lwd_model_family.engram_fingerprint()
+        if local != remote:
+            raise RuntimeError(
+                f"[LWD] edge/cloud Engram hash parameters mismatch: edge "
+                f"fingerprint {local or '<no Engram>'} != cloud "
+                f"{remote or '<no Engram>'}; serve the same checkpoint and "
+                f"tokenizer on both sides"
+            )
+        if local:
+            lwd_logger.info("[LWD] Engram hash fingerprint verified: %s", local)
 
     def _lwd_send_to_cloud(self, message: LwdEdgeToCloudMessage) -> None:
         """Send to the cloud, retrying a full outbound queue; raises once the
@@ -192,7 +197,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     # Engine interface overrides                                         #
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
-        """Edge admission (validation + mrope, scheduler-local ledger)
+        """Edge admission (validation + model-family metadata, scheduler-local
+        ledger)
         -> cloud request notify (communication stays in the engine)
         -> native engine entry (native validation + enqueue +
         abort_immediately handled natively)."""
@@ -215,7 +221,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     def _lwd_notify_request(self, request: Request) -> None:
         """Announce the request to the cloud, packing the sampling fields from
-        the shared table."""
+        the shared table and the model family's whole-request metadata."""
         sampling_params = request.sampling_params
         assert sampling_params is not None, "admission rejects pooling requests"
         values: dict[str, Any] = {
@@ -224,12 +230,16 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if values["max_tokens"] is None:
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
+        metadata = self.scheduler.lwd_model_family.request_metadata(request)
         self._lwd_send_to_cloud(
             LwdRequestNotify(
                 request_id=request.request_id,
                 num_prompt_tokens=request.num_prompt_tokens,
                 block_hashes=list(request.block_hashes),
                 eos_token_id=sampling_params.eos_token_id,
+                engram_tail_compressed_ids=metadata.engram_tail_compressed_ids,
+                engram_tail_dead=metadata.engram_tail_dead,
+                image_placeholder_spans=metadata.image_placeholder_spans,
                 **values,
             )
         )
