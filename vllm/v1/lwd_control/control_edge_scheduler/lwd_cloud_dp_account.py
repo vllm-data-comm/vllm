@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Per-cloud-DP account of the edge scheduler.
+
+One account holds everything the edge knows about one cloud DP rank: its
+seqno stream (the UP pairing contract is per channel, so every engine has
+its own), its pending prefill batches, its request load and its gate
+state. The scheduler keeps one account per DP connection plus one routing
+table (request id -> dp_idx) that is pinned at admission and never
+changes: a request's KV and scheduler state live only in its target
+engine, so every chunk, abort and result travels through the account of
+the engine the request was routed to.
+
+Load counts are maintained incrementally on the same transitions that
+change the routing table, instead of rescanning every request on every
+gate check.
+"""
+
+from __future__ import annotations
+
+# Pending cap, counted in unconsumed chunks (seqno): one seqno = one
+# cloud-step consumption unit. When the number of unconsumed chunks of one
+# engine reaches the cap, new prefill admission to that engine stops --
+# its requests accumulate in the edge waiting queue and the gate reopens
+# once that engine drains. One engine's full gate never holds the others.
+LWD_MAX_PENDING_CHUNKS = 3
+
+
+class LwdCloudDpAccount:
+    """The edge-side bookkeeping of one cloud DP rank."""
+
+    def __init__(self, dp_idx: int) -> None:
+        self.dp_idx = dp_idx
+        self.seqno = 0
+        """Next UP pairing number of this engine; taken only by a range
+        notify that was sent."""
+        self.pending_batches: dict[int, set[str]] = {}
+        """seqno -> in-batch request ids whose result has not arrived. A
+        batch entry leaves once every request received its first token."""
+        self.prefill_load = 0
+        """Requests routed here that still prefill (waiting, skipped or
+        running)."""
+        self.decode_load = 0
+        """Requests routed here that finished embedding and await cloud
+        results."""
+        self.gate_held = False
+        """Gate state of the last transition, for HOLD/OPEN logging only."""
+
+    # ------------------------------------------------------------------ load
+
+    @property
+    def load(self) -> int:
+        return self.prefill_load + self.decode_load
+
+    def score(self) -> int:
+        """Routing score, lowest wins: prefill weighs 4, decode 1, the same
+        weights as the native DP load balancer."""
+        return 4 * self.prefill_load + self.decode_load
+
+    def note_prefill_admitted(self) -> None:
+        self.prefill_load += 1
+
+    def note_prefill_done(self) -> None:
+        """A request finished embedding and moved to awaiting."""
+        self.prefill_load -= 1
+        self.decode_load += 1
+
+    def note_request_settled(self, was_awaiting: bool) -> None:
+        """A request left the account (finished, aborted or dropped)."""
+        if was_awaiting:
+            self.decode_load -= 1
+        else:
+            self.prefill_load -= 1
+
+    # ----------------------------------------------------------------- batch
+
+    def take_seqno(self) -> int:
+        """Consume the next pairing number for a range notify."""
+        seqno = self.seqno
+        self.seqno = seqno + 1
+        return seqno
+
+    def register_batch(self, seqno: int, request_ids: set[str]) -> None:
+        self.pending_batches[seqno] = set(request_ids)
+
+    def pending_chunks(self) -> int:
+        return len(self.pending_batches)
+
+    def note_first_token(self, request_id: str) -> None:
+        """First token of a request arrived; drop it from its batch entry
+        and remove entries that fully drained."""
+        for seqno in list(self.pending_batches):
+            batch = self.pending_batches[seqno]
+            batch.discard(request_id)
+            if not batch:
+                del self.pending_batches[seqno]
+
+    def drop_request(self, request_id: str) -> None:
+        """Remove a request from every batch entry (abort or finish);
+        idempotent for requests in no batch."""
+        self.note_first_token(request_id)
+
+    # ------------------------------------------------------------------ gate
+
+    def is_gated(
+        self, max_num_running_reqs: int, has_resume_inflight: bool
+    ) -> bool:
+        """Whether new prefill admission to this engine must wait.
+
+        A resume in flight is exempt (finish in-flight chunks before new
+        ones; also prevents a max_num_seqs=1 config from deadlocking on
+        itself). Otherwise the engine is gated when its request slots are
+        full or its pending chunks reached the cap.
+        """
+        if has_resume_inflight:
+            return False
+        if self.load >= max_num_running_reqs:
+            return True
+        return self.pending_chunks() >= LWD_MAX_PENDING_CHUNKS
