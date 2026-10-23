@@ -19,6 +19,7 @@ errors.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -36,6 +37,7 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefill_notify_queue import
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
+    lwd_draft_slots,
     lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -43,8 +45,17 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdC2eNotify,
     LwdRangeItem,
     LwdRangeNotify,
+    LwdRequestNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
+    LwdRequestMetadata,
+    LwdRequestMetadataLayout,
+    lwd_request_metadata_columns,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
 
 LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
 """``ModelRunnerOutput.lwd_down_carrier`` attached by the cloud worker:
@@ -91,11 +102,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # (draft tokens take budget and KV); the sole home of the formula is
         # lwd_base_scheduler.lwd_spec_factor
         self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
+        self._lwd_draft_slots: int = lwd_draft_slots(self.vllm_config)
         lwd_logger.info(
             "[cloud-sched] chunked-prefill batches mixed "
             "with decode (one notify consumed per step at most, "
-            "spec_factor=%d)",
+            "spec_factor=%d, draft_slots=%d, lookahead=%d)",
             self._lwd_spec_factor,
+            self._lwd_draft_slots,
+            self.num_lookahead_tokens,
         )
         # Diagnostics hub: the spec acceptance-rate accumulators / periodic
         # direct output and bypass payload extraction all live in
@@ -105,6 +119,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # I/O); the engine post_step flushes them to the edge in one shot --
         # the edge side pre-posts DOWN recvs accordingly
         self.pending_c2e: list[LwdC2eNotify] = []
+        self._lwd_request_metadata_layout = LwdRequestMetadataLayout.from_model_config(
+            self.vllm_config.model_config
+        )
+        # Whole-request model-family metadata of the request notify, until
+        # the request's first chunk carries it to the runner. Written by the
+        # ingest thread before it posts the request's ADD, read and removed
+        # by the scheduling thread afterwards (single-key dict operations).
+        self._lwd_request_metadata: dict[str, LwdRequestMetadata] = {}
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """After native accounting (including spec observation), unpack the
@@ -351,9 +373,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return ready
 
     def _lwd_preflight_ok(self, items: list[LwdRangeItem], num_decode: int) -> bool:
-        """Admission triple check: token budget / slots (counting new
-        additions only) / conservative KV estimate; decode occupancy is
-        counted as 1+k."""
+        """Admission triple check: token and input budgets / slots (counting
+        new additions only) / conservative KV estimate; decode occupancy is
+        counted as 1+k. The native scheduler also charges every scheduled
+        request its parallel-drafting slots against the input budget and
+        reserves lookahead KV slots for it; both are counted here, or the
+        native step would cut the edge's chunks short."""
         need_tokens = (
             sum(item.num_tokens for item in items) + num_decode * self._lwd_spec_factor
         )
@@ -362,6 +387,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 "[cloud-sched] preflight hold: tokens %d > budget %d",
                 need_tokens,
                 self.max_num_scheduled_tokens,
+            )
+            return False
+        need_inputs = need_tokens + (num_decode + len(items)) * self._lwd_draft_slots
+        input_budget = self.scheduler_config.max_num_batched_tokens
+        if need_inputs > input_budget:
+            lwd_logger.info(
+                "[cloud-sched] preflight hold: input slots %d > budget %d",
+                need_inputs,
+                input_budget,
             )
             return False
         # Slots count only new admissions: requests resuming a chunk are
@@ -379,9 +413,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self.max_num_running_reqs,
             )
             return False
+        lookahead = self.num_lookahead_tokens
         need_blocks = sum(
-            cdiv(item.num_tokens, self.block_size) for item in items
-        ) + num_decode * cdiv(self._lwd_spec_factor, self.block_size)
+            cdiv(item.num_tokens + lookahead, self.block_size) for item in items
+        ) + num_decode * cdiv(self._lwd_spec_factor + lookahead, self.block_size)
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
             lwd_logger.info(
@@ -506,9 +541,32 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         return decode_exact
 
-    @staticmethod
+    def lwd_register_request_metadata(self, notify: LwdRequestNotify) -> None:
+        """Ingest thread, before the request's ADD: check the notify's
+        model-family metadata against this cloud's model and keep it for the
+        request's first chunk.
+
+        Raises:
+            ValueError: The metadata does not fit the cloud model.
+        """
+        self._lwd_request_metadata_layout.validate(notify)
+        metadata = LwdRequestMetadata.from_notify(notify)
+        if not metadata.is_empty():
+            self._lwd_request_metadata[notify.request_id] = metadata
+
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        # A request finished or aborted before its first chunk still holds
+        # its metadata.
+        self._lwd_request_metadata.pop(request.request_id, None)
+        return super()._free_request(request, delay_free_blocks)
+
     def _lwd_attach_embed_batch(
-        out: SchedulerOutput, notify: LwdRangeNotify, items: list[LwdRangeItem]
+        self,
+        out: SchedulerOutput,
+        notify: LwdRangeNotify,
+        items: list[LwdRangeItem],
     ) -> None:
         """Attach the EMBED batch: the UP-chain seqno is dispatched with the
         batch to the cloud worker; the batch pairing number is the seqno
@@ -519,7 +577,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         (HCCL P2P requires matching numel on both ends); mrope positions
         pass through per item: the runner writes them into req_state
         directly via frombuffer for MM requests (empty bytes for text
-        requests, zero path change)."""
+        requests, zero path change). Whole-request metadata rides the
+        request's first chunk only (offset 0), where the runner caches it."""
+        metadata = [
+            self._lwd_request_metadata.pop(item.request_id, None)
+            if item.offset == 0
+            else None
+            for item in items
+        ]
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
@@ -529,5 +594,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 prompt_offsets=[item.offset for item in items],
                 has_mrope=[item.has_mrope for item in items],
                 mrope_positions=[item.mrope_positions for item in items],
+                **lwd_request_metadata_columns(
+                    [m or LwdRequestMetadata() for m in metadata]
+                ),
             ),
         )
