@@ -30,8 +30,9 @@ flowchart LR
 ```
 
 - The cloud listens and the edge connects, in every deployment scene. There is no broker.
-- Every DP rank is its own EngineCore process and owns its own control plane: one ZMQ context, one IO thread, one TCP link. Edge DP rank `i` talks to cloud DP rank `i`.
-- The edge identity `lwd-edge{instance_id}-dp{dp_rank}-{session_id}` is unique per edge process, so a cloud DP rank can tell several edges apart once it serves more than one. The session id also keeps two misconfigured edges with the same instance and rank apart at the ZMQ layer: the later one is rejected in the handshake, and the working one stays connected.
+- Every cloud DP rank is its own EngineCore process and owns its own control plane: one ZMQ context, one IO thread, one TCP link. Cloud DP rank `i` talks to edge link `i`.
+- In a `single_instance` topology one edge process serves every DP connection: its plane holds one DEALER per link (link `i` connects to cloud DP rank `i` and registers as that link's `dp_rank`). One DEALER per link, not one DEALER with several connects: a multi-connect DEALER round-robins sends across the clouds and replies cannot be attributed to a link.
+- The edge identity `lwd-edge{instance_id}-dp{dp_rank}-{session_id}` is unique per edge process and link, so a cloud DP rank can tell several edges apart once it serves more than one. The session id also keeps two misconfigured edges with the same instance and rank apart at the ZMQ layer: the later one is rejected in the handshake, and the working one stays connected.
 
 ## Layers
 
@@ -104,19 +105,20 @@ sender.send(peer, payload)           # False means backpressure
 plane.shutdown()
 ```
 
-- `dp_rank` is `ParallelConfig.data_parallel_index`. `dp_size` must be the global DP size: non-MoE engine processes reset `ParallelConfig.data_parallel_size` to 1 before the engine is built, so the caller must read it before that.
+- `dp_rank` is `ParallelConfig.data_parallel_index` on the cloud; the edge runs one process per instance (dp_rank 0) whose links register as the dp_rank of the cloud DP they serve. `dp_size` must be the global DP size: non-MoE engine processes reset `ParallelConfig.data_parallel_size` to 1 before the engine is built, so the caller must read it before that.
 - `LwdCloudControlPlane` and `LwdEdgeControlPlane` can also be built from explicit `LwdCloudControlPlaneSpec` / `LwdEdgeControlPlaneSpec`, for callers without a topology.
+- `wait_until_ready` returns the peers of every link by dp_rank; a missing cloud fails the whole startup (fail-fast), naming the dp_ranks that did not answer.
 
 ## Configuration mapping
 
 | Role | Endpoint | Source |
 | --- | --- | --- |
 | Cloud | binds `tcp://0.0.0.0:{ctrl_port}` (`[::]` for IPv6) | `ctrl_port` of this instance's DP `dp_rank` |
-| Edge | connects `tcp://{addr}:{ctrl_port}` | the cloud DP of the same index in `LwdConfig.connections` |
+| Edge | connects once per DP connection | every cloud DP of `LwdConfig.connections`, by dp_idx |
 
 - The cloud binds every interface rather than its topology address, which may not be a local interface behind NAT or in a container.
-- `dp_size` must equal the DP count of the instance in the topology, and `dp_rank` must be in range; otherwise `ValueError`.
-- A DP rank with more than one entry in `LwdConfig.connections` raises `NotImplementedError`. `single_instance` and `edge_share` have one DP connection per DP rank; `cloud_share` and `lwd_cluster` need the multi-peer follow-ups.
+- On the cloud, `dp_size` must equal the DP count of the instance in the topology, and `dp_rank` must be in range; otherwise `ValueError`. The edge runs one engine with vLLM data parallel size 1; a larger size is rejected fail-fast.
+- A `single_instance` edge instance has one DP connection per cloud DP rank; several connections to the same cloud DP rank (multi-edge scenes) raise `NotImplementedError`.
 - Listener callbacks run on the IO thread and must not block. The caller decides how to hand payloads to the engine thread.
 - `send()` may only be called on the thread that called `start()`.
 
@@ -153,7 +155,7 @@ flowchart LR
 
 - The edge treats a lost cloud the same way: without a connection its DEALER reports a full link, so payloads wait instead of being dropped.
 - Backpressure only covers the link: it fires when the peer's IO thread or the network stalls. The engines hand inbound messages to unbounded queues (`input_queue`, the edge `unembed_notify_queue`, the cloud `LwdPrefillNotifyQueue`), so a slow engine does not back up the link.
-- One held payload blocks every peer of the plane; with one peer per plane today this only affects that peer.
+- Held payloads are per peer: one full link holds only its own payloads, and the other links of the plane keep flowing.
 
 ## Engine integration
 
@@ -257,6 +259,7 @@ This change delivers the link, the handshake, the business messages, the factory
 | --- | --- |
 | Peer loss detection | Per-session application heartbeats, `on_peer_down`; a lease decides a new session: rejected while the registered one is alive (duplicate), accepted once it expires (restart) |
 | Several edges per cloud DP rank | Session table on the cloud, per-peer outbound queues and failure isolation; enables `cloud_share` |
-| Several clouds per edge DP rank | Several links per edge plane; enables `lwd_cluster` |
 | Tests | API-level tests through the factory once configuration and schedulers settle |
 | Lifecycle | Reconnect after a cloud restart without losing payloads in flight, flushing queued payloads at shutdown, discovery, authentication |
+
+Delivered since the first round: one edge plane serves several cloud DP ranks (one DEALER per link, per-peer held payloads), enabling `single_instance` topologies with several cloud DPs. `lwd_cluster` still needs several links per edge DP rank to different edges' clouds.

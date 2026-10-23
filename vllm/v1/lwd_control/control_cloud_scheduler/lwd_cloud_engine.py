@@ -96,11 +96,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits the edge checks (same inputs of the cap/preflight
-        # formulas on both sides).
+        # formulas on both sides). The coordinator address lets the edge
+        # trigger the first DP wave; its published host may not be routable
+        # from the edge, so it is rewritten to this DP's topology address.
         self._lwd_cloud_params = LwdCloudParamsNotify(
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
+            dp_coordinator_addr=self._lwd_dp_coordinator_addr(),
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -115,6 +118,18 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_ingest_thread.start()
         plane = self._lwd_start_control_plane()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+
+    def _lwd_dp_coordinator_addr(self) -> str:
+        """Routable coordinator stats endpoint, or empty without one."""
+        address = getattr(self, "frontend_stats_publish_address", None)
+        if not self.has_coordinator or not address:
+            return ""
+        if not str(address).startswith("tcp://"):
+            return ""
+        _, _, port = str(address).rpartition(":")
+        dp_rank = self.vllm_config.parallel_config.data_parallel_index
+        local = self.lwd_config.instance.dp[dp_rank]
+        return f"tcp://{local.addr}:{port}"
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)

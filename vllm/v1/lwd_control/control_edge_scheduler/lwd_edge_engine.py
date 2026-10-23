@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Edge engine core: the control plane to the same-index cloud DP rank, the
-check of the cloud's scheduling limits and the request entry (edge admission +
-announcement to the cloud; communication stays in the engine).
+"""Edge engine core: the control plane to every cloud DP rank, the check of
+each cloud's scheduling limits and the request entry (edge admission +
+announcement to the routed cloud DP rank; communication stays in the engine).
 
 Stepping is the native step_with_batch_queue, adapted at construction: depth
 2, is_pooling_model=True (no native sample_tokens) and an executor proxy (a
 normally completed batch returning None becomes a placeholder).
 
-Startup blocks until the cloud accepts the handshake and sends its scheduling
-limits, within one handshake timeout; any failure stops the engine. There is
-no self-healing: restart the whole group.
+Startup blocks until every cloud DP rank accepted the handshake and sent its
+scheduling limits, within one handshake timeout; any failure stops the
+engine. There is no self-healing: restart the whole group.
 """
 
 from __future__ import annotations
@@ -57,30 +57,37 @@ _LWD_SEND_RETRY_INTERVAL_S = 0.2
 
 
 class LwdEdgeEngineCore(LwdBaseEngineCore):
-    """Edge PO engine: control plane + cloud limits check + native stepping."""
+    """Edge PO engine: control plane to every cloud DP rank, cloud limits
+    check and native stepping."""
 
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
 
     def _lwd_assemble(self) -> None:
-        self._lwd_cloud_params: LwdCloudParamsNotify | None = None
+        self._lwd_cloud_params: dict[int, LwdCloudParamsNotify] = {}
         self._lwd_cloud_params_received = threading.Event()
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
-        # One handshake_timeout_s covers the accept and the limits: it bounds
-        # the wait for a cloud ready to serve.
+        # One handshake_timeout_s covers every link: accept and limits for
+        # all M cloud DP ranks, bounding the wait for a full cloud.
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
         deadline = time.monotonic() + handshake_timeout_s
-        self._lwd_cloud: LwdPeer = plane.wait_until_ready(handshake_timeout_s)
-        if not self._lwd_cloud_params_received.wait(
-            max(0.0, deadline - time.monotonic())
-        ):
-            raise RuntimeError(
-                f"[LWD] edge engine init failed: cloud {self._lwd_cloud} at "
-                f"{plane.endpoint} accepted the handshake but sent no scheduling "
-                f"limits within {handshake_timeout_s}s"
-            )
-        self._lwd_check_cloud_params()
+        self._lwd_clouds: dict[int, LwdPeer] = plane.wait_until_ready(
+            handshake_timeout_s
+        )
+        expected = len(self._lwd_clouds)
+        while len(self._lwd_cloud_params) < expected:
+            if not self._lwd_cloud_params_received.wait(
+                max(0.0, deadline - time.monotonic())
+            ):
+                raise RuntimeError(
+                    f"[LWD] edge engine init failed: {expected - len(self._lwd_cloud_params)} "
+                    f"of {expected} cloud DP ranks accepted the handshake but "
+                    f"sent no scheduling limits within {handshake_timeout_s}s"
+                )
+            self._lwd_cloud_params_received.clear()
+        for dp_idx, params in self._lwd_cloud_params.items():
+            self._lwd_check_cloud_params(dp_idx, params)
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         # Native batch queue stepping (step/step_with_batch_queue untouched):
         # 1. depth 2, rebuilding the deque so its maxlen matches and
@@ -95,10 +102,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
         lwd_logger.info(
-            "[edge] engine assembled: cloud %s at %s, native batch-queue "
+            "[edge] engine assembled: %d cloud DP ranks, native batch-queue "
             "stepping depth=%d",
-            self._lwd_cloud,
-            plane.endpoint,
+            len(self._lwd_clouds),
             self.batch_queue_size,
         )
 
@@ -106,30 +112,32 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return lwd_decode_cloud_to_edge(payload)
 
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
-        """Cloud limits -> wake the startup wait; c2e -> scheduler notify
-        queue + WAKEUP; anything else is unknown."""
+        """Cloud limits -> record and wake the startup wait; c2e -> scheduler
+        notify queue + WAKEUP; anything else is unknown."""
         if isinstance(msg, LwdCloudParamsNotify):
-            self._lwd_cloud_params = msg
+            self._lwd_cloud_params[peer.dp_rank] = msg
             self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, LwdC2eNotify):
             lwd_logger.info(
-                "[edge] c2e received reqs=%d hidden_numel=%d",
+                "[edge] c2e received from dp%d reqs=%d hidden_numel=%d",
+                peer.dp_rank,
                 len(msg.req_ids),
                 msg.hidden_num_elements,
             )
-            self.scheduler.unembed_notify_queue.append(msg)
+            self.scheduler.unembed_notify_queue.append((peer.dp_rank, msg))
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
         return False
 
-    def _lwd_check_cloud_params(self) -> None:
-        """(max_num_batched_tokens, max_num_seqs) must match the cloud: both
-        feed the cap/preflight formulas, and a mismatch makes the cloud hold
-        prefills behind decodes forever without any error. The speculative
-        factor is adopted from the cloud and liveness re-checked with it."""
-        params = self._lwd_cloud_params
-        assert params is not None
+    def _lwd_check_cloud_params(
+        self, dp_idx: int, params: LwdCloudParamsNotify
+    ) -> None:
+        """(max_num_batched_tokens, max_num_seqs) must match every cloud DP
+        rank: both feed the cap/preflight formulas, and a mismatch makes the
+        cloud hold prefills behind decodes forever without any error. The
+        speculative factor is adopted from the cloud and liveness re-checked
+        with it."""
         sched = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         local = (
@@ -144,10 +152,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
         if local[:2] != remote[:2]:
             raise RuntimeError(
-                f"[LWD] edge/cloud scheduling config mismatch: "
+                f"[LWD] edge/cloud scheduling config mismatch on dp{dp_idx}: "
                 f"(max_num_batched_tokens, max_num_seqs) edge={local[:2]} != "
                 f"cloud={remote[:2]}; a mismatch makes the cloud hold prefills "
-                f"behind decodes forever, so start both sides with the same values"
+                "behind decodes forever, so start both sides with the same values"
             )
         if local[2] != remote[2]:
             # The factor reserves draft budget of cloud decode steps; the edge
@@ -171,38 +179,39 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{spec_factor} the cap is always < 1 (budget "
                     f"{self.scheduler.max_num_scheduled_tokens} - max_num_seqs "
                     f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
-                    f"increase max_num_batched_tokens or decrease max_num_seqs"
+                    "increase max_num_batched_tokens or decrease max_num_seqs"
                 )
-        lwd_logger.info("[cloud-params] scheduling limits verified: %s", local)
+        lwd_logger.info("[cloud-params] dp%d limits verified: %s", dp_idx, local)
 
-    def _lwd_send_to_cloud(self, message: LwdEdgeToCloudMessage) -> None:
-        """Send to the cloud, retrying a full outbound queue; raises once the
-        retries run out instead of losing the message."""
+    def _lwd_send_to_cloud(self, dp_idx: int, message: LwdEdgeToCloudMessage) -> None:
+        """Send to one cloud DP rank, retrying a full outbound queue; raises
+        once the retries run out instead of losing the message."""
+        cloud = self._lwd_clouds[dp_idx]
         for attempt in range(_LWD_SEND_RETRY_STEPS):
-            if self._lwd_send(self._lwd_cloud, message):
+            if self._lwd_send(cloud, message):
                 return
             time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
-            f"[LWD] {type(message).__name__} to cloud {self._lwd_cloud} not "
+            f"[LWD] {type(message).__name__} to cloud dp{dp_idx} {cloud} not "
             f"sent: outbound queue still full after {_LWD_SEND_RETRY_STEPS} "
-            f"retries (cloud stalled or gone?)"
+            "retries (cloud stalled or gone?)"
         )
 
     # ------------------------------------------------------------------ #
     # Engine interface overrides                                         #
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
-        """Edge admission (validation + mrope, scheduler-local ledger)
-        -> cloud request notify (communication stays in the engine)
-        -> native engine entry (native validation + enqueue +
-        abort_immediately handled natively)."""
+        """Edge admission (validation + mrope, scheduler-local ledger and
+        routing) -> cloud request notify of the routed DP rank
+        (communication stays in the engine) -> native engine entry (native
+        validation + enqueue + abort_immediately handled natively)."""
         lwd_logger.info(
             "[edge] request received req=%s tokens=%d (admit + announce)",
             request.request_id,
             request.num_prompt_tokens,
         )
-        self.scheduler.lwd_admit_request(request)
-        self._lwd_notify_request(request)
+        dp_idx = self.scheduler.lwd_admit_request(request)
+        self._lwd_notify_request(dp_idx, request)
         super().add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
@@ -213,9 +222,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler.lwd_edge_abort(request_ids)
         super().abort_requests(request_ids)
 
-    def _lwd_notify_request(self, request: Request) -> None:
-        """Announce the request to the cloud, packing the sampling fields from
-        the shared table."""
+    def _lwd_notify_request(self, dp_idx: int, request: Request) -> None:
+        """Announce the request to one cloud DP rank, packing the sampling
+        fields from the shared table."""
         sampling_params = request.sampling_params
         assert sampling_params is not None, "admission rejects pooling requests"
         values: dict[str, Any] = {
@@ -225,11 +234,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
         self._lwd_send_to_cloud(
+            dp_idx,
             LwdRequestNotify(
                 request_id=request.request_id,
                 num_prompt_tokens=request.num_prompt_tokens,
                 block_hashes=list(request.block_hashes),
                 eos_token_id=sampling_params.eos_token_id,
                 **values,
-            )
+            ),
         )

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Byte-level ZMQ transport of one LWD control link.
+"""Byte-level ZMQ transport of the LWD control links.
 
-The cloud binds a ROUTER, the edge connects a DEALER whose identity carries
-its session id. A transport must be opened, used and closed on a single
-thread (ZMQ sockets are not thread-safe).
+The cloud binds one ROUTER; the edge connects one DEALER per cloud DP rank
+it serves, each identity carrying its session id. A transport must be
+opened, used and closed on a single thread (ZMQ sockets are not
+thread-safe).
 
 Both directions are bounded by `_LWD_LINK_HWM`, so a peer that stops reading
 eventually makes `send()` report a full link instead of buffering without
@@ -45,13 +46,18 @@ class LwdPeerUnreachableError(RuntimeError):
 @dataclass(frozen=True)
 class LwdInboundFrame:
     identity: bytes | None
-    """Routing identity of the sender; None on the DEALER side."""
+    """Routing identity of the sender; None on the cloud side. The edge
+    transport carries the link index instead, so a payload names the link
+    that delivered it."""
     kind: LwdFrameKind
     body: bytes
+    link: int | None = None
+    """Edge only: index of the link the frame arrived on."""
 
 
 class LwdControlTransport(ABC):
-    """One ZMQ socket of a control link: options, framing, non-blocking I/O.
+    """The ZMQ sockets of a control plane: options, framing, non-blocking
+    I/O. One socket for the cloud ROUTER, one DEALER per link for the edge.
 
     Subclasses provide the socket type, role options, attach and framing.
     """
@@ -63,8 +69,8 @@ class LwdControlTransport(ABC):
         self._socket: zmq.Socket | None = None
 
     def open(self, ctx: zmq.Context) -> None:
-        """Create, configure and attach the socket. Cleans up on failure."""
-        sock = ctx.socket(self._SOCKET_TYPE)
+        """Create, configure and attach the sockets. Cleans up on failure."""
+        sock = self._create_socket(ctx)
         try:
             # Options only apply to connections made after they are set, so
             # `make_zmq_socket`, which attaches immediately, cannot be used.
@@ -85,39 +91,54 @@ class LwdControlTransport(ABC):
             raise
         self._socket = sock
 
+    def _create_socket(self, ctx: zmq.Context) -> zmq.Socket:
+        return ctx.socket(self._SOCKET_TYPE)
+
     @property
     def socket(self) -> zmq.Socket:
         if self._socket is None:
             raise RuntimeError("control link transport is not open")
         return self._socket
 
+    @property
+    def sockets(self) -> list[zmq.Socket]:
+        """Every socket the IO loop polls."""
+        return [self.socket]
+
     def recv_all(self) -> list[LwdInboundFrame]:
-        """Drain every pending message without blocking."""
+        """Drain every pending message of every socket without blocking."""
         frames: list[LwdInboundFrame] = []
-        while True:
-            try:
-                parts = self.socket.recv_multipart(zmq.NOBLOCK)
-            except zmq.Again:
-                return frames
-            frame = self._parse(parts)
-            if frame is None:
-                logger.warning(
-                    "control link %s: dropped malformed message of %d parts",
-                    self.endpoint,
-                    len(parts),
-                )
-                continue
-            frames.append(frame)
+        for link, socket in enumerate(self.sockets):
+            while True:
+                try:
+                    parts = socket.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                frame = self._parse(parts, link)
+                if frame is None:
+                    logger.warning(
+                        "control link %s: dropped malformed message of %d parts",
+                        self.endpoint,
+                        len(parts),
+                    )
+                    continue
+                frames.append(frame)
+        return frames
 
     def send(self, kind: LwdFrameKind, body: bytes, identity: bytes | None) -> bool:
         """Send one message without blocking.
 
+        Args:
+            identity: The ROUTER routing identity on the cloud; the link
+                index, as decimal bytes, on the edge.
+
         Returns:
             False when the link cannot take the message now: the high-water
-            mark is reached, or the edge is not connected yet.
+            mark is reached, or the link is not connected yet.
 
         Raises:
-            LwdPeerUnreachableError: The cloud has no connection to `identity`.
+            LwdPeerUnreachableError: The cloud has no connection to
+                `identity`.
         """
         try:
             self._send(kind.value, body, identity)
@@ -143,7 +164,7 @@ class LwdControlTransport(ABC):
     def _attach(self, sock: zmq.Socket) -> None: ...
 
     @abstractmethod
-    def _parse(self, parts: list[bytes]) -> LwdInboundFrame | None: ...
+    def _parse(self, parts: list[bytes], link: int) -> LwdInboundFrame | None: ...
 
     @abstractmethod
     def _send(self, kind: bytes, body: bytes, identity: bytes | None) -> None: ...
@@ -172,7 +193,7 @@ class LwdCloudTransport(LwdControlTransport):
     def _attach(self, sock: zmq.Socket) -> None:
         sock.bind(self.endpoint)
 
-    def _parse(self, parts: list[bytes]) -> LwdInboundFrame | None:
+    def _parse(self, parts: list[bytes], link: int) -> LwdInboundFrame | None:
         if len(parts) != 3:
             return None
         kind = _lwd_frame_kind(parts[1])
@@ -187,30 +208,89 @@ class LwdCloudTransport(LwdControlTransport):
 
 
 class LwdEdgeTransport(LwdControlTransport):
-    """DEALER connected by the edge; messages are [kind, body]."""
+    """DEALERs connected by the edge, one per cloud DP rank; messages are
+    [kind, body].
+
+    One socket per link: a DEALER with several connects would round-robin
+    sends across the clouds and replies could not be attributed to a link.
+    Link i connects to cloud DP rank i and carries the identity of that
+    link's handshake; a full or unestablished link reports EAGAIN for its
+    own sends only.
+    """
 
     _SOCKET_TYPE = zmq.DEALER
 
-    def __init__(self, endpoint: str, identity: bytes) -> None:
-        super().__init__(endpoint)
-        self._identity = identity
+    def __init__(
+        self, endpoints: tuple[str, ...], identities: tuple[bytes, ...]
+    ) -> None:
+        super().__init__(endpoints[0])
+        if len(endpoints) != len(identities):
+            raise ValueError(
+                f"[LWD] one identity per link, got {len(endpoints)} endpoints "
+                f"and {len(identities)} identities"
+            )
+        self._endpoints = endpoints
+        self._identities = identities
+        self._links: list[zmq.Socket] = []
+
+    def open(self, ctx: zmq.Context) -> None:
+        for endpoint, identity in zip(self._endpoints, self._identities):
+            link = ctx.socket(self._SOCKET_TYPE)
+            try:
+                link.setsockopt(zmq.LINGER, 0)
+                link.setsockopt(zmq.SNDHWM, _LWD_LINK_HWM)
+                link.setsockopt(zmq.RCVHWM, _LWD_LINK_HWM)
+                link.setsockopt(zmq.TCP_KEEPALIVE, 1)
+                link.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
+                link.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
+                link.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
+                _, host, _ = split_zmq_path(endpoint)
+                if is_valid_ipv6_address(host):
+                    link.setsockopt(zmq.IPV6, 1)
+                link.setsockopt(zmq.IDENTITY, identity)
+                # Never queue frames for a link that is not established:
+                # sends report a full link (EAGAIN) instead of piling up
+                # until the cloud appears.
+                link.setsockopt(zmq.IMMEDIATE, 1)
+                link.connect(endpoint)
+            except Exception:
+                link.close(linger=0)
+                self.close()
+                raise
+            self._links.append(link)
+
+    @property
+    def socket(self) -> zmq.Socket:
+        if not self._links:
+            raise RuntimeError("control link transport is not open")
+        return self._links[0]
+
+    @property
+    def sockets(self) -> list[zmq.Socket]:
+        return list(self._links)
 
     def _configure(self, sock: zmq.Socket) -> None:
-        sock.setsockopt(zmq.IDENTITY, self._identity)
-        # Never queue frames for a link that is not established: sends report
-        # a full link (EAGAIN) instead of piling up until the cloud appears.
-        sock.setsockopt(zmq.IMMEDIATE, 1)
+        return None  # options set per link in open()
 
     def _attach(self, sock: zmq.Socket) -> None:
-        sock.connect(self.endpoint)
+        return None  # links attached in open()
 
-    def _parse(self, parts: list[bytes]) -> LwdInboundFrame | None:
+    def _parse(self, parts: list[bytes], link: int) -> LwdInboundFrame | None:
         if len(parts) != 2:
             return None
         kind = _lwd_frame_kind(parts[0])
         if kind is None:
             return None
-        return LwdInboundFrame(identity=None, kind=kind, body=parts[1])
+        return LwdInboundFrame(identity=None, kind=kind, body=parts[1], link=link)
 
     def _send(self, kind: bytes, body: bytes, identity: bytes | None) -> None:
-        self.socket.send_multipart((kind, body), zmq.NOBLOCK)
+        if identity is None:
+            raise ValueError("DEALER send requires a link index")
+        link = int(identity)
+        self._links[link].send_multipart((kind, body), zmq.NOBLOCK)
+
+    def close(self) -> None:
+        """Idempotent; pending outbound frames are discarded."""
+        for link in self._links:
+            link.close(linger=0)
+        self._links = []

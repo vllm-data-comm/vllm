@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Build the control plane of one DP rank from `VllmConfig.lwd_config`.
 
-Every cloud DP rank binds its topology `ctrl_port` on all interfaces; every
-edge DP rank connects to the cloud DP rank of the same index.
+Every cloud DP rank binds its topology `ctrl_port` on all interfaces. One
+edge process serves every DP connection of its instance: the edge plane of
+DP rank i connects to the cloud DP rank of the same index.
 """
 
 from vllm.config.lwd import LwdConfig
-from vllm.config.lwd.topology import LwdDPConnection
 from vllm.utils.network_utils import is_valid_ipv6_address, make_zmq_path
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdCloudControlPlane,
@@ -36,8 +36,8 @@ def lwd_create_control_plane(
             built, so read it before that.
 
     Raises:
-        ValueError: `dp_size` or `dp_rank` does not match the topology.
-        NotImplementedError: The DP rank has more than one DP connection.
+        ValueError: `dp_size` or `dp_rank` does not match the topology or
+            the role.
     """
     _lwd_validate_dp(lwd_config, dp_rank, dp_size)
     if lwd_config.role == "cloud":
@@ -46,35 +46,32 @@ def lwd_create_control_plane(
 
 
 def _lwd_validate_dp(lwd_config: LwdConfig, dp_rank: int, dp_size: int) -> None:
+    """The edge runs one process per instance; the cloud one engine per DP."""
     topology_dp_size = len(lwd_config.instance.dp)
+    if lwd_config.role == "edge":
+        # One edge process serves every DP connection, so its vLLM DP size
+        # is 1 and its dp_rank is 0.
+        if dp_size != 1 or dp_rank != 0:
+            raise ValueError(
+                f"[LWD] edge instance {lwd_config.instance_id} runs one engine "
+                f"for its {topology_dp_size} DP connections; start it with "
+                f"data parallel size 1, got dp_size={dp_size} dp_rank={dp_rank}"
+            )
+        if topology_dp_size < 1:
+            raise ValueError("[LWD] instance must have at least one DP")
+        return
     if dp_size != topology_dp_size:
         raise ValueError(
             f"[LWD] vLLM data parallel size {dp_size} != topology DP count "
-            f"{topology_dp_size} of {lwd_config.role} instance "
-            f"{lwd_config.instance_id}"
+            f"{topology_dp_size} of cloud instance {lwd_config.instance_id}"
         )
-    # Checked before the topology is indexed by dp_rank; the spec checks it
-    # again only for callers that build a spec by hand.
     if not 0 <= dp_rank < dp_size:
         raise ValueError(f"[LWD] dp_rank {dp_rank} not in [0, {dp_size})")
-
-
-def _lwd_single_connection(lwd_config: LwdConfig, dp_rank: int) -> LwdDPConnection:
-    connections = [c for c in lwd_config.connections if c.dp_idx == dp_rank]
-    if len(connections) != 1:
-        # TODO(lwd): serve several DP connections per DP rank, issue #8.
-        raise NotImplementedError(
-            f"[LWD] {lwd_config.role} instance {lwd_config.instance_id} "
-            f"dp{dp_rank} has {len(connections)} DP connections; the control "
-            f"plane supports one (scene={lwd_config.topology.deployment.scene})"
-        )
-    return connections[0]
 
 
 def _lwd_cloud_spec(
     lwd_config: LwdConfig, dp_rank: int, dp_size: int
 ) -> LwdCloudControlPlaneSpec:
-    _lwd_single_connection(lwd_config, dp_rank)
     local = lwd_config.instance.dp[dp_rank]
     assert local.ctrl_port is not None, "topology requires ctrl_port on clouds"
     bind_host = _LWD_IPV6_ANY if is_valid_ipv6_address(local.addr) else _LWD_IPV4_ANY
@@ -90,12 +87,27 @@ def _lwd_cloud_spec(
 def _lwd_edge_spec(
     lwd_config: LwdConfig, dp_rank: int, dp_size: int
 ) -> LwdEdgeControlPlaneSpec:
-    cloud = _lwd_single_connection(lwd_config, dp_rank).cloud
-    assert cloud.ctrl_port is not None, "topology requires ctrl_port on clouds"
+    """Endpoints of the cloud DP ranks this edge engine connects to.
+
+    One edge process serves every DP connection of its instance: link i
+    connects to the cloud DP rank of DP index i.
+    """
+    connections = sorted(lwd_config.connections, key=lambda c: c.dp_idx)
+    if [c.dp_idx for c in connections] != list(range(len(connections))):
+        raise NotImplementedError(
+            f"[LWD] edge instance {lwd_config.instance_id} needs one "
+            f"connection per DP index; got dp indices "
+            f"{[c.dp_idx for c in connections]} (scene="
+            f"{lwd_config.topology.deployment.scene})"
+        )
     return LwdEdgeControlPlaneSpec(
         instance_id=lwd_config.instance_id,
         dp_rank=dp_rank,
         dp_size=dp_size,
-        cloud_endpoint=make_zmq_path("tcp", cloud.addr, cloud.ctrl_port),
+        cloud_endpoints=tuple(
+            make_zmq_path("tcp", c.cloud.addr, c.cloud.ctrl_port)
+            for c in connections
+            if c.cloud.ctrl_port is not None
+        ),
         config=lwd_config.topology.control_plane,
     )

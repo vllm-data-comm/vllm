@@ -111,6 +111,10 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     max_num_batched_tokens: int
     max_num_seqs: int
     num_speculative_tokens: int
+    dp_coordinator_addr: str = ""
+    """Frontend stats endpoint of this DP rank's coordinator, for the edge to
+    trigger the first DP wave; empty when the cloud runs no coordinator
+    (single DP or non-MoE engines)."""
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
