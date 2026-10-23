@@ -72,6 +72,18 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
+    engram_tail_compressed_ids: list[int] = []
+    """Engram compressed ids of the prompt tail that the first decode
+    positions look back at, `lookback_depth` entries, tail index `t` being
+    prompt position `P - 1 - t`; 0 for image tokens and positions before the
+    prompt start. Empty without Engram."""
+    engram_tail_dead: list[bool] = []
+    """Per tail index: the tail token is an image token. Empty without
+    Engram."""
+    image_placeholder_spans: list[int] = []
+    """Flattened `(start, length, token_id)` runs of image placeholder ids in
+    the whole prompt, for the cloud to rebuild the ids its image routing
+    reads. Empty for text-only prompts and models without them."""
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
@@ -111,6 +123,13 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     max_num_batched_tokens: int
     max_num_seqs: int
     num_speculative_tokens: int
+    num_draft_slots: int = 0
+    """Extra input slots per scheduled request for parallel drafting
+    (`max_num_new_slots_for_drafting`); the edge picker budgets them so the
+    cloud reproduces its chunk boundaries."""
+    engram_fingerprint: str = ""
+    """Digest of the cloud's Engram hash parameters; empty without Engram.
+    A mismatch makes the edge's bucket indices land on wrong table rows."""
 
 
 class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]

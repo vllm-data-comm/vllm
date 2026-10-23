@@ -64,6 +64,13 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
+    # Whole-request metadata of `LwdRequestNotify`, cloud-side fill only.
+    # Each list is empty or aligned with req_ids; an entry is non-empty
+    # only on the request's first chunk (offset 0) and only when it
+    # applies, so the runner caches it per request.
+    engram_tail_compressed_ids: list[list[int]] = field(default_factory=list)
+    engram_tail_dead: list[list[bool]] = field(default_factory=list)
+    image_placeholder_spans: list[list[int]] = field(default_factory=list)
 
 
 @dataclass

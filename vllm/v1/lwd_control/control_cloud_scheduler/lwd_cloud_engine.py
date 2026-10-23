@@ -26,6 +26,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    lwd_draft_slots,
     lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
@@ -40,6 +41,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_decode_edge_to_cloud,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
+    lwd_cloud_engram_fingerprint,
+)
 from vllm.v1.request import Request
 
 # Sleep between retries of a full outbound queue: step metadata must not be
@@ -101,6 +105,10 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
+            num_draft_slots=lwd_draft_slots(self.vllm_config),
+            engram_fingerprint=lwd_cloud_engram_fingerprint(
+                self.vllm_config.model_config
+            ),
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -246,6 +254,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
         elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
+            # Before the ADD: the request's first chunk cannot be scheduled
+            # until the ADD lands, so its metadata is in place by then.
+            self.scheduler.lwd_register_request_metadata(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             lwd_logger.info(
                 "[cloud] request added req=%s tokens=%d",
