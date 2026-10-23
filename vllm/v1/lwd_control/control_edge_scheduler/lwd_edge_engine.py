@@ -224,6 +224,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if values["max_tokens"] is None:
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
+        # Full-prompt mrope rides the request notify once (message v2): the
+        # cloud primes the request state at admission instead of slicing per
+        # chunk. Text-only requests keep the empty default.
+        mrope = self.scheduler.lwd_mrope_positions(request.request_id)
+        if mrope is not None:
+            values["mrope_positions"] = mrope.contiguous().numpy().tobytes()
         self._lwd_send_to_cloud(
             LwdRequestNotify(
                 request_id=request.request_id,

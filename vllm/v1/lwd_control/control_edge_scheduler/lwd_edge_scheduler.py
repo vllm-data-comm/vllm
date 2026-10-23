@@ -512,6 +512,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"len {request.num_prompt_tokens} (request {request.request_id})"
         )
         self._lwd_mrope_positions_dict[request.request_id] = positions
+
+    def lwd_mrope_positions(self, req_id: str) -> "torch.Tensor | None":
+        """Whole-prompt mrope ledger entry for the request (None = text-only).
+
+        Consumed by the engine at admission to pack LwdRequestNotify
+        (message v2: full-prompt positions announced once).
+        """
+        return self._lwd_mrope_positions_dict.get(req_id)
         # [Lwd][perf] per-request latency of whole-prompt mrope computation
         # (runs on the edge engine main thread; the scheduling loop stalls
         # meanwhile; used for MM degradation attribution)

@@ -673,6 +673,12 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+            # LWD per-request window cap (see the running-loop twin
+            # above): bounds this request to the rows whose embeddings
+            # have actually arrived on host. None for all non-LWD requests.
+            lwd_window_cap = getattr(request, "lwd_window_cap", None)
+            if lwd_window_cap is not None:
+                num_new_tokens = min(num_new_tokens, lwd_window_cap)
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
@@ -1089,6 +1095,13 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
+                    # LWD per-request window cap: set by LwdCloudScheduler on
+                    # prefill requests whose embeddings are only partially staged,
+                    # so the pooled token budget cannot over-schedule a request
+                    # beyond its window. None for all other requests.
+                    lwd_window_cap = getattr(request, "lwd_window_cap", None)
+                    if lwd_window_cap is not None:
+                        num_new_tokens = min(num_new_tokens, lwd_window_cap)
                     assert num_new_tokens > 0
 
                     # Apply Mamba alignment before encoder caps.

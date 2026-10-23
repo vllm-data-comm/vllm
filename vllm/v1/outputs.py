@@ -333,6 +333,13 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # LWD edge embed batch piggybacks the UP send watermark (the highest UP
+    # seqno whose transfer had completed when the batch's execute returned;
+    # channel FIFO makes a single watermark exact). The edge engine releases
+    # pending-gate entries by it (semantics = fully received by the cloud).
+    # Always -1 for non-LWD.
+    lwd_up_send_watermark: int = -1
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
