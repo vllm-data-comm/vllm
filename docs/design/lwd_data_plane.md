@@ -44,9 +44,11 @@ flowchart LR
 | Group | Ranks |
 | --- | --- |
 | world | `[0, 1, 2, 3, 4, 5]` |
-| TP / EP / MC2 | `[0, 1]`, `[2, 3, 4, 5]` |
+| TP / EP / MC2 (non-MoE) | `[0, 1]`, `[2, 3, 4, 5]` |
 | PP / DCP / PCP / DP | `[0]`, `[1]`, ..., `[5]` |
 | UP, DOWN | `[0, 2]` |
+
+With several cloud DPs the DP groups hold the co-located ranks across the DPs and the EP / MC2 groups span every cloud rank of the instance (experts sharded dp x tp, as natively); each DP connection adds its own UP and DOWN pair, all held by the edge endpoint rank. See [lwd_multi_dp.md](lwd_multi_dp.md).
 
 Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `lwd_init_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `lwd_check_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
 
@@ -59,7 +61,7 @@ The old branch built a `[edge0, cloud0]` PP group with `pipeline_parallel_size=2
 | Scene | Status | Reason |
 | --- | --- | --- |
 | `single_instance`, 1 DP | Supported | |
-| `single_instance`, several DPs | Rejected | The edge DPs share their ranks, and one rank is one process |
+| `single_instance`, several DPs | Supported | The edge DPs share their ranks: one edge process serves every DP connection; see [lwd_multi_dp.md](lwd_multi_dp.md) |
 | `edge_share` | Rejected | The edge instances share their ranks |
 | `cloud_share`, `lwd_cluster` | Rejected | An endpoint rank would hold the channels of several DP connections |
 

@@ -23,6 +23,9 @@ from typing import Any
 
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
+    LwdCoordClient,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_executor_proxy import (
     LwdEdgeExecutorProxy,
 )
@@ -88,6 +91,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_cloud_params_received.clear()
         for dp_idx, params in self._lwd_cloud_params.items():
             self._lwd_check_cloud_params(dp_idx, params)
+        # A MoE multi-DP cloud pauses its engines between waves; the edge
+        # is its front-end stand-in, so it wakes the wave of the routed
+        # engine on the first request. Links without a coordinator (single
+        # DP, non-MoE) stay without a client.
+        self._lwd_coord_clients: dict[int, LwdCoordClient] = {
+            dp_idx: LwdCoordClient(dp_idx, params.dp_coordinator_addr)
+            for dp_idx, params in self._lwd_cloud_params.items()
+            if params.dp_coordinator_addr
+        }
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         # Native batch queue stepping (step/step_with_batch_queue untouched):
         # 1. depth 2, rebuilding the deque so its maxlen matches and
@@ -107,6 +119,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             len(self._lwd_clouds),
             self.batch_queue_size,
         )
+
+    def shutdown(self) -> None:
+        # Reached after a failed assembly too, before the clients exist.
+        for client in getattr(self, "_lwd_coord_clients", {}).values():
+            client.shutdown()
+        super().shutdown()
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_cloud_to_edge(payload)
@@ -211,6 +229,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             request.num_prompt_tokens,
         )
         dp_idx = self.scheduler.lwd_admit_request(request)
+        client = self._lwd_coord_clients.get(dp_idx)
+        if client is not None:
+            client.send_first_req()
         self._lwd_notify_request(dp_idx, request)
         super().add_request(request)
 
