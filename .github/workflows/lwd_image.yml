@@ -1,0 +1,65 @@
+name: LWD Image
+
+on:
+  schedule:
+    - cron: '37 19 * * *' # 03:37 Beijing
+  workflow_dispatch:
+    inputs:
+      soc_select:
+        type: choice
+        options: [both, a2, a3]
+        default: both
+        description: "SoC variants to build"
+      vllm_ref:
+        type: string
+        default: main
+        description: "vllm fork ref to build from"
+      vllm_ascend_ref:
+        type: string
+        default: main
+        description: "vllm-ascend fork ref to build from"
+      base_tag:
+        type: string
+        default: ""
+        description: "override the pinned official base image tag"
+      push:
+        type: boolean
+        default: true
+        description: "push the image to ghcr.io"
+      update_nightly_tag:
+        type: boolean
+        default: true
+        description: "also move the rolling nightly tag"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: lwd-image
+  cancel-in-progress: true
+
+jobs:
+  a2:
+    if: ${{ github.event_name == 'schedule' || inputs.soc_select != 'a3' }}
+    uses: vllm-data-comm/ci-infra/.github/workflows/lwd_image.yml@main
+    with:
+      soc: a2
+      vllm_ref: ${{ inputs.vllm_ref || 'main' }}
+      vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || 'main' }}
+      base_tag: ${{ inputs.base_tag }}
+      push: ${{ github.event_name == 'schedule' || inputs.push }}
+      nightly: ${{ github.event_name == 'schedule' || inputs.update_nightly_tag }}
+    secrets: inherit
+
+  a3:
+    if: ${{ github.event_name == 'schedule' || inputs.soc_select != 'a2' }}
+    uses: vllm-data-comm/ci-infra/.github/workflows/lwd_image.yml@main
+    with:
+      soc: a3
+      vllm_ref: ${{ inputs.vllm_ref || 'main' }}
+      vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || 'main' }}
+      base_tag: ${{ inputs.base_tag }}
+      push: ${{ github.event_name == 'schedule' || inputs.push }}
+      nightly: ${{ github.event_name == 'schedule' || inputs.update_nightly_tag }}
+    secrets: inherit

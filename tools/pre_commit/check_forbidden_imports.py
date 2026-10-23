@@ -35,6 +35,8 @@ CHECK_IMPORTS = {
         ),
         allowed_files={
             # pickle
+            # Round-trip only trusted, in-process LWD configuration snapshots.
+            "tests/config/lwd/test_entry.py",
             "vllm/multimodal/hasher.py",
             "vllm/transformers_utils/config.py",
             "vllm/model_executor/models/registry.py",

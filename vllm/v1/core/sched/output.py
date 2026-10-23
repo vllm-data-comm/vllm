@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,59 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+
+
+class LwdBatchType(enum.Enum):
+    LWD_EMBED = "lwd_embed"  # prefill send: token_ids -> embeddings
+    LWD_UNEMBED = "lwd_unembed"  # token recovery: batched hidden + top_id_ths -> tokens
+
+
+@dataclass
+class LwdEmbedBatch:
+    """LWD prefill_only mode edge execute batch"""
+
+    req_ids: list[str] = field(default_factory=list)
+    token_ids: list[list[int]] = field(default_factory=list)
+    # Multimodal fields are per-request (aligned with req_ids): a mixed
+    # pdmix batch can interleave text-only and image requests, so a
+    # batch-level flag is not enough.
+    # - prompt_offsets[i]: start of request i's chunk within its prompt
+    #   (edge-side mm row-slicing window; same origin as the scheduling
+    #   offset);
+    # - has_mrope[i]: whether request i carries mrope rows (the edge
+    #   computes positions only for MM requests at admission);
+    # - mrope_positions[i]: raw mrope position bytes for request i's
+    #   chunk ([3, n] int64, forwarded by the cloud scheduler from the
+    #   RangeNotify item; empty bytes when no mrope). Cloud-side
+    #   fill/consume only: the runner frombuffers them straight into
+    #   req_state; the edge no longer fills them (positions ride the
+    #   control-plane notify; the data-plane aux frame is retired).
+    #   bytes is a native msgspec type, serialized with the SO to every
+    #   cloud worker at no extra cost.
+    prompt_offsets: list[int] = field(default_factory=list)
+    has_mrope: list[bool] = field(default_factory=list)
+    mrope_positions: list[bytes] = field(default_factory=list)
+
+
+@dataclass
+class LwdUnembedBatch:
+    """LWD prefill_only mode edge token-recovery batch (spec-decode aware)."""
+
+    req_ids: list[str] = field(default_factory=list)
+    num_accept_tokens: list[int] = field(default_factory=list)  # per request: accepted count (<= K)
+    recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
+    out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
+    top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
+    token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
+
+
+@dataclass
+class LwdBatch:
+    """LWD prefill_only mode batch dispatched by the scheduler."""
+
+    batch_type: LwdBatchType
+    seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
+    batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
 
 
 @dataclass
@@ -304,6 +358,9 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # LWD batch metadata dispatch to the worker.
+    lwd_batch: LwdBatch | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -316,6 +373,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            lwd_batch=None,
         )
 
 

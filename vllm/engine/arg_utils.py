@@ -84,6 +84,7 @@ from vllm.config.kernel import (
 )
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.lora import MaxLoRARanks
+from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
     ConvertOption,
@@ -752,6 +753,8 @@ class EngineArgs:
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
+    api_server_rpc_port: str | None = None
+    api_server_attach: str | None = None
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str | dict[str, str] = LoadConfig.pt_load_map_location
@@ -1731,6 +1734,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
+        LwdAPIConfig.add_cli_args(parser)
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
@@ -2047,6 +2051,15 @@ class EngineArgs:
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
+        lwd_config = None
+        lwd_api = LwdAPIConfig.from_namespace(self, headless=headless)
+        if (
+            isinstance(self.additional_config, dict)
+            and "lwd_config" in self.additional_config
+        ):
+            lwd_config = resolve_lwd_config(self.additional_config, api=lwd_api)
+        else:
+            lwd_api.validate_topology(None)
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
@@ -2670,6 +2683,7 @@ class EngineArgs:
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
+            lwd_config=lwd_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,

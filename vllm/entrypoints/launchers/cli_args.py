@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 import vllm.envs as envs
 from vllm.config import config
+from vllm.config.lwd import LwdAPIConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, optional_type
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -440,6 +441,9 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     # LaunchSubcommandBase.add_cli_args), so its args are serve args as well.
     if hasattr(args, "subparser") and args.subparser not in ("serve", "launch"):
         return
+
+    # Frontend flags are not forwarded to EngineArgs; config validation happens there.
+    LwdAPIConfig.validate_frontend(args)
 
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
