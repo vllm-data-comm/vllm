@@ -75,6 +75,11 @@ class LwdEmbedBatch:
     # fully-arrived release check on it (recv_rows == prompt_lens[i]).
     prompt_lens: list[int] = field(default_factory=list)
 
+    # Requests aborted before their payload was fully staged: carried across
+    # processes so the cloud drops hold/staging entries the flush hook cannot
+    # see (preemption removes a request without finishing it).
+    aborted: list[str] = field(default_factory=list)
+
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
