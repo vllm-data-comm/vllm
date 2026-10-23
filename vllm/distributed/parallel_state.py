@@ -2364,14 +2364,20 @@ def _lwd_initialize_model_parallel(
     _PP = init_model_parallel_group(
         singleton_groups, local_rank, backend, group_name="pp"
     )
-    # Non-MoE DP ranks run as independent engines, and MoE with DP is
-    # rejected before the engine starts, so no DP group spans several ranks.
+    # Non-MoE DP ranks run as independent engines, so their DP groups stay
+    # singletons; MoE engines run on the native DP engine core, whose DP
+    # collectives span the co-located ranks of every cloud DP.
+    is_moe = vllm_config.model_config is None or vllm_config.model_config.is_moe
     _DP = init_model_parallel_group(
-        singleton_groups, local_rank, backend, group_name="dp"
+        spec.dp_groups if is_moe else singleton_groups,
+        local_rank,
+        backend,
+        group_name="dp",
     )
-    if vllm_config.model_config is None or vllm_config.model_config.is_moe:
+    if is_moe:
+        # Experts sharded dp x tp over each cloud instance, as natively.
         _EP = init_model_parallel_group(
-            tp_groups,
+            spec.ep_groups,
             local_rank,
             backend,
             group_name="ep",
@@ -2379,7 +2385,7 @@ def _lwd_initialize_model_parallel(
         )
         if parallel_config.enable_eplb:
             _EPLB = init_model_parallel_group(
-                tp_groups, local_rank, backend, group_name="eplb"
+                spec.ep_groups, local_rank, backend, group_name="eplb"
             )
     logger.info(
         "[LWD] rank %d in world size %d: TP group %s, data-plane channels %s",
