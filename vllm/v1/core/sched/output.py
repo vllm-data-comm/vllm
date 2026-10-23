@@ -69,6 +69,12 @@ class LwdEmbedBatch:
     # step computes" (that is num_scheduled_tokens) and NOT the arrival
     # high-water (that is recv_rows). Consumers use absolute prompt
     # coordinates and the native schedule quantity only.
+    # Per-request prompt total rows. Under the host-staging architecture the
+    # staging pool sizes each request's host buffer by it once (the authority
+    # fallback when a recv hint is lost); the engine's hold ledger keys the
+    # fully-arrived release check on it (recv_rows == prompt_lens[i]).
+    prompt_lens: list[int] = field(default_factory=list)
+
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
