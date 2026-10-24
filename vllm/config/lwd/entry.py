@@ -71,3 +71,20 @@ class LwdConfig:
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:
         return self.topology.connections(self.role, self.instance_id)
+
+    @property
+    def cloud_dp_size(self) -> int:
+        """Number of DPs of the cloud instance this config takes part in.
+
+        One control link and one data-plane channel pair exist per cloud DP.
+        An edge runs a single process whatever that count is, so its own
+        `data_parallel_size` cannot answer this; both roles read it from the
+        shared topology, which is what makes their per-DP seqno streams line
+        up.
+        """
+        cloud_id = (
+            self.instance_id
+            if self.role == "cloud"
+            else self.connections[0].cloud_id
+        )
+        return len(self.topology.instance("cloud", cloud_id).dp)

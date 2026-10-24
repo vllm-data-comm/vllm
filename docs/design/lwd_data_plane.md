@@ -17,9 +17,9 @@ The data plane spans two repositories:
 
 HCCL builds a communicator from a world that every rank joins, so the edge and cloud instances form one HCCL world whose ranks are the global ranks in the topology (`hccl_world_size`, `dp[].ranks`). Inside that world:
 
-- each edge instance DP and each cloud instance DP runs like a centralized pp=1 deployment: its ranks are one TP group, and the PP, DCP, PCP and DP groups are singletons;
-- the EP and MC2 groups equal the TP groups;
-- each DP connection adds two groups, UP and DOWN, over its endpoint pair: the first edge rank and the first cloud rank (`cloud_leader_rank`).
+- each edge instance DP and each cloud instance DP runs like a centralized pp=1 deployment: its ranks are one TP group, and the PP, DCP and PCP groups are singletons;
+- the DP groups join the replicas of one TP position across an instance's DPs, and the EP and MC2 groups span a whole instance, so that MoE experts shard over DP x TP as they do in a centralized deployment. At one DP all three collapse to what they were before: singleton DP groups and EP/MC2 equal to the TP groups;
+- each DP connection adds two groups, UP and DOWN, over its endpoint pair: the first edge rank and the first cloud rank (`cloud_leader_rank`). A shared edge rank holds one such pair per cloud DP, keyed by the connection's DP index.
 
 Example: one edge instance on ranks 0-1, one cloud instance on ranks 2-5.
 
@@ -59,11 +59,13 @@ The old branch built a `[edge0, cloud0]` PP group with `pipeline_parallel_size=2
 | Scene | Status | Reason |
 | --- | --- | --- |
 | `single_instance`, 1 DP | Supported | |
-| `single_instance`, several DPs | Rejected | The edge DPs share their ranks, and one rank is one process |
+| `single_instance`, several cloud DPs | Supported | One edge process holds one control link and one channel pair per cloud DP; the edge DPs of the topology all name that one process and share its rank |
 | `edge_share` | Rejected | The edge instances share their ranks |
-| `cloud_share`, `lwd_cluster` | Rejected | An endpoint rank would hold the channels of several DP connections |
+| `cloud_share`, `lwd_cluster` | Rejected | A cloud DP would serve several edges, which its handshake and request ledger do not separate |
 
-TODO(lwd): give each DP connection its own communication domain, built from rendezvous information exchanged over the control plane, instead of one world shared by every instance. That lifts the shared-rank limit and decouples the lifecycles of the edge and the cloud.
+Several cloud DPs is what lets MoE experts shard over DP x TP: at EP = TP alone, a model whose experts do not fit in one TP group's memory cannot be served at all.
+
+TODO(lwd): give each DP connection its own communication domain, built from rendezvous information exchanged over the control plane, instead of one world shared by every instance. That decouples the lifecycles of the edge and the cloud.
 
 ## Channels
 

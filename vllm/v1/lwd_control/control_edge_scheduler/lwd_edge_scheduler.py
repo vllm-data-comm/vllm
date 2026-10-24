@@ -61,8 +61,9 @@ from vllm.v1.request import RequestStatus
 if TYPE_CHECKING:
     from vllm.v1.request import Request
 
-LwdSendToCloud = Callable[[LwdEdgeToCloudMessage], None]
-"""Sends one message to the cloud; raises instead of losing it."""
+LwdSendToCloud = Callable[[int, LwdEdgeToCloudMessage], None]
+"""Sends one message to the cloud DP of the given index; raises instead of
+losing it."""
 
 # Cloud finish code -> edge terminal state (frontend reason goes through the
 # output channel; ERROR maps to ABORTED)
@@ -73,13 +74,14 @@ _LWD_FINISH_STATUS = {
     FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
 }
 
-# Cloud-side pending cap, counted in unconsumed chunks (seqno): one seqno =
-# one cloud-step consumption unit. The edge records seqno -> in-batch request
-# list; once every request in a batch has received its first token, that
-# chunk is consumed; when the number of unconsumed chunks reaches the cap,
-# new prefill admission stops -- requests accumulate in the edge waiting
-# queue (picker FCFS prefix naturally forms multi-request batches), and the
-# gate reopens by itself once the cloud-side pending drains.
+# Per-cloud-DP pending cap, counted in unconsumed chunks (seqno): one seqno =
+# one cloud-step consumption unit of that DP. The edge records seqno ->
+# in-batch request list; once every request in a batch has received its first
+# token, that chunk is consumed; when a DP's unconsumed chunks reach the cap,
+# prefill admission for that DP stops -- requests accumulate in the edge
+# waiting queue (picker FCFS prefix naturally forms multi-request batches),
+# and the gate reopens by itself once that cloud DP drains. The cap is
+# per-DP because each cloud DP runs its own scheduler and KV pool.
 _LWD_MAX_PENDING_CHUNKS = 3
 
 
@@ -89,25 +91,43 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Injected by the engine once the cloud accepted the handshake.
+        # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
-        self._lwd_seqno = 0
+        # Cloud DP count: one control link and one data-plane channel pair
+        # per index. The edge itself always runs a single process.
+        self._lwd_cloud_dp_size: int = self.vllm_config.lwd_config.cloud_dp_size
+        # Per-DP seqno streams: the data-plane FIFO contract is per channel,
+        # and each cloud DP owns its own channel pair.
+        self._lwd_seqno: list[int] = [0] * self._lwd_cloud_dp_size
+        # Request -> cloud DP, pinned at admission and never changed: the
+        # cloud holds the request's KV and scheduler state, so every later
+        # chunk, abort and result of that request belongs to the same DP.
+        self._lwd_request_dp: dict[str, int] = {}
+        # Round-robin tie-break cursor for routing.
+        self._lwd_route_cursor: int = 0
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
         # block hash chain for cloud-side hits.
         self.kv_cache_manager.enable_caching = False
-        # Pending ledger (single account): seqno -> set of in-batch requests
+        # Pending ledger, per cloud DP: seqno -> set of in-batch requests
         # whose result has not yet arrived. One seqno = one cloud-step
         # consumption unit; a request is removed from its batch once its
         # first token arrives, and once a batch is fully drained the whole
-        # entry is removed -- prefill gate watermark = len(this table)
-        self._lwd_pending_batches: dict[int, set[str]] = {}
+        # entry is removed -- a DP's prefill gate watermark = len(its table)
+        self._lwd_pending_batches: list[dict[int, set[str]]] = [
+            {} for _ in range(self._lwd_cloud_dp_size)
+        ]
         # c2e notify queue: appended by the control-plane IO thread, consumed
-        # within a scheduling step to produce an UNEMBED batch
-        self.unembed_notify_queue: deque[LwdC2eNotify] = deque()
-        # Pending gate state (only used for open/close transition logging)
-        self._lwd_prefill_gate_held: bool = False
+        # within a scheduling step to produce an UNEMBED batch. Entries are
+        # (cloud dp index, notify): down_seqno counters are per cloud DP, so
+        # the index has to travel with the notify to address the DOWN channel.
+        self.unembed_notify_queue: deque[tuple[int, LwdC2eNotify]] = deque()
+        # Pending gate state per DP (only used for open/close transition
+        # logging)
+        self._lwd_prefill_gate_held: list[bool] = [
+            False
+        ] * self._lwd_cloud_dp_size
         # MTP budget factor (decode consumes 1+k tokens per request per
         # step); edge/cloud budgets are deployment-aligned, the cap reads the
         # local config directly, the sole home of the formula is
@@ -164,12 +184,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def has_requests(self) -> bool:
         """Liveness predicate for native stepping: has a dispatchable batch
         (EMBED dispatchable / c2e pending consumption / DISABLE_DOWN
-        passthrough backlog). False when the gate is HOLD with nothing in
-        flight; the engine then sleeps via has_work -- whenever schedule()
+        passthrough backlog). False when every DP's gate is HOLD with nothing
+        in flight; the engine then sleeps via has_work -- whenever schedule()
         is called there must be a real batch, and empty batches never enter
         the queue (native batch-queue contract; an empty batch would blow up
         the harvest path with a None result)."""
-        return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
+        return (
+            bool(self.unembed_notify_queue)
+            or self._lwd_pick_target_dp() is not None
+        )
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         """Dispatch an EMBED batch first; otherwise consume c2e to produce an
@@ -185,41 +208,69 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return out
         return self._lwd_schedule_unembed()
 
-    def _lwd_embed_dispatchable(self) -> bool:
-        """EMBED dispatchability check (with gate transition logging): a
-        resume in flight is exempt from both gates; otherwise the fullness
-        check must pass, pending chunks must be below the cap, and waiting
-        must be non-empty (at the pending cap the gate HOLDs, requests
-        accumulate in waiting, and the gate reopens once the cloud
-        drains)."""
-        if self._lwd_has_prefill_chunk_inflight():
-            self._lwd_log_gate_open()
+    def _lwd_pick_target_dp(self) -> int | None:
+        """The cloud DP this step serves, or None when no DP can take one.
+
+        One batch carries one seqno to one cloud, so a step serves exactly
+        one DP. Scanning starts after the last served DP so a permanently
+        busy DP cannot starve the others.
+
+        TODO(lwd): decide whether a step should be able to dispatch to
+        several cloud DPs at once. One batch per step caps embed dispatch at
+        one link per step, which the batch-queue depth hides at small DP
+        counts but may bound throughput as the cloud grows; emitting several
+        batches per step would change the SchedulerOutput contract.
+        """
+        for offset in range(self._lwd_cloud_dp_size):
+            dp_idx = (self._lwd_route_cursor + offset) % self._lwd_cloud_dp_size
+            if self._lwd_embed_dispatchable(dp_idx):
+                return dp_idx
+        return None
+
+    def _lwd_embed_dispatchable(self, dp_idx: int) -> bool:
+        """EMBED dispatchability of one cloud DP (with gate transition
+        logging): a resume in flight is exempt from both gates; otherwise the
+        fullness check must pass, that DP's pending chunks must be below the
+        cap, and it must have a request to send (at the pending cap the gate
+        HOLDs, requests accumulate in waiting, and the gate reopens once that
+        cloud DP drains)."""
+        if self._lwd_has_prefill_chunk_inflight(dp_idx):
+            self._lwd_log_gate_open(dp_idx)
             return True
-        pending_chunks = len(self._lwd_pending_batches)
+        pending_chunks = len(self._lwd_pending_batches[dp_idx])
         if (
             len(self.running) >= self.max_num_running_reqs
             or pending_chunks >= _LWD_MAX_PENDING_CHUNKS
-            or not (self.waiting or self.skipped_waiting)
+            or not self._lwd_has_waiting_for_dp(dp_idx)
         ):
             if (
                 pending_chunks >= _LWD_MAX_PENDING_CHUNKS
-                and not self._lwd_prefill_gate_held
+                and not self._lwd_prefill_gate_held[dp_idx]
             ):
-                self._lwd_prefill_gate_held = True
+                self._lwd_prefill_gate_held[dp_idx] = True
                 lwd_logger.info(
-                    "[edge-sched] prefill gate HOLD: pending_chunks=%d >= %d",
+                    "[edge-sched] prefill gate HOLD dp=%d: pending_chunks=%d >= %d",
+                    dp_idx,
                     pending_chunks,
                     _LWD_MAX_PENDING_CHUNKS,
                 )
             return False
-        self._lwd_log_gate_open()
+        self._lwd_log_gate_open(dp_idx)
         return True
 
-    def _lwd_log_gate_open(self) -> None:
+    def _lwd_has_waiting_for_dp(self, dp_idx: int) -> bool:
+        """Whether any queued request is routed to this cloud DP."""
+        return any(
+            self._lwd_request_dp.get(request.request_id) == dp_idx
+            for queue in (self.waiting, self.skipped_waiting)
+            for request in queue
+        )
+
+    def _lwd_log_gate_open(self, dp_idx: int) -> None:
         """Gate open transition logging (HOLD -> OPEN logged only once)."""
-        if self._lwd_prefill_gate_held:
-            self._lwd_prefill_gate_held = False
-            lwd_logger.info("[edge-sched] prefill gate OPEN")
+        if self._lwd_prefill_gate_held[dp_idx]:
+            self._lwd_prefill_gate_held[dp_idx] = False
+            lwd_logger.info("[edge-sched] prefill gate OPEN dp=%d", dp_idx)
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
         """Chunked batch + budget clamp + RangeNotify, then the EMBED batch
@@ -229,12 +280,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_computed_tokens, so a dropped chunk would never be embedded and
         the next offset would not match the cloud. A notify that cannot be
         sent raises instead."""
-        if not self._lwd_embed_dispatchable():
+        dp_idx = self._lwd_pick_target_dp()
+        if dp_idx is None:
             return None
-        out = self._lwd_schedule_batch()
+        out = self._lwd_schedule_batch(dp_idx)
         if not out.num_scheduled_tokens:
             return None
-        self.lwd_edge_notify_range(out)
+        self.lwd_edge_notify_range(out, dp_idx)
+        # Serve the next DP first on the following step.
+        self._lwd_route_cursor = (dp_idx + 1) % self._lwd_cloud_dp_size
         return out
 
     def _lwd_schedule_unembed(self) -> SchedulerOutput:
@@ -243,7 +297,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         proxy with an already-completed future, keeping the scheduler path
         uniform."""
         if self.unembed_notify_queue:
-            return lwd_build_unembed_batch(self.unembed_notify_queue.popleft())
+            dp_idx, notify = self.unembed_notify_queue.popleft()
+            return lwd_build_unembed_batch(notify, dp_idx)
         return SchedulerOutput.make_empty()
 
     def update_from_output(self, scheduler_output, model_runner_output):
@@ -395,11 +450,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
     def _lwd_pick_prefill_batch(
-        self,
+        self, dp_idx: int
     ) -> tuple[list[str], dict[str, int]]:
-        """Picker adapter layer: assemble candidates, compute cap/free_seq,
-        and model-family conversion-specific parameters."""
-        inflight = len(self.running)
+        """Picker adapter layer for one cloud DP: assemble that DP's
+        candidates, compute cap/free_seq, and model-family
+        conversion-specific parameters.
+
+        The budget terms are per cloud DP: each one runs its own scheduler
+        and KV pool sized by the same `max_num_*` the edge checked at
+        handshake, so only the requests routed to this DP consume its
+        budget. Charging all DPs' in-flight requests against one DP's
+        budget would starve the fleet as the DP count grows.
+        """
+        inflight = sum(
+            1
+            for r in self.running
+            if self._lwd_request_dp.get(r.request_id) == dp_idx
+        )
         cap = self.max_num_scheduled_tokens - inflight * self._lwd_inflight_reservation
         free_seq = self.max_num_running_reqs - inflight
         # Resume candidates take only the prefill phase (decode-phase
@@ -411,10 +478,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 r.request_id, r.num_prompt_tokens, r.num_computed_tokens
             )
             for r in self._lwd_reqs_in_phase(LwdReqPhase.PREFILL, self.running)
+            if self._lwd_request_dp.get(r.request_id) == dp_idx
         ]
         waiting = [
             LwdPrefillCandidate(r.request_id, r.num_prompt_tokens, 0)
             for r in [*self.skipped_waiting, *self.waiting]
+            if self._lwd_request_dp.get(r.request_id) == dp_idx
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
@@ -432,13 +501,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         return req_ids, expected
 
-    def _lwd_schedule_batch(self) -> SchedulerOutput:
+    def _lwd_schedule_batch(self, dp_idx: int) -> SchedulerOutput:
         """Chunk batch assembly: the picker selects the batch, scheduled via
         the base-class visible-set mechanism (budget clamped to the picked
         chunk total -- the picker's cap also covers the cloud's drafting
         slots, which the edge's native budget does not charge -- so the
         chunk split is reproduced natively)."""
-        req_ids, expected = self._lwd_pick_prefill_batch()
+        req_ids, expected = self._lwd_pick_prefill_batch(dp_idx)
         return self._lwd_schedule(req_ids, token_budget_cap=sum(expected.values()))
 
     def _try_schedule_encoder_inputs(
@@ -454,55 +523,109 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         contract, so nothing is scheduled, consumed, or rolled back."""
         return [], num_new_tokens, encoder_compute_budget, []
 
-    def _lwd_has_prefill_chunk_inflight(self) -> bool:
-        """Whether running has an embed request not fully sent; same
+    def _lwd_has_prefill_chunk_inflight(self, dp_idx: int) -> bool:
+        """Whether this DP has an embed request not fully sent; same
         criterion as the picker resume branch -- the two must stay
         consistent."""
-        return (
-            next(
-                self._lwd_reqs_in_phase(LwdReqPhase.PREFILL, self.running),
-                None,
-            )
-            is not None
+        return any(
+            self._lwd_request_dp.get(r.request_id) == dp_idx
+            for r in self._lwd_reqs_in_phase(LwdReqPhase.PREFILL, self.running)
         )
 
     def lwd_admit_request(self, request: Request) -> None:
         """Scheduler-local half of request admission: mode boundary
-        validation + model-family precomputation. The cloud announcement
-        (communication) and enqueueing belong to the engine's add_request;
-        abort_immediately goes through the native engine path (the ledger
-        is pruned in the abort_requests override)."""
+        validation + model-family precomputation + cloud DP routing. The
+        cloud announcement (communication) and enqueueing belong to the
+        engine's add_request; abort_immediately goes through the native
+        engine path (the ledger is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self.lwd_model_family.admit(request)
+        self._lwd_route_request(request.request_id)
 
-    def lwd_edge_notify_range(self, scheduler_output: SchedulerOutput) -> None:
-        """Send one batch RangeNotify and attach the EMBED batch; a seqno is
-        only taken by a notify that was sent."""
+    def _lwd_route_request(self, request_id: str) -> int:
+        """Pin a request to one cloud DP, for its whole life.
+
+        The chosen cloud holds this request's KV and scheduler state, so
+        every later chunk, abort and result must take the same link. The
+        edge is the only source of cloud traffic, so its own ledger is an
+        exact load picture and no cloud-side stats are needed: score a DP by
+        its prefill (weight 4) and decode (weight 1) occupancy, same terms as
+        the native DP load balancer, and take the lightest. Ties rotate from
+        the last served DP so an idle fleet spreads out instead of piling
+        onto DP 0.
+        """
+        best_dp, best_score = 0, None
+        for offset in range(self._lwd_cloud_dp_size):
+            dp_idx = (self._lwd_route_cursor + offset) % self._lwd_cloud_dp_size
+            score = self._lwd_engine_load(dp_idx)
+            if best_score is None or score < best_score:
+                best_dp, best_score = dp_idx, score
+        self._lwd_request_dp[request_id] = best_dp
+        lwd_logger.info(
+            "[edge-route] req=%s -> dp=%d score=%s loads=%s",
+            request_id,
+            best_dp,
+            best_score,
+            [self._lwd_engine_load(i) for i in range(self._lwd_cloud_dp_size)],
+        )
+        return best_dp
+
+    def lwd_request_dp(self, request_id: str) -> int:
+        """The cloud DP a request was routed to at admission."""
+        dp_idx = self._lwd_request_dp.get(request_id)
+        assert dp_idx is not None, f"[LWD] request {request_id} was not routed"
+        return dp_idx
+
+    def _lwd_engine_load(self, dp_idx: int) -> int:
+        """Routing score of one cloud DP: prefill weighs 4, decode 1."""
+        prefill = decode = 0
+        for request in self.running:
+            if self._lwd_request_dp.get(request.request_id) != dp_idx:
+                continue
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                prefill += 1
+            else:
+                decode += 1
+        queued = sum(
+            1
+            for queue in (self.waiting, self.skipped_waiting)
+            for request in queue
+            if self._lwd_request_dp.get(request.request_id) == dp_idx
+        )
+        return (prefill + queued) * 4 + decode
+
+    def lwd_edge_notify_range(
+        self, scheduler_output: SchedulerOutput, dp_idx: int
+    ) -> None:
+        """Send one batch RangeNotify to one cloud DP and attach the EMBED
+        batch; a seqno is only taken by a notify that was sent."""
         built = self._lwd_build_range_items(scheduler_output.num_scheduled_tokens)
         if built is None:
             return
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
-        seqno = self._lwd_seqno
+        seqno = self._lwd_seqno[dp_idx]
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
         lwd_logger.info(
-            "[edge] range announced seqno=%d reqs=%d tokens=%d",
+            "[edge] range announced dp=%d seqno=%d reqs=%d tokens=%d",
+            dp_idx,
             seqno,
             len(items),
             sum(i.num_tokens for i in items),
         )
-        self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
-        self._lwd_seqno = seqno + 1
-        self._lwd_pending_batches[seqno] = set(req_ids)
+        self.lwd_send_to_cloud(dp_idx, LwdRangeNotify(seqno=seqno, items=items))
+        self._lwd_seqno[dp_idx] = seqno + 1
+        self._lwd_pending_batches[dp_idx][seqno] = set(req_ids)
         # On successful send, assemble the EMBED batch and attach it to SO:
-        # seqno is the pairing key of the data-plane tensor sent to the
-        # cloud (same value as registered by the cloud-side RangeNotify);
-        # the embed payload is this batch's per-request token slices (the
-        # edge worker flattens them in req_ids order); mrope positions
-        # already went to the control plane with the RangeNotify, so the
-        # edge worker no longer builds aux frames
+        # (dp_idx, seqno) is the pairing key of the data-plane tensor sent to
+        # the cloud (same value as registered by that cloud DP's
+        # RangeNotify); the embed payload is this batch's per-request token
+        # slices (the edge worker flattens them in req_ids order); mrope
+        # positions already went to the control plane with the RangeNotify,
+        # so the edge worker no longer builds aux frames
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
+            dp_idx=dp_idx,
             batch_meta=LwdEmbedBatch(
                 req_ids=req_ids,
                 token_ids=token_slices,
@@ -587,16 +710,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return True
 
     def _lwd_drop_pending_request(self, request_id: str) -> None:
-        """Remove a request from the pending ledger (shared by first-token
-        arrival/termination/abort): discard the request from each batch;
-        once a batch is fully drained -> the whole entry is removed (the
-        pending watermark drops; failing to remove would make it only ever
-        rise, leaving the prefill gate in permanent HOLD)."""
-        for seqno in list(self._lwd_pending_batches):
-            batch = self._lwd_pending_batches[seqno]
+        """Remove a request from its DP's pending ledger (shared by
+        first-token arrival/termination/abort): discard the request from each
+        batch; once a batch is fully drained -> the whole entry is removed
+        (the pending watermark drops; failing to remove would make it only
+        ever rise, leaving that DP's prefill gate in permanent HOLD)."""
+        dp_idx = self._lwd_request_dp.get(request_id)
+        if dp_idx is None:
+            return
+        pending = self._lwd_pending_batches[dp_idx]
+        for seqno in list(pending):
+            batch = pending[seqno]
             batch.discard(request_id)
             if not batch:
-                del self._lwd_pending_batches[seqno]
+                del pending[seqno]
 
     def _lwd_purge_admission_metadata(self) -> None:
         """Reconcile and remove model-family admission metadata: the request
@@ -609,6 +736,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request = self.requests.get(rid)
             if request is None or self._lwd_req_phase(request) is LwdReqPhase.DECODE:
                 self.lwd_model_family.release(rid)
+        # The routing table outlives the batch ledger (a decode-phase request
+        # still routes its results), so it is reclaimed on the same
+        # reconciliation, once the request has left the engine entirely.
+        for rid in [r for r in self._lwd_request_dp if r not in self.requests]:
+            del self._lwd_request_dp[rid]
 
     def _lwd_validate_request(self, request: Request) -> None:
         """Mode boundary validation (edge capability surface): reject
@@ -679,9 +811,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
 
 
-def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
+def lwd_build_unembed_batch(
+    notify: LwdC2eNotify, dp_idx: int = 0
+) -> SchedulerOutput:
     """Assemble the UNEMBED batch: cloud results bypass native scheduling;
-    use make_empty as the skeleton and attach LwdUnembedBatch."""
+    use make_empty as the skeleton and attach LwdUnembedBatch.
+
+    `dp_idx` is the cloud DP the notify came from: `down_seqno` counters are
+    per cloud DP, so the pair addresses that DP's DOWN channel.
+    """
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.num_scheduled_tokens = dict(
         zip(notify.req_ids, notify.num_accepted_tokens)
@@ -690,6 +828,7 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
     scheduler_output.lwd_batch = LwdBatch(
         batch_type=LwdBatchType.LWD_UNEMBED,
         seqno=notify.down_seqno,
+        dp_idx=dp_idx,
         batch_meta=LwdUnembedBatch(
             req_ids=list(notify.req_ids),
             num_accept_tokens=list(notify.num_accepted_tokens),

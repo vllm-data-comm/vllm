@@ -78,14 +78,22 @@ class LwdBaseEngineCore(EngineCoreProc):
     pure scheduling bookkeeping, so it is restored for LWD engines afterwards.
     `_lwd_assemble` then sets up the role and starts the control plane; READY
     has already reached the frontend by then.
+
+    This class is the single-DP base. The seams live in the methods below, so
+    a DP variant pairs the same ones with `DPEngineCoreProc` by listing this
+    class first in its bases: every override here delegates through `super()`,
+    which then reaches the DP implementation rather than the plain one.
     """
 
     lwd_scheduler_cls: type
 
     def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
         self._lwd_dp_size = lwd_dp_size
-        self._lwd_control_plane: LwdControlPlane | None = None
-        self._lwd_sender: LwdControlSender | None = None
+        # One plane and sender per link this process holds. A cloud process
+        # holds exactly one (its own DP); an edge process holds one per
+        # cloud DP it serves. Indexed by the link's cloud DP index.
+        self._lwd_control_planes: list[LwdControlPlane] = []
+        self._lwd_senders: list[LwdControlSender] = []
         # has_work state at the last transition log; None = not logged yet.
         self._lwd_last_has_work_state: tuple[bool, bool, bool] | None = None
         vllm_config = kwargs["vllm_config"]
@@ -109,24 +117,53 @@ class LwdBaseEngineCore(EngineCoreProc):
         raise NotImplementedError
 
     def _lwd_start_control_plane(self) -> LwdControlPlane:
-        """Start this DP rank's control plane; the calling (engine) thread
-        owns its sender."""
+        """Start this DP rank's single control plane; the calling (engine)
+        thread owns its sender. Cloud roles, which have one link."""
         dp_rank = self.vllm_config.parallel_config.data_parallel_index
-        plane = lwd_create_control_plane(self.lwd_config, dp_rank, self._lwd_dp_size)
-        self._lwd_control_plane = plane
-        self._lwd_sender = plane.start(_LwdEngineListener(self))
-        lwd_logger.info(
-            "[comm] control plane dp%d/%d started on %s",
-            dp_rank,
-            self._lwd_dp_size,
-            plane.endpoint,
-        )
-        return plane
+        return self._lwd_start_control_planes(dp_ranks=[dp_rank])[0]
 
-    def _lwd_send(self, peer: LwdPeer, message: LwdMessage) -> bool:
-        """Queue `message` for `peer`; False when the outbound queue is full."""
-        assert self._lwd_sender is not None, "control plane not started"
-        return self._lwd_sender.send(peer, lwd_encode_message(message))
+    def _lwd_start_control_planes(
+        self, dp_ranks: list[int] | None = None
+    ) -> list[LwdControlPlane]:
+        """Start one control plane per link; the engine thread owns the
+        senders.
+
+        Each link gets its own plane (own ZMQ context, IO thread and
+        socket), so a stalled peer can only back up its own outbound queue.
+        `dp_ranks` defaults to every cloud DP, which is what a shared edge
+        process serves.
+        """
+        if dp_ranks is None:
+            dp_ranks = list(range(self.lwd_config.cloud_dp_size))
+        # Both sides of a link compare the cloud's DP count: it is the
+        # number of links, and the handshake checks it. A cloud passes its
+        # own vLLM DP size, which the factory also checks against the
+        # topology; an edge has no such local value (its own DP size is
+        # always 1) and takes the count from the topology.
+        link_dp_size = (
+            self._lwd_dp_size
+            if self.lwd_config.role == "cloud"
+            else self.lwd_config.cloud_dp_size
+        )
+        for dp_rank in dp_ranks:
+            plane = lwd_create_control_plane(
+                self.lwd_config, dp_rank, link_dp_size
+            )
+            self._lwd_control_planes.append(plane)
+            self._lwd_senders.append(plane.start(_LwdEngineListener(self)))
+            lwd_logger.info(
+                "[comm] control plane dp%d/%d started on %s",
+                dp_rank,
+                self._lwd_dp_size,
+                plane.endpoint,
+            )
+        return self._lwd_control_planes
+
+    def _lwd_send(self, peer: LwdPeer, message: LwdMessage, link: int = 0) -> bool:
+        """Queue `message` for `peer` on `link`; False when its outbound
+        queue is full."""
+        assert self._lwd_senders, "control plane not started"
+        return self._lwd_senders[link].send(peer, lwd_encode_message(message))
 
     def _lwd_fail(self, reason: str) -> None:
         """Any thread: fail the engine on the engine thread, where
@@ -197,7 +234,7 @@ class LwdBaseEngineCore(EngineCoreProc):
         return any(state)
 
     def shutdown(self) -> None:
-        # Also reached after a failed assembly, before the plane exists.
-        if self._lwd_control_plane is not None:
-            self._lwd_control_plane.shutdown()
+        # Also reached after a failed assembly, before any plane exists.
+        for plane in self._lwd_control_planes:
+            plane.shutdown()
         super().shutdown()

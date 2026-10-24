@@ -1317,13 +1317,33 @@ class EngineCoreProc(EngineCore):
 
             parallel_config.data_parallel_index = dp_rank
             if data_parallel and vllm_config.model_config.is_moe:
-                if vllm_config.lwd_config is not None:
-                    raise NotImplementedError(
-                        "[LWD] MoE models with data parallelism are not supported"
-                    )
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
-                engine_core = DPEngineCoreProc(*args, **kwargs)
+                lwd = vllm_config.lwd_config
+                if lwd is not None:
+                    # LWD cloud DPs are MoE DP ranks: their experts shard
+                    # over DP x TP, so every rank must reach the same
+                    # all2all each step. That lockstep is DPEngineCoreProc's
+                    # wave machinery, which the LWD engine pairs with its
+                    # own seams. No engine_index here: DPEngineCoreProc
+                    # derives it from data_parallel_rank and takes no such
+                    # keyword.
+                    if lwd.role != "cloud":
+                        raise NotImplementedError(
+                            "[LWD] only the cloud runs several DPs; the edge "
+                            "is one process serving every cloud DP"
+                        )
+                    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (  # noqa: E501
+                        LwdCloudDPEngineCore,
+                    )
+
+                    engine_core = LwdCloudDPEngineCore(
+                        *args,
+                        lwd_dp_size=parallel_config.data_parallel_size,
+                        **kwargs,
+                    )
+                else:
+                    engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect

@@ -2364,14 +2364,18 @@ def _lwd_initialize_model_parallel(
     _PP = init_model_parallel_group(
         singleton_groups, local_rank, backend, group_name="pp"
     )
-    # Non-MoE DP ranks run as independent engines, and MoE with DP is
-    # rejected before the engine starts, so no DP group spans several ranks.
-    _DP = init_model_parallel_group(
-        singleton_groups, local_rank, backend, group_name="dp"
-    )
+    # A DP group joins the replicas of one TP position, so that MoE experts
+    # shard over DP x TP as they do in a centralized deployment. At one DP
+    # every group is a singleton, as a centralized pp=1 deployment has.
+    dp_groups = [list(group) for group in spec.dp_groups]
+    _DP = init_model_parallel_group(dp_groups, local_rank, backend, group_name="dp")
     if vllm_config.model_config is None or vllm_config.model_config.is_moe:
+        # The MoE all2all rides the EP group, so it spans the whole instance:
+        # an EP group per TP group would route each token to the experts of
+        # one DP replica only, which produces garbage rather than an error.
+        ep_groups = [list(group) for group in spec.ep_groups]
         _EP = init_model_parallel_group(
-            tp_groups,
+            ep_groups,
             local_rank,
             backend,
             group_name="ep",
@@ -2379,13 +2383,16 @@ def _lwd_initialize_model_parallel(
         )
         if parallel_config.enable_eplb:
             _EPLB = init_model_parallel_group(
-                tp_groups, local_rank, backend, group_name="eplb"
+                ep_groups, local_rank, backend, group_name="eplb"
             )
     logger.info(
-        "[LWD] rank %d in world size %d: TP group %s, data-plane channels %s",
+        "[LWD] rank %d in world size %d: TP group %s, DP group %s, EP group %s, "
+        "data-plane channels %s",
         rank,
         world_size,
         list(tp_group),
+        spec.dp_group_of(rank),
+        spec.ep_group_of(rank),
         spec.channel_endpoints_of(rank),
     )
 

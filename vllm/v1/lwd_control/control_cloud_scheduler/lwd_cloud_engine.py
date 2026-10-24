@@ -18,7 +18,7 @@ import torch
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.engine.core import EngineShutdownState
+from vllm.v1.engine.core import DPEngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
@@ -374,3 +374,33 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 self._lwd_send_until_queued(self._lwd_edge, notify)
             self.scheduler.pending_c2e.clear()
         super().post_step(model_executed)
+
+
+class LwdCloudDPEngineCore(LwdCloudEngineCore, DPEngineCoreProc):
+    """Cloud PO engine of one DP rank among several.
+
+    The LWD seams come first in the MRO and every one of them delegates
+    through ``super()``, so they layer onto the DP implementations rather
+    than replacing them: the wave state machine, dummy batches, request
+    counts and ``START_DP_WAVE`` handling all stay DPEngineCoreProc's.
+
+    Why DP needs its own engine at all: at DP > 1 the experts shard over
+    DP x TP, so every rank has to reach the same MoE all2all on every step.
+    An idle rank keeps that appointment by running a dummy batch, which is
+    exactly what the wave machinery drives.
+    """
+
+    def add_request(self, request: Request, request_wave: int = 0) -> None:
+        """Enter a request on the current wave, not wave 0.
+
+        LWD requests do not come from the vLLM frontend -- the ingest thread
+        injects them straight from the edge's notify -- so nothing has
+        stamped them with a wave. Leaving the default 0 makes
+        ``DPEngineCoreProc.add_request`` see ``request_wave == current_wave``
+        on the very first wave and skip notifying the coordinator; the other
+        ranks then stay blocked on their input queue while this one walks
+        into the DP all-reduce alone, and the step deadlocks. Later waves
+        happen to recover (0 < current_wave takes the wake path), so the
+        symptom is "the first request of a fresh engine hangs".
+        """
+        super().add_request(request, self.current_wave)

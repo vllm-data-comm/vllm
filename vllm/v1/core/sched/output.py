@@ -90,8 +90,13 @@ class LwdBatch:
     """LWD prefill_only mode batch dispatched by the scheduler."""
 
     batch_type: LwdBatchType
-    seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
+    # Unique per (dp_idx, direction), increasing by 1 on every dispatch:
+    # each DP connection is its own data-plane FIFO with its own counter.
+    seqno: int
     batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
+    # Cloud DP connection this batch belongs to. Together with seqno it
+    # addresses the data-plane channel; one batch never spans two DPs.
+    dp_idx: int = 0
 
 
 @dataclass

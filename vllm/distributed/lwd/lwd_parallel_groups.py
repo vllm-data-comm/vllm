@@ -7,7 +7,6 @@ Design: docs/design/lwd_data_plane.md.
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -30,6 +29,7 @@ _LWD_ENGRAM_ARCHITECTURES = ("DeepseekV41ForCausalLM",)
 class LwdChannelEndpoints:
     """Global ranks that hold the data-plane channels of one DP connection."""
 
+    dp_idx: int
     edge_rank: int
     cloud_rank: int
 
@@ -39,9 +39,13 @@ class LwdParallelGroupsSpec:
     """Rank groups that every process of the shared world builds.
 
     Each edge instance and each cloud DP runs like a centralized pp=1
-    deployment on its own ranks: its TP group is its rank allocation and all
-    other model-parallel groups are singletons. Each DP connection adds one
-    edge-cloud rank pair for the data-plane channels.
+    deployment on its own ranks: its TP group is its rank allocation, and the
+    PP, DCP and PCP groups are singletons. An instance whose DPs span several
+    rank allocations adds two groups that span them: the DP group joins the
+    replicas of one TP position, and the EP group covers the whole instance,
+    so that experts shard over DP x TP as they do in a centralized
+    deployment. Each DP connection adds one edge-cloud rank pair for the
+    data-plane channels.
 
     Built by `from_topology`; every process derives the same spec from the
     same topology, so group creation (a world collective) runs in the same
@@ -51,6 +55,18 @@ class LwdParallelGroupsSpec:
     world_size: int
     tp_groups: tuple[LwdRankGroup, ...]
     """One group per edge instance DP and cloud instance DP, by first rank."""
+    dp_groups: tuple[LwdRankGroup, ...]
+    """One group per TP position of an instance, joining its DP replicas.
+
+    Covers every rank: a DP of its own is a singleton. Sorted by first rank.
+    """
+    ep_groups: tuple[LwdRankGroup, ...]
+    """One group per instance, over all of its ranks, by first rank.
+
+    The MoE all2all rides this group, so it has to span the DP replicas that
+    hold the other expert shards. Ascend builds its MC2 group over the same
+    ranks.
+    """
     channel_endpoints: tuple[LwdChannelEndpoints, ...]
     """One pair per DP connection, by edge rank."""
 
@@ -59,22 +75,18 @@ class LwdParallelGroupsSpec:
         """Derive the groups, or raise before any process creates one.
 
         Raises:
-            NotImplementedError: A rank is shared by several DPs, or holds the
-                channels of several DP connections.
+            NotImplementedError: A rank is shared by several DPs of different
+                instances.
         """
-        # 1. A DP's ranks are its TP group; one rank is one process, so reject sharing.
-        allocations = [
-            dp.ranks
+        instances = [
+            (instance, [dp.ranks for dp in instance.dp])
             for instance in (*topology.edges, *topology.clouds)
-            for dp in instance.dp
         ]
-        if len(set(allocations)) != len(allocations):
-            # TODO(lwd): host shared edge ranks once each DP connection gets
-            # its own communication domain instead of one shared world.
-            raise NotImplementedError(
-                "[LWD] DPs sharing ranks cannot run in one shared HCCL world "
-                f"(scene={topology.deployment.scene}): one rank is one process"
-            )
+        # 1. A DP's ranks are its TP group. Edge DPs of one instance share an
+        #    allocation (one edge process serves every cloud DP), so only
+        #    count each allocation once; `_validate_ranks` already rejects
+        #    allocations overlapping across instances.
+        allocations = sorted({ranks for _, group in instances for ranks in group})
         # 2. Endpoints are the first ranks; the cloud one broadcasts to its TP group.
         connections = [
             connection
@@ -84,30 +96,31 @@ class LwdParallelGroupsSpec:
         channel_endpoints = sorted(
             (
                 LwdChannelEndpoints(
-                    connection.edge.ranks[0], connection.cloud_leader_rank
+                    connection.dp_idx,
+                    connection.edge.ranks[0],
+                    connection.cloud_leader_rank,
                 )
                 for connection in connections
             ),
             key=lambda endpoints: (endpoints.edge_rank, endpoints.cloud_rank),
         )
-        # 3. One UP/DOWN pair per rank, so reject ranks in several connections.
-        endpoint_uses = Counter(
-            rank
-            for endpoints in channel_endpoints
-            for rank in (endpoints.edge_rank, endpoints.cloud_rank)
-        )
-        overloaded = sorted(rank for rank, uses in endpoint_uses.items() if uses > 1)
-        if overloaded:
-            # TODO(lwd): key the data-plane channels by DP connection.
-            raise NotImplementedError(
-                f"[LWD] ranks {overloaded} hold the channels of several DP "
-                "connections; the data plane supports one per rank "
-                f"(scene={topology.deployment.scene})"
+        # 3. DP groups join the replicas of one TP position; EP groups span a
+        #    whole instance. Both are singletons at one DP, which is what the
+        #    native groups are in a centralized pp=1 deployment.
+        dp_groups: list[LwdRankGroup] = []
+        ep_groups: list[LwdRankGroup] = []
+        for _, group in instances:
+            distinct = sorted(set(group))
+            ep_groups.append(
+                tuple(sorted(rank for ranks in distinct for rank in ranks))
             )
+            dp_groups.extend(tuple(sorted(replicas)) for replicas in zip(*distinct))
         # 4. Sorted groups make every process create them in the same order.
         return cls(
             world_size=topology.deployment.hccl_world_size,
-            tp_groups=tuple(sorted(allocations)),
+            tp_groups=tuple(allocations),
+            dp_groups=tuple(sorted(dp_groups)),
+            ep_groups=tuple(sorted(ep_groups)),
             channel_endpoints=tuple(channel_endpoints),
         )
 
@@ -116,17 +129,34 @@ class LwdParallelGroupsSpec:
         return tuple((rank,) for rank in range(self.world_size))
 
     def tp_group_of(self, rank: int) -> LwdRankGroup:
-        for group in self.tp_groups:
+        return self._group_of(self.tp_groups, rank, "TP")
+
+    def dp_group_of(self, rank: int) -> LwdRankGroup:
+        return self._group_of(self.dp_groups, rank, "DP")
+
+    def ep_group_of(self, rank: int) -> LwdRankGroup:
+        return self._group_of(self.ep_groups, rank, "EP")
+
+    def _group_of(
+        self, groups: tuple[LwdRankGroup, ...], rank: int, kind: str
+    ) -> LwdRankGroup:
+        for group in groups:
             if rank in group:
                 return group
-        raise ValueError(f"[LWD] rank {rank} is not in [0, {self.world_size})")
+        raise ValueError(
+            f"[LWD] rank {rank} is in no {kind} group of [0, {self.world_size})"
+        )
 
-    def channel_endpoints_of(self, rank: int) -> LwdChannelEndpoints | None:
-        """The channel pair this rank holds; None for non-endpoint ranks."""
-        for endpoints in self.channel_endpoints:
-            if rank in (endpoints.edge_rank, endpoints.cloud_rank):
-                return endpoints
-        return None
+    def channel_endpoints_of(self, rank: int) -> tuple[LwdChannelEndpoints, ...]:
+        """The channel pairs this rank holds, by DP index; empty for none.
+
+        A shared edge rank holds one pair per cloud DP it serves.
+        """
+        return tuple(
+            endpoints
+            for endpoints in self.channel_endpoints
+            if rank in (endpoints.edge_rank, endpoints.cloud_rank)
+        )
 
 
 def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
