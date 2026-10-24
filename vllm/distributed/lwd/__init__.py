@@ -7,6 +7,7 @@ from .lwd_parallel_groups import (
     LwdParallelGroupsSpec,
     LwdRankGroup,
     lwd_check_parallel_config,
+    lwd_set_dp_master_ip,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "LwdParallelGroupsSpec",
     "LwdRankGroup",
     "lwd_check_parallel_config",
+    "lwd_set_dp_master_ip",
 ]

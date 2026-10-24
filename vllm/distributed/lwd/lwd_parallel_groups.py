@@ -159,6 +159,39 @@ class LwdParallelGroupsSpec:
         )
 
 
+def lwd_set_dp_master_ip(vllm_config: VllmConfig) -> None:
+    """Point the data parallel rendezvous of this instance at its own host.
+
+    `master_addr` must name global rank 0, which is an edge rank: it hosts
+    the store of the shared HCCL world. Upstream derives
+    `data_parallel_master_ip` from it as well (`create_engine_config`), so
+    a cloud left alone rendezvouses its DP group on the edge host, where
+    nothing listens. The failure is silent: DP rank 0 binds its store on
+    every interface and looks healthy, the other ranks block connecting,
+    and no worker is ever spawned, so the HCCL world never fills and the
+    edge waits on rank 0 forever. DP rank 0 of this instance hosts the
+    group, and the topology knows its address.
+    """
+    lwd_config = vllm_config.lwd_config
+    assert lwd_config is not None
+    parallel_config = vllm_config.parallel_config
+    # At one DP no group is built and the address goes unused; leaving it
+    # alone keeps single-DP deployments byte-identical.
+    if parallel_config.data_parallel_size == 1:
+        return
+    dp_master_ip = lwd_config.instance.dp[0].addr
+    if parallel_config.data_parallel_master_ip == dp_master_ip:
+        return
+    logger.info(
+        "[LWD] data parallel master ip %s -> %s (master_addr %s is global "
+        "rank 0, on the edge)",
+        parallel_config.data_parallel_master_ip,
+        dp_master_ip,
+        parallel_config.master_addr,
+    )
+    parallel_config.data_parallel_master_ip = dp_master_ip
+
+
 def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     """Reject at config time what the shared HCCL world cannot host.
 

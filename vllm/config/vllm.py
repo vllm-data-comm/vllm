@@ -1287,8 +1287,12 @@ class VllmConfig:
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
         if self.lwd_config is not None:
-            from vllm.distributed.lwd import lwd_check_parallel_config
+            from vllm.distributed.lwd import (
+                lwd_check_parallel_config,
+                lwd_set_dp_master_ip,
+            )
 
+            lwd_set_dp_master_ip(self)
             lwd_check_parallel_config(self)
 
         if self.model_config is not None:
