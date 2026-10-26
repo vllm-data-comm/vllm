@@ -45,7 +45,7 @@ flowchart LR
 | --- | --- |
 | world | `[0, 1, 2, 3, 4, 5]` |
 | TP / EP / MC2 | `[0, 1]`, `[2, 3, 4, 5]` |
-| PP / DCP / PCP / DP | `[0]`, `[1]`, ..., `[5]` |
+| PP / DCP / PCP / DP / Engram DP | `[0]`, `[1]`, ..., `[5]` |
 | UP, DOWN | `[0, 2]` |
 
 Group creation is a world collective, so every process derives the same `LwdParallelGroupsSpec` from the same topology and creates the groups in the same order: the vLLM groups in `initialize_model_parallel`, then the Ascend groups in `init_ascend_model_parallel`, then the channel groups in `lwd_init_channels`. Configs the data plane cannot host (an unsupported topology or parallel feature, or a tensor parallel size other than the DP rank count) are rejected by `lwd_check_parallel_config` in `VllmConfig.__post_init__`; the edge and the cloud read the same topology, so both fail at startup, before any worker joins the world.
@@ -64,6 +64,8 @@ The old branch built a `[edge0, cloud0]` PP group with `pipeline_parallel_size=2
 | `cloud_share`, `lwd_cluster` | Rejected | A cloud DP would serve several edges, which its handshake and request ledger do not separate |
 
 Several cloud DPs is what lets MoE experts shard over DP x TP: at EP = TP alone, a model whose experts do not fit in one TP group's memory cannot be served at all.
+
+The Engram group is the DP group, since the DP replicas of an instance are co-located by topology. It is built unconditionally, unlike the native path's `engram_config is not None`: only the cloud has an Engram config, and a group the cloud creates while the edge does not deadlocks the world collective. Over several DPs the table has to be shared (`dp_shared_memory`), not split: splitting puts it over `TP x DP` shards while the hash columns stay fixed, which the table rejects for uneven heads. Sharing also keeps the driver's pinned pool, which hosts the offloaded tables and runs out well before host memory, from holding a copy per DP.
 
 TODO(lwd): give each DP connection its own communication domain, built from rendezvous information exchanged over the control plane, instead of one world shared by every instance. That decouples the lifecycles of the edge and the cloud.
 

@@ -202,7 +202,8 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         NotImplementedError: A parallel feature, the topology or the Engram
             placement is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance, or the edge model kept n-gram layers.
+            of the local instance, the edge model kept n-gram layers, or
+            several DPs serve Engram without sharing one table.
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
@@ -222,10 +223,6 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
             ),
             ("elastic EP", parallel_config.enable_elastic_ep),
             (
-                "Engram dp_shared_memory",
-                engram_config is not None and engram_config.dp_shared_memory,
-            ),
-            (
                 "Engram embedding_across_dp",
                 engram_config is not None and engram_config.embedding_across_dp,
             ),
@@ -237,6 +234,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
             f"[LWD] not supported in edge-cloud mode: {', '.join(unsupported)}"
         )
     _lwd_check_engram_layers(vllm_config)
+    _lwd_check_engram_sharing(vllm_config)
     # Raises for topologies the shared HCCL world cannot host.
     LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     # The topology gives every DP of an instance the same rank count.
@@ -247,6 +245,41 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
             f"!= {len(dp_ranks)} ranks per DP of {lwd_config.role} instance "
             f"{lwd_config.instance_id}"
         )
+
+
+def _lwd_check_engram_sharing(vllm_config: VllmConfig) -> None:
+    """Several DPs hold their Engram tables by sharing one, not by splitting.
+
+    The Engram group is the DP group, so an unshared table splits over
+    `TP x DP` shards while the hash columns stay fixed: at 4 DPs of 4 ranks
+    that is 16 shards of 24 columns, which the table rejects for uneven
+    heads. Sharing keeps the split at TP and maps one host copy per node,
+    which also keeps the driver's pinned pool from holding a copy per DP --
+    the pool, not host memory, is what runs out first.
+
+    Reads the model, like `_lwd_check_engram_layers`, and demands the flag
+    be set explicitly: a platform may resolve the Engram config after this
+    check (Ascend does, in `check_and_update_config`), so an absent config
+    here is one about to be defaulted with sharing off, not one that will
+    stay absent.
+
+    Raises:
+        ValueError: Several DPs serve Engram without `dp_shared_memory`.
+    """
+    if vllm_config.parallel_config.data_parallel_size == 1:
+        return
+    model_config = vllm_config.model_config
+    if model_config is None or not model_has_engram_layers(model_config):
+        return
+    engram_config = vllm_config.engram_config
+    if engram_config is not None and engram_config.dp_shared_memory:
+        return
+    raise ValueError(
+        "[LWD] serving Engram over several DPs needs "
+        "--engram-config '{\"cpu_offload\":true,\"dp_shared_memory\":true}': "
+        "the DP replicas share one host table instead of splitting it over "
+        "tensor parallel x data parallel shards"
+    )
 
 
 def _lwd_check_engram_layers(vllm_config: VllmConfig) -> None:

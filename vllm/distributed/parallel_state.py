@@ -2337,7 +2337,7 @@ def _lwd_initialize_model_parallel(
             f"{len(tp_group)} ranks {list(tp_group)} of rank {rank} in the topology"
         )
 
-    global _TP, _ETP, _DCP, _PCP, _PP, _DP, _EP, _EPLB
+    global _TP, _ETP, _DCP, _PCP, _PP, _DP, _EP, _EPLB, _ENGRAM_DP
     assert _TP is None, "tensor model parallel group is already initialized"
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     local_rank = get_world_group().local_rank
@@ -2369,6 +2369,21 @@ def _lwd_initialize_model_parallel(
     # every group is a singleton, as a centralized pp=1 deployment has.
     dp_groups = [list(group) for group in spec.dp_groups]
     _DP = init_model_parallel_group(dp_groups, local_rank, backend, group_name="dp")
+    # The Engram group is the DP group: an instance's DP replicas are
+    # co-located by topology, which is what a node-local Engram group is. It
+    # carries `dp_shared_memory`, letting the replicas map one host table
+    # instead of one each -- the tables live in the driver's pinned pool, so
+    # a cloud without it needs that pool to hold a copy per DP.
+    #
+    # Built unconditionally, unlike the native path's `engram_config is not
+    # None`: group creation is a world collective, and only the cloud has an
+    # Engram config. Deciding per side would have the cloud create a group the
+    # edge never joins, which deadlocks before any error surfaces. Groups of
+    # a model without Engram layers cost a communicator nobody uses.
+    assert _ENGRAM_DP is None, "engram data parallel group is already initialized"
+    _ENGRAM_DP = init_model_parallel_group(
+        dp_groups, local_rank, backend, group_name="edp"
+    )
     if vllm_config.model_config is None or vllm_config.model_config.is_moe:
         # The MoE all2all rides the EP group, so it spans the whole instance:
         # an EP group per TP group would route each token to the experts of
@@ -2385,13 +2400,15 @@ def _lwd_initialize_model_parallel(
             _EPLB = init_model_parallel_group(
                 ep_groups, local_rank, backend, group_name="eplb"
             )
+    engram_config = vllm_config.engram_config
     logger.info(
-        "[LWD] rank %d in world size %d: TP group %s, DP group %s, EP group %s, "
-        "data-plane channels %s",
+        "[LWD] rank %d in world size %d: TP group %s, DP group %s (also the "
+        "Engram group, shared=%s), EP group %s, data-plane channels %s",
         rank,
         world_size,
         list(tp_group),
         spec.dp_group_of(rank),
+        engram_config is not None and engram_config.dp_shared_memory,
         spec.ep_group_of(rank),
         spec.channel_endpoints_of(rank),
     )
