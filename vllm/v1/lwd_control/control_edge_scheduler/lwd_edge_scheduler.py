@@ -105,6 +105,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_request_dp: dict[str, int] = {}
         # Round-robin tie-break cursor for routing.
         self._lwd_route_cursor: int = 0
+        # Seat ledger at the last log; None = never logged.
+        self._lwd_last_fleet_seats: tuple[int, ...] | None = None
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -203,6 +205,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
         )
+        self._lwd_log_fleet_seats()
         out = self._lwd_schedule_embed()
         if out is not None:
             return out
@@ -238,25 +241,71 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_log_gate_open(dp_idx)
             return True
         pending_chunks = len(self._lwd_pending_batches[dp_idx])
+        # Seat count is per cloud DP: each one runs its own scheduler and
+        # KV pool sized by the max_num_seqs both sides agreed on at the
+        # handshake, so only the requests routed here occupy its seats.
+        # Counting the whole fleet against one DP's limit closes all the
+        # gates at once as soon as the fleet total reaches a single DP's
+        # cap, which pins throughput at 1/N of the deployment.
+        inflight = self._lwd_engine_inflight(dp_idx)
         if (
-            len(self.running) >= self.max_num_running_reqs
+            inflight >= self.max_num_running_reqs
             or pending_chunks >= _LWD_MAX_PENDING_CHUNKS
             or not self._lwd_has_waiting_for_dp(dp_idx)
         ):
-            if (
-                pending_chunks >= _LWD_MAX_PENDING_CHUNKS
-                and not self._lwd_prefill_gate_held[dp_idx]
-            ):
+            held_reason = (
+                "pending_chunks"
+                if pending_chunks >= _LWD_MAX_PENDING_CHUNKS
+                else "seats"
+                if inflight >= self.max_num_running_reqs
+                else None
+            )
+            if held_reason is not None and not self._lwd_prefill_gate_held[dp_idx]:
                 self._lwd_prefill_gate_held[dp_idx] = True
                 lwd_logger.info(
-                    "[edge-sched] prefill gate HOLD dp=%d: pending_chunks=%d >= %d",
+                    "[edge-sched] prefill gate HOLD dp=%d on %s: "
+                    "inflight=%d/%d pending_chunks=%d/%d",
                     dp_idx,
+                    held_reason,
+                    inflight,
+                    self.max_num_running_reqs,
                     pending_chunks,
                     _LWD_MAX_PENDING_CHUNKS,
                 )
             return False
         self._lwd_log_gate_open(dp_idx)
         return True
+
+    def _lwd_log_fleet_seats(self) -> None:
+        """Log the fleet's seat ledger whenever it changes.
+
+        One line answers the question the per-DP accounting exists for:
+        are the cloud DPs actually filling up in parallel, or is the fleet
+        pinned at one DP's worth of concurrency? Logged on change rather
+        than per step -- a step is milliseconds."""
+        seats = tuple(
+            self._lwd_engine_inflight(dp_idx)
+            for dp_idx in range(self._lwd_cloud_dp_size)
+        )
+        if seats == self._lwd_last_fleet_seats:
+            return
+        self._lwd_last_fleet_seats = seats
+        lwd_logger.info(
+            "[edge-sched] fleet seats %s of %d per dp, waiting=%d",
+            list(seats),
+            self.max_num_running_reqs,
+            len(self.waiting) + len(self.skipped_waiting),
+        )
+
+    def _lwd_engine_inflight(self, dp_idx: int) -> int:
+        """Requests this cloud DP is holding: everything routed to it that
+        the edge has not yet retired. Same ledger the picker's `free_seq`
+        reads, so the gate and the batch size cannot disagree."""
+        return sum(
+            1
+            for request in self.running
+            if self._lwd_request_dp.get(request.request_id) == dp_idx
+        )
 
     def _lwd_has_waiting_for_dp(self, dp_idx: int) -> bool:
         """Whether any queued request is routed to this cloud DP."""
@@ -270,7 +319,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Gate open transition logging (HOLD -> OPEN logged only once)."""
         if self._lwd_prefill_gate_held[dp_idx]:
             self._lwd_prefill_gate_held[dp_idx] = False
-            lwd_logger.info("[edge-sched] prefill gate OPEN dp=%d", dp_idx)
+            lwd_logger.info(
+                "[edge-sched] prefill gate OPEN dp=%d: inflight=%d/%d "
+                "pending_chunks=%d/%d",
+                dp_idx,
+                self._lwd_engine_inflight(dp_idx),
+                self.max_num_running_reqs,
+                len(self._lwd_pending_batches[dp_idx]),
+                _LWD_MAX_PENDING_CHUNKS,
+            )
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
         """Chunked batch + budget clamp + RangeNotify, then the EMBED batch
@@ -462,11 +519,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         budget. Charging all DPs' in-flight requests against one DP's
         budget would starve the fleet as the DP count grows.
         """
-        inflight = sum(
-            1
-            for r in self.running
-            if self._lwd_request_dp.get(r.request_id) == dp_idx
-        )
+        inflight = self._lwd_engine_inflight(dp_idx)
         cap = self.max_num_scheduled_tokens - inflight * self._lwd_inflight_reservation
         free_seq = self.max_num_running_reqs - inflight
         # Resume candidates take only the prefill phase (decode-phase
@@ -506,9 +559,24 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         the base-class visible-set mechanism (budget clamped to the picked
         chunk total -- the picker's cap also covers the cloud's drafting
         slots, which the edge's native budget does not charge -- so the
-        chunk split is reproduced natively)."""
+        chunk split is reproduced natively).
+
+        Only this DP's hidden requests are charged against the seat
+        budget: the batch goes to one cloud DP, and `max_num_seqs` is that
+        DP's own limit."""
         req_ids, expected = self._lwd_pick_prefill_batch(dp_idx)
-        return self._lwd_schedule(req_ids, token_budget_cap=sum(expected.values()))
+        picked = set(req_ids)
+        hidden_seats = sum(
+            1
+            for request in self.running
+            if request.request_id not in picked
+            and self._lwd_request_dp.get(request.request_id) == dp_idx
+        )
+        return self._lwd_schedule(
+            req_ids,
+            token_budget_cap=sum(expected.values()),
+            hidden_seats=hidden_seats,
+        )
 
     def _try_schedule_encoder_inputs(
         self,

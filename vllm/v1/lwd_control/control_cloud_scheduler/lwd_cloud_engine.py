@@ -17,7 +17,8 @@ import torch
 
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
@@ -391,16 +392,38 @@ class LwdCloudDPEngineCore(LwdCloudEngineCore, DPEngineCoreProc):
     """
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
-        """Enter a request on the current wave, not wave 0.
+        """Enter the request and wake the fleet if it was idle.
 
-        LWD requests do not come from the vLLM frontend -- the ingest thread
-        injects them straight from the edge's notify -- so nothing has
-        stamped them with a wave. Leaving the default 0 makes
-        ``DPEngineCoreProc.add_request`` see ``request_wave == current_wave``
-        on the very first wave and skip notifying the coordinator; the other
-        ranks then stay blocked on their input queue while this one walks
-        into the DP all-reduce alone, and the step deadlocks. Later waves
-        happen to recover (0 < current_wave takes the wake path), so the
-        symptom is "the first request of a fresh engine hangs".
+        LWD requests do not come from the vLLM frontend -- the ingest
+        thread injects them straight from the edge's notify -- so nothing
+        stamps them with a wave, and `DPEngineCoreProc.add_request`'s wake
+        path is keyed entirely on `request_wave != current_wave`. Whatever
+        value is passed, that path cannot serve LWD: the default 0 misses
+        the very first wave, and `current_wave` misses every wave. Once
+        every rank has gone idle, `engines_running` is False and the other
+        ranks block on `input_queue.get`; the rank that took the request
+        would then walk into the DP all-reduce alone and deadlock.
+
+        So drive the wake directly: mark this engine running and publish
+        `start_wave` to the coordinator, which broadcasts START_DP_WAVE to
+        the rest. Only when the fleet is actually idle -- a wake published
+        mid-wave would be a stale-wave notification for a wave already
+        running.
         """
-        super().add_request(request, self.current_wave)
+        super().add_request(request, request_wave)
+        if not self.has_coordinator:
+            # Nobody to broadcast START_DP_WAVE; the ranks stay in lockstep
+            # through the all-reduce alone.
+            return
+        if self.engines_running or self.scheduler.pause_state != PauseState.UNPAUSED:
+            return
+        self.engines_running = True
+        self.output_queue.put_nowait(
+            (-1, EngineCoreOutputs(start_wave=self.current_wave))
+        )
+        lwd_logger.info(
+            "[cloud] dp=%d wakes the fleet for wave %d on req=%s",
+            self.dp_rank,
+            self.current_wave,
+            request.request_id,
+        )
