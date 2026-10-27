@@ -551,6 +551,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """
         self._lwd_request_metadata_layout.validate(notify)
         metadata = LwdRequestMetadata.from_notify(notify)
+        # Paired with the edge's "[engram] edge tail" line; diffing the two
+        # separates a control-plane transport fault from a hashing one.
+        lwd_logger.info(
+            "[engram] cloud tail req=%s prompt=%d ids=%s dead=%s spans=%s",
+            notify.request_id,
+            notify.num_prompt_tokens,
+            metadata.engram_tail_compressed_ids,
+            metadata.engram_tail_dead,
+            metadata.image_placeholder_spans,
+        )
         if not metadata.is_empty():
             self._lwd_request_metadata[notify.request_id] = metadata
 

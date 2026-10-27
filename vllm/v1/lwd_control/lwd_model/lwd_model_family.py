@@ -301,9 +301,20 @@ class LwdDeepseekV41ModelFamily(LwdModelFamily):
         # TODO(lwd): send tail products instead of compressed ids once the
         # Ascend hash kernel consumes them (design doc 3.1.5)
         compressed_ids, dead = self._engram_hasher.tail_compressed_ids(prompt)
+        tail_ids = compressed_ids.tolist()
+        tail_dead = dead.tolist()
+        # Paired with the cloud's "[engram] cloud tail" line: the two have to
+        # read the same, or the look-back window lands on wrong table rows.
+        lwd_logger.info(
+            "[engram] edge tail req=%s prompt=%d ids=%s dead=%s",
+            request.request_id,
+            prompt.numel(),
+            tail_ids,
+            tail_dead,
+        )
         return LwdRequestMetadata(
-            engram_tail_compressed_ids=compressed_ids.tolist(),
-            engram_tail_dead=dead.tolist(),
+            engram_tail_compressed_ids=tail_ids,
+            engram_tail_dead=tail_dead,
             image_placeholder_spans=spans,
         )
 
