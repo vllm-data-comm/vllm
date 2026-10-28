@@ -2369,11 +2369,10 @@ def _lwd_initialize_model_parallel(
     # every group is a singleton, as a centralized pp=1 deployment has.
     dp_groups = [list(group) for group in spec.dp_groups]
     _DP = init_model_parallel_group(dp_groups, local_rank, backend, group_name="dp")
-    # The Engram group is the DP group: an instance's DP replicas are
-    # co-located by topology, which is what a node-local Engram group is. It
-    # carries `dp_shared_memory`, letting the replicas map one host table
-    # instead of one each -- the tables live in the driver's pinned pool, so
-    # a cloud without it needs that pool to hold a copy per DP.
+    # The Engram group is the host-local part of the DP group: co-located
+    # replicas map one host table instead of one each, which keeps the
+    # driver's pinned pool from holding a copy per replica. One replica per
+    # host makes it a singleton, the table then being split by TP alone.
     #
     # Built unconditionally, unlike the native path's `engram_config is not
     # None`: group creation is a world collective, and only the cloud has an
@@ -2382,7 +2381,10 @@ def _lwd_initialize_model_parallel(
     # a model without Engram layers cost a communicator nobody uses.
     assert _ENGRAM_DP is None, "engram data parallel group is already initialized"
     _ENGRAM_DP = init_model_parallel_group(
-        dp_groups, local_rank, backend, group_name="edp"
+        [list(group) for group in spec.engram_dp_groups],
+        local_rank,
+        backend,
+        group_name="edp",
     )
     if vllm_config.model_config is None or vllm_config.model_config.is_moe:
         # The MoE all2all rides the EP group, so it spans the whole instance:
@@ -2402,12 +2404,13 @@ def _lwd_initialize_model_parallel(
             )
     engram_config = vllm_config.engram_config
     logger.info(
-        "[LWD] rank %d in world size %d: TP group %s, DP group %s (also the "
-        "Engram group, shared=%s), EP group %s, data-plane channels %s",
+        "[LWD] rank %d in world size %d: TP group %s, DP group %s, Engram "
+        "group %s (shared=%s), EP group %s, data-plane channels %s",
         rank,
         world_size,
         list(tp_group),
         spec.dp_group_of(rank),
+        spec.engram_dp_group_of(rank),
         engram_config is not None and engram_config.dp_shared_memory,
         spec.ep_group_of(rank),
         spec.channel_endpoints_of(rank),

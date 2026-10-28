@@ -8,13 +8,20 @@ from vllm.config.lwd import LwdTopology
 from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
 
 
-def _instance(identity: int, ranks: list[list[int]], cloud: bool) -> dict[str, Any]:
+def _instance(
+    identity: int,
+    ranks: list[list[int]],
+    cloud: bool,
+    hosts: list[int] | None = None,
+) -> dict[str, Any]:
+    """`hosts` places DP `i` on host `hosts[i]`; by default all share one."""
+    hosts = hosts or [0] * len(ranks)
     return {
         "id": identity,
         "dp": [
             {
                 "dp_idx": index,
-                "addr": f"10.{int(cloud)}.0.{identity + 1}",
+                "addr": f"10.{int(cloud)}.{hosts[index]}.{identity + 1}",
                 "ranks": group,
                 **({"ctrl_port": 5550 + index} if cloud else {}),
             }
@@ -28,6 +35,7 @@ def _topology(
     edges: list[list[list[int]]],
     clouds: list[list[list[int]]],
     links: list[tuple[int, int]],
+    cloud_hosts: list[int] | None = None,
 ) -> LwdTopology:
     world_size = len(
         {rank for dps in (*edges, *clouds) for ranks in dps for rank in ranks}
@@ -50,7 +58,10 @@ def _topology(
                 },
             },
             "edges": [_instance(i, dps, cloud=False) for i, dps in enumerate(edges)],
-            "clouds": [_instance(i, dps, cloud=True) for i, dps in enumerate(clouds)],
+            "clouds": [
+                _instance(i, dps, cloud=True, hosts=cloud_hosts)
+                for i, dps in enumerate(clouds)
+            ],
             "instance_links": [{"edge": e, "cloud": c} for e, c in links],
         }
     )
@@ -78,6 +89,7 @@ def test_one_dp_keeps_singleton_dp_groups_and_ep_equal_to_tp() -> None:
     )
 
     assert spec.dp_groups == spec.singleton_groups
+    assert spec.engram_dp_groups == spec.singleton_groups
     assert spec.ep_groups == spec.tp_groups
 
 
@@ -101,6 +113,71 @@ def test_several_cloud_dps_span_the_instance_for_ep_and_zip_for_dp() -> None:
         LwdChannelEndpoints(1, 0, 3),
     )
     assert spec.channel_endpoints_of(3) == (LwdChannelEndpoints(1, 0, 3),)
+
+
+def test_co_located_dps_share_one_engram_group() -> None:
+    """DP replicas on one host map a single Engram table, so they form one
+    group -- the placement the pinned-pool copy count depends on."""
+    spec = LwdParallelGroupsSpec.from_topology(
+        _topology("single_instance", [[[0], [0]]], [[[1, 2], [3, 4]]], [(0, 0)])
+    )
+
+    assert spec.engram_dp_groups == spec.dp_groups == ((0,), (1, 3), (2, 4))
+
+
+def test_dps_on_separate_hosts_hold_engram_tables_of_their_own() -> None:
+    """Hosts cannot share memory across the network, so each holds a table
+    split by TP alone: the Engram groups stay singletons while the DP groups
+    still span the hosts."""
+    spec = LwdParallelGroupsSpec.from_topology(
+        _topology(
+            "single_instance",
+            [[[0], [0]]],
+            [[[1, 2], [3, 4]]],
+            [(0, 0)],
+            cloud_hosts=[0, 1],
+        )
+    )
+
+    assert spec.dp_groups == ((0,), (1, 3), (2, 4))
+    assert spec.engram_dp_groups == spec.singleton_groups
+
+
+def test_engram_groups_stop_at_host_boundaries_within_one_instance() -> None:
+    """Two hosts of two replicas each: the DP group spans all four, the
+    Engram group only the pair sharing a host. A single shard size, which is
+    what native derives from rank numbering, cannot express this."""
+    spec = LwdParallelGroupsSpec.from_topology(
+        _topology(
+            "single_instance",
+            [[[0]] * 4],
+            [[[1, 2], [3, 4], [5, 6], [7, 8]]],
+            [(0, 0)],
+            cloud_hosts=[0, 0, 1, 1],
+        )
+    )
+
+    assert spec.dp_groups == ((0,), (1, 3, 5, 7), (2, 4, 6, 8))
+    assert spec.engram_dp_groups == ((0,), (1, 3), (2, 4), (5, 7), (6, 8))
+    assert spec.engram_dp_group_of(5) == (5, 7)
+    assert spec.dp_group_of(5) == (1, 3, 5, 7)
+
+
+def test_every_rank_is_in_exactly_one_engram_group() -> None:
+    """Group creation is a world collective: a rank left out of the Engram
+    groups would block the ranks that build them."""
+    spec = LwdParallelGroupsSpec.from_topology(
+        _topology(
+            "single_instance",
+            [[[0]] * 4],
+            [[[1, 2], [3, 4], [5, 6], [7, 8]]],
+            [(0, 0)],
+            cloud_hosts=[0, 0, 1, 1],
+        )
+    )
+
+    members = sorted(rank for group in spec.engram_dp_groups for rank in group)
+    assert members == list(range(spec.world_size))
 
 
 def test_rank_outside_the_world_has_no_tp_group() -> None:

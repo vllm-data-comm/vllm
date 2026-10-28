@@ -65,7 +65,13 @@ The old branch built a `[edge0, cloud0]` PP group with `pipeline_parallel_size=2
 
 Several cloud DPs is what lets MoE experts shard over DP x TP: at EP = TP alone, a model whose experts do not fit in one TP group's memory cannot be served at all.
 
-The Engram group is the DP group, since the DP replicas of an instance are co-located by topology. It is built unconditionally, unlike the native path's `engram_config is not None`: only the cloud has an Engram config, and a group the cloud creates while the edge does not deadlocks the world collective. Over several DPs the table has to be shared (`dp_shared_memory`), not split: splitting puts it over `TP x DP` shards while the hash columns stay fixed, which the table rejects for uneven heads. Sharing also keeps the driver's pinned pool, which hosts the offloaded tables and runs out well before host memory, from holding a copy per DP.
+The Engram group is the host-local part of the DP group: the replicas of one TP position placed on one host, read off the `addr` of each DP. An Engram table is held by the replicas sharing a host, which map one copy of it rather than one each; replicas on different hosts cannot share memory and so fall in different groups, down to a singleton per rank when each host holds a replica of its own.
+
+Native derives the same grouping from rank numbering, because a centralized deployment has only ranks to go by: `_engram_dp_shard_size` takes the greatest divisor of the DP count that keeps replicas whole within a node, then verifies the node boundaries with `in_the_same_node_as`. A topology names the host of every DP, so the address is the node identity and the grouping is direct — and per host, which a single shard size for the whole deployment cannot express.
+
+The group is built unconditionally, unlike the native path's `engram_config is not None`: only the cloud has an Engram config, and a group the cloud creates while the edge does not deadlocks the world collective.
+
+Replicas that do share a host must also share the table (`dp_shared_memory`) rather than split it: splitting puts it over `TP x Engram DP` shards while the hash columns stay fixed, which the table rejects for uneven heads. Sharing also keeps the driver's pinned pool, which hosts the offloaded tables and runs out well before host memory, from holding a copy per replica. `lwd_check_parallel_config` rejects the unshared case by group size, so a host with a replica of its own needs no flag.
 
 TODO(lwd): give each DP connection its own communication domain, built from rendezvous information exchanged over the control plane, instead of one world shared by every instance. That decouples the lifecycles of the edge and the cloud.
 
