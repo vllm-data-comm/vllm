@@ -68,8 +68,6 @@ class LwdEmbedBatch:
     # Each list is empty or aligned with req_ids; an entry is non-empty
     # only on the request's first chunk (offset 0) and only when it
     # applies, so the runner caches it per request.
-    engram_tail_compressed_ids: list[list[int]] = field(default_factory=list)
-    engram_tail_dead: list[list[bool]] = field(default_factory=list)
     image_placeholder_spans: list[list[int]] = field(default_factory=list)
 
 

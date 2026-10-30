@@ -296,8 +296,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 num_prompt_tokens=request.num_prompt_tokens,
                 block_hashes=list(request.block_hashes),
                 eos_token_id=sampling_params.eos_token_id,
-                engram_tail_compressed_ids=metadata.engram_tail_compressed_ids,
-                engram_tail_dead=metadata.engram_tail_dead,
                 image_placeholder_spans=metadata.image_placeholder_spans,
                 **values,
             )

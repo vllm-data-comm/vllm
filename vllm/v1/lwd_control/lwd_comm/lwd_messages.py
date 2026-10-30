@@ -72,14 +72,6 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
-    engram_tail_compressed_ids: list[int] = []
-    """Engram compressed ids of the prompt tail that the first decode
-    positions look back at, `lookback_depth` entries, tail index `t` being
-    prompt position `P - 1 - t`; 0 for image tokens and positions before the
-    prompt start. Empty without Engram."""
-    engram_tail_dead: list[bool] = []
-    """Per tail index: the tail token is an image token. Empty without
-    Engram."""
     image_placeholder_spans: list[int] = []
     """Flattened `(start, length, token_id)` runs of image placeholder ids in
     the whole prompt, for the cloud to rebuild the ids its image routing

@@ -4,8 +4,11 @@
 
 The cloud holds the Engram tables but no prompt token ids. The edge therefore
 hashes every prompt position into the final bucket indices the cloud looks
-up, and maps the last prompt tokens, which the first decode steps look back
-at, to their compressed ids. Neither carries a token id.
+up, carrying no token id.
+
+The first decode steps look back at the last prompt tokens, which the cloud
+recovers from the embeddings of those positions instead (the cloud's
+`LwdEmbedLookup`); nothing about the tail is hashed or sent here.
 """
 
 import hashlib
@@ -165,32 +168,6 @@ class LwdEngramHasher:
                 rolling[..., None] % self._primes[:, shift - 1] + self._offsets[:, cols]
             )
         return torch.cat(hashes, dim=-1).to(torch.int32)
-
-    def tail_compressed_ids(
-        self, prompt_token_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compressed ids of the prompt tail that decode positions look back at.
-
-        Tail index `t` is prompt position `P - 1 - t`.
-
-        Args:
-            prompt_token_ids: CPU 1-D ids of the full prompt.
-
-        Returns:
-            `(compressed_ids, dead)`: int64 `[lookback_depth]`, 0 for image
-            tokens and positions before the prompt start; bool
-            `[lookback_depth]`, True where the tail token is an image token.
-
-        Raises:
-            ValueError: The prompt is malformed or a token id is outside the
-                vocab.
-        """
-        self._check_prompt(prompt_token_ids)
-        tail = prompt_token_ids.numel() - 1 - torch.arange(self.lookback_depth)
-        present = tail >= 0
-        compressed, image = self._compress(prompt_token_ids[tail.clamp_min(0)])
-        dead = present & image
-        return torch.where(present & ~dead, compressed, 0), dead
 
     def fingerprint(self) -> str:
         """Hex digest of every hash parameter, compared at the handshake."""
