@@ -263,13 +263,15 @@ class LwdDeepseekV41ModelFamily(LwdModelFamily):
             # Paired with the cloud's "[engram] cloud tail" line: the ids the
             # cloud recovers from the tail embeddings have to be these, or its
             # look-back window lands on wrong table rows, which nothing but the
-            # accuracy would show. Listed newest first, as the cloud lists them.
+            # accuracy would show. Listed newest first, as the cloud lists them;
+            # by index rather than a negative step, which a tensor cannot take.
             depth = self._engram_hasher.lookback_depth
+            tail = prompt[max(prompt.numel() - depth, 0) :].tolist()
             lwd_logger.info(
                 "[engram] edge tail req=%s prompt=%d ids=%s",
                 request.request_id,
                 prompt.numel(),
-                prompt[: -depth - 1 : -1].tolist(),
+                tail[::-1],
             )
         return LwdRequestMetadata(image_placeholder_spans=spans)
 
