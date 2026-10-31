@@ -14,7 +14,7 @@ from typing import TypeAlias
 
 import msgspec
 
-LWD_MESSAGE_VERSION = 1
+LWD_MESSAGE_VERSION = 2
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -30,8 +30,8 @@ class LwdRangeItem(msgspec.Struct, gc=False):  # type: ignore[call-arg]
     num_tokens: int
     has_mrope: bool = False
     mrope_positions: bytes = b""
-    """Contiguous int64 [3, num_tokens] M-RoPE positions of the chunk; empty
-    when unused. `has_mrope` with empty bytes is a protocol error."""
+    """Legacy per-chunk positions; empty on the current protocol path. Full
+    prompt positions travel in LwdRequestNotify."""
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -72,6 +72,9 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
+    mrope_positions: bytes = b""
+    """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
+    prompt; empty when unused."""
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (

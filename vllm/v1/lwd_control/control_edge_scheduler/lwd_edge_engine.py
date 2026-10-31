@@ -39,6 +39,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
+    LwdAbortNotify,
     LwdC2eNotify,
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
@@ -154,53 +155,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self, dp_idx: int, params: LwdCloudParamsNotify
     ) -> None:
         """(max_num_batched_tokens, max_num_seqs) must match every cloud DP
-        rank: both feed the cap/preflight formulas, and a mismatch makes the
-        cloud hold prefills behind decodes forever without any error. The
-        speculative factor is adopted from the cloud and liveness re-checked
-        with it."""
+        rank: a mismatch makes the cloud hold prefills behind decodes forever
+        without any error."""
         sched = self.vllm_config.scheduler_config
-        spec_config = getattr(self.vllm_config, "speculative_config", None)
-        local = (
-            sched.max_num_batched_tokens,
-            sched.max_num_seqs,
-            getattr(spec_config, "num_speculative_tokens", None) or 0,
-        )
-        remote = (
-            params.max_num_batched_tokens,
-            params.max_num_seqs,
-            params.num_speculative_tokens,
-        )
-        if local[:2] != remote[:2]:
+        local = (sched.max_num_batched_tokens, sched.max_num_seqs)
+        remote = (params.max_num_batched_tokens, params.max_num_seqs)
+        if local != remote:
             raise RuntimeError(
                 f"[LWD] edge/cloud scheduling config mismatch on dp{dp_idx}: "
-                f"(max_num_batched_tokens, max_num_seqs) edge={local[:2]} != "
-                f"cloud={remote[:2]}; a mismatch makes the cloud hold prefills "
+                f"(max_num_batched_tokens, max_num_seqs) edge={local} != "
+                f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 "behind decodes forever, so start both sides with the same values"
             )
-        if local[2] != remote[2]:
-            # The factor reserves draft budget of cloud decode steps; the edge
-            # has no legitimate local source (a spec config on the edge would
-            # start the draft machinery), so it adopts the cloud's.
-            spec_factor = remote[2] + 1
-            lwd_logger.warning(
-                "[cloud-params] adopt cloud spec_factor=%d over edge local %d",
-                spec_factor,
-                local[2] + 1,
-            )
-            self.scheduler._lwd_spec_factor = spec_factor
-            # The scheduler checked liveness with the local factor.
-            if (
-                self.scheduler.max_num_scheduled_tokens
-                - self.scheduler.max_num_running_reqs * spec_factor
-                < 1
-            ):
-                raise RuntimeError(
-                    f"[LWD] deadlock config: with the cloud spec_factor="
-                    f"{spec_factor} the cap is always < 1 (budget "
-                    f"{self.scheduler.max_num_scheduled_tokens} - max_num_seqs "
-                    f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
-                    "increase max_num_batched_tokens or decrease max_num_seqs"
-                )
         lwd_logger.info("[cloud-params] dp%d limits verified: %s", dp_idx, local)
 
     def _lwd_send_to_cloud(self, dp_idx: int, message: LwdEdgeToCloudMessage) -> None:
@@ -238,11 +204,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         super().add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
-        """Pending-ledger removal (leaving entries in would push the
-        prefill gate up); finishing goes through native; the cloud
-        abort-notify feature is not landed yet and will be completed
-        together with that feature."""
-        self.scheduler.lwd_edge_abort(request_ids)
+        """Notify each request's original cloud DP, then finish natively."""
+        routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
+        for dp_idx, request_id in routed_aborts:
+            self._lwd_send_to_cloud(dp_idx, LwdAbortNotify(request_id))
         super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, dp_idx: int, request: Request) -> None:
@@ -263,6 +228,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 num_prompt_tokens=request.num_prompt_tokens,
                 block_hashes=list(request.block_hashes),
                 eos_token_id=sampling_params.eos_token_id,
+                mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
                 **values,
             ),
         )

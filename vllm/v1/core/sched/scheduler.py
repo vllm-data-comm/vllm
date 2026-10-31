@@ -674,6 +674,11 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
 
+            # Bound LWD prefill to the rows already received for this request.
+            lwd_window_cap = getattr(request, "lwd_window_cap", None)
+            if lwd_window_cap is not None:
+                num_new_tokens = min(num_new_tokens, lwd_window_cap)
+
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -1070,8 +1075,10 @@ class Scheduler(SchedulerInterface):
                     lwd_logger.info(
                         "sched dbg: num_new=%s computed=%s num_tokens=%s "
                         "prompt=%s status=%s",
-                        num_new_tokens, num_computed_tokens,
-                        request.num_tokens, request.num_prompt_tokens,
+                        num_new_tokens,
+                        num_computed_tokens,
+                        request.num_tokens,
+                        request.num_prompt_tokens,
                         request.status,
                     )
                     threshold = self.scheduler_config.long_prefill_token_threshold
@@ -1089,6 +1096,17 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
+
+                    # Clamp after speculative padding so padding cannot exceed
+                    # the received LWD window.
+                    lwd_window_cap = getattr(request, "lwd_window_cap", None)
+                    if lwd_window_cap is not None:
+                        num_new_tokens = min(num_new_tokens, lwd_window_cap)
+                        if (
+                            pad_spec_decode
+                            and num_new_tokens != 1 + self.num_spec_tokens
+                        ):
+                            pad_spec_decode = False
                     assert num_new_tokens > 0
 
                     # Apply Mamba alignment before encoder caps.

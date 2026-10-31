@@ -53,20 +53,15 @@ class LwdEmbedBatch:
     #   offset);
     # - has_mrope[i]: whether request i carries mrope rows (the edge
     #   computes positions only for MM requests at admission);
-    # - mrope_positions[i]: raw mrope position bytes for request i's
-    #   chunk ([3, n] int64, forwarded by the cloud scheduler from the
-    #   RangeNotify item; empty bytes when no mrope). Cloud-side
-    #   fill/consume only: the runner frombuffers them straight into
-    #   req_state; the edge no longer fills them (positions ride the
-    #   control-plane notify; the data-plane aux frame is retired).
-    #   bytes is a native msgspec type, serialized with the SO to every
-    #   cloud worker at no extra cost.
+    # - mrope_positions[i]: legacy per-chunk bytes; the current path leaves
+    #   them empty and carries full-prompt positions in NewRequestData.
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
     dp_idx: int = 0
     """Cloud DP rank this batch travels to; the edge worker picks the UP
     channel of this DP connection. 0 keeps single-cloud behaviour."""
+    aborted_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -115,6 +110,7 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    lwd_mrope_positions: bytes = b""
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -142,6 +138,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            lwd_mrope_positions=getattr(request, "lwd_mrope_positions", b""),
             prefill_token_ids=prefill_token_ids,
         )
 
