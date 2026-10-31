@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-import pickle
 import queue
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
@@ -193,8 +193,11 @@ def test_refill_announces_at_dispatch_and_drains_after_abort() -> None:
     output = outputs[0]
     meta = output.lwd_batch.batch_meta
     assert meta.token_ids == [[4, 5, 6]] and meta.is_refill
-    transported = pickle.loads(pickle.dumps(output))
-    assert transported.lwd_batch.batch_meta.is_refill
+    transported = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(meta),
+        type=type(meta),
+    )
+    assert transported.is_refill
     assert output.scheduled_new_reqs[0].mm_features == ["image"]
     assert output.num_scheduled_tokens == {}
 

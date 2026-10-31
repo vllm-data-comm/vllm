@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """lwd_pick_prefill_batch 表驱动测试:chunk 组批算术的边界锁死。
 
 用例覆盖原实现注释里记录的事故形态(末位截断漏记、预算超批)与
