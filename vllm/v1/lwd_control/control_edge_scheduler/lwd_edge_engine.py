@@ -29,6 +29,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_executor_proxy import (
     LwdEdgeExecutorProxy,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_prefix_control import (
+    LwdEdgePrefixControl,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
@@ -44,6 +47,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
     LwdMessage,
+    LwdPrefixReadyNotify,
+    LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_cloud_to_edge,
 )
@@ -53,6 +58,7 @@ from vllm.v1.request import Request
 # reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
 # conservative, validate performance with 2 first.
 LWD_EDGE_BATCH_QUEUE_DEPTH = 2
+LWD_PREFIX_READY_TIMEOUT_S = 60.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
 # total) before failing: by then the cloud stopped reading or is gone.
@@ -68,12 +74,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     scheduler: LwdEdgeScheduler
 
     def _lwd_assemble(self) -> None:
+        self._lwd_prefix_enabled = bool(
+            self.vllm_config.cache_config.enable_prefix_caching
+        )
+        self._lwd_prefix_control = (
+            LwdEdgePrefixControl(self, LWD_PREFIX_READY_TIMEOUT_S)
+            if self._lwd_prefix_enabled
+            else None
+        )
         self._lwd_cloud_params: dict[int, LwdCloudParamsNotify] = {}
         self._lwd_cloud_params_received = threading.Event()
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
-        # One handshake_timeout_s covers every link: accept and limits for
-        # all M cloud DP ranks, bounding the wait for a full cloud.
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
         deadline = time.monotonic() + handshake_timeout_s
         self._lwd_clouds: dict[int, LwdPeer] = plane.wait_until_ready(
@@ -94,23 +106,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_cloud_params_received.clear()
         for dp_idx, params in self._lwd_cloud_params.items():
             self._lwd_check_cloud_params(dp_idx, params)
-        # A MoE multi-DP cloud pauses its engines between waves; the edge
-        # is its front-end stand-in, so it wakes the wave of the routed
-        # engine on the first request. Links without a coordinator (single
-        # DP, non-MoE) stay without a client.
+        self._lwd_configure_prefix_cache()
         self._lwd_coord_clients: dict[int, LwdCoordClient] = {
             dp_idx: LwdCoordClient(dp_idx, params.dp_coordinator_addr)
             for dp_idx, params in self._lwd_cloud_params.items()
             if params.dp_coordinator_addr
         }
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
-        # Native batch queue stepping (step/step_with_batch_queue untouched):
-        # 1. depth 2, rebuilding the deque so its maxlen matches and
-        #    appendleft on a full queue cannot silently evict a batch in
-        #    flight;
-        # 2. the edge samples inside execute, so is_pooling_model stops the
-        #    native sample_tokens call;
-        # 3. the executor proxy.
+        self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
         self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
         self.batch_queue = deque(maxlen=self.batch_queue_size)
@@ -123,8 +126,39 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.batch_queue_size,
         )
 
+    def _lwd_configure_prefix_cache(self) -> None:
+        capabilities: set[tuple[int, int, bool, bool]] = set()
+        for dp_idx, params in self._lwd_cloud_params.items():
+            if self._lwd_prefix_enabled != params.prefix_caching:
+                raise RuntimeError(
+                    f"[LWD] prefix caching mismatch on dp{dp_idx}: "
+                    f"edge={self._lwd_prefix_enabled} "
+                    f"cloud={params.prefix_caching}"
+                )
+            capabilities.add(
+                (
+                    params.hash_block_size,
+                    params.prefix_alignment_tokens,
+                    params.prefix_alignment_required,
+                    params.prefix_use_eagle,
+                )
+            )
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is None:
+            return
+        if len(capabilities) != 1:
+            raise RuntimeError(
+                f"[LWD] inconsistent prefix capabilities across cloud DP ranks: "
+                f"{sorted(capabilities)}"
+            )
+        params = next(iter(self._lwd_cloud_params.values()))
+        control.configure(params)
+        self.scheduler._lwd_prefix_hash_block_size = control.hash_block_size
+
     def shutdown(self) -> None:
-        # Reached after a failed assembly too, before the clients exist.
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is not None:
+            control.shutdown()
         for client in getattr(self, "_lwd_coord_clients", {}).values():
             client.shutdown()
         super().shutdown()
@@ -138,6 +172,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if isinstance(msg, LwdCloudParamsNotify):
             self._lwd_cloud_params[peer.dp_rank] = msg
             self._lwd_cloud_params_received.set()
+            return True
+        if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
+            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             return True
         if isinstance(msg, LwdC2eNotify):
             lwd_logger.info(
@@ -187,27 +224,80 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     # Engine interface overrides                                         #
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
-        """Edge admission (validation + mrope, scheduler-local ledger and
-        routing) -> cloud request notify of the routed DP rank
-        (communication stays in the engine) -> native engine entry (native
-        validation + enqueue + abort_immediately handled natively)."""
         lwd_logger.info(
             "[edge] request received req=%s tokens=%d (admit + announce)",
             request.request_id,
             request.num_prompt_tokens,
         )
+        if self.scheduler.lwd_edge_request_active(request.request_id):
+            lwd_logger.error(
+                "[edge] reject duplicate active request req=%s", request.request_id
+            )
+            raise AssertionError(f"duplicate active request id: {request.request_id}")
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is not None and not request.abort_immediately:
+            control.add_request(request)
+            return
+        self._lwd_admit_and_notify(request)
+        self._lwd_enqueue_request(request)
+
+    def _lwd_admit_and_notify(self, request: Request) -> None:
         dp_idx = self.scheduler.lwd_admit_request(request)
         client = self._lwd_coord_clients.get(dp_idx)
-        if client is not None:
-            client.send_first_req()
-        self._lwd_notify_request(dp_idx, request)
+        try:
+            if client is not None:
+                client.send_first_req()
+            self._lwd_notify_request(dp_idx, request)
+        except Exception:
+            self.scheduler.lwd_edge_cancel_admission(request.request_id)
+            raise
+
+    def _lwd_enqueue_request(self, request: Request) -> None:
         super().add_request(request)
 
+    def _handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is not None and control.handle_client_request(request_type, request):
+            return
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, LwdRefillNotify
+        ):
+            self._lwd_handle_refill(request)
+            return
+        super()._handle_client_request(request_type, request)
+
+    def _lwd_handle_refill(self, notify: LwdRefillNotify) -> None:
+        outputs = self.scheduler.lwd_edge_build_refill(notify)
+        if outputs is None:
+            lwd_logger.error("[edge-refill] req=%s cannot be served", notify.request_id)
+            self._lwd_abort_refill(notify.request_id)
+            return
+        self.scheduler.lwd_edge_queue_refill(outputs)
+
+    def _lwd_abort_refill(self, request_id: str) -> None:
+        request = self.scheduler.requests.get(request_id)
+        if request is None:
+            lwd_logger.warning("[edge-refill] stale abort req=%s ignored", request_id)
+            return
+        self._lwd_abort_internally(request)
+
+    def _lwd_abort_internally(self, request: Request) -> None:
+        self.abort_requests([request.request_id])
+        self._send_abort_outputs_to_client([request.request_id], request.client_index)
+
     def abort_requests(self, request_ids: list[str]) -> None:
-        """Notify each request's original cloud DP, then finish natively."""
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is not None:
+            control.prepare_abort(request_ids)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
         for dp_idx, request_id in routed_aborts:
-            self._lwd_send_to_cloud(dp_idx, LwdAbortNotify(request_id))
+            request = getattr(self.scheduler, "requests", {}).get(request_id)
+            self._lwd_send_to_cloud(
+                dp_idx,
+                LwdAbortNotify(request_id, getattr(request, "lwd_prefix_nonce", 0)),
+            )
         super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, dp_idx: int, request: Request) -> None:
@@ -227,6 +317,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 request_id=request.request_id,
                 num_prompt_tokens=request.num_prompt_tokens,
                 block_hashes=list(request.block_hashes),
+                prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
+                skip_reading_prefix_cache=bool(
+                    getattr(sampling_params, "skip_reading_prefix_cache", False)
+                ),
                 eos_token_id=sampling_params.eos_token_id,
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
                 **values,

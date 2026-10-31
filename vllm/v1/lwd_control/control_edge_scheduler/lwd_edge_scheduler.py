@@ -22,6 +22,7 @@ single-cloud behaviour.
 
 from __future__ import annotations
 
+import copy
 import time
 from collections import deque
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from vllm.v1.core.sched.output import (
     LwdBatchType,
     LwdEmbedBatch,
     LwdUnembedBatch,
+    NewRequestData,
     SchedulerOutput,
 )
 from vllm.v1.engine import (
@@ -60,11 +62,13 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdEdgeToCloudMessage,
     LwdRangeItem,
     LwdRangeNotify,
+    LwdRefillNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
 LwdSendToCloud = Callable[[int, LwdEdgeToCloudMessage], None]
@@ -81,21 +85,41 @@ _LWD_FINISH_STATUS = {
 }
 
 
+def lwd_edge_scheduler_config(vllm_config: VllmConfig) -> VllmConfig:
+    scheduler_config = copy.copy(vllm_config)
+    scheduler_config.cache_config = copy.copy(vllm_config.cache_config)
+    scheduler_config.cache_config.enable_prefix_caching = False
+    return scheduler_config
+
+
 class LwdEdgeScheduler(LwdBaseScheduler):
     """Per-cloud-DP routing/gating + chunked prefill scheduling +
     control-plane egress (RangeNotify/seqno)."""
 
     def __init__(self, *args, **kwargs) -> None:
+        original_config = args[0] if args else kwargs["vllm_config"]
+        self._lwd_prefix_enabled = bool(
+            original_config.cache_config.enable_prefix_caching
+        )
+        if args:
+            args = (lwd_edge_scheduler_config(args[0]), *args[1:])
+        else:
+            kwargs["vllm_config"] = lwd_edge_scheduler_config(kwargs["vllm_config"])
         super().__init__(*args, **kwargs)
+        self._lwd_prefix_hash_block_size = 0
+        self._lwd_pending_refills: deque[SchedulerOutput] = deque()
+        self._lwd_announced_refills: set[tuple[int, int]] = set()
         # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
+        self.lwd_refill_abort: Callable[[str], None] | None = None
         # One account per cloud DP rank; the count comes from the routing
         # entry of any DP of the local (edge) instance, all of which share
         # the same connections.
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_accounts: tuple[LwdCloudDpAccount, ...] = tuple(
-            LwdCloudDpAccount(dp_idx) for dp_idx in range(len(lwd_config.connections))
+            LwdCloudDpAccount(dp_idx, LWD_MAX_PENDING_CHUNKS)
+            for dp_idx in range(len(lwd_config.connections))
         )
         self._lwd_aborted_req_ids: dict[int, list[str]] = {
             account.dp_idx: [] for account in self._lwd_accounts
@@ -189,16 +213,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """
         return (
             bool(self.unembed_notify_queue)
+            or bool(getattr(self, "_lwd_pending_refills", ()))
             or any(self._lwd_aborted_req_ids.values())
             or any(account.pending_chunks() for account in self._lwd_accounts)
             or self._lwd_embed_dispatchable()
         )
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
-        """Dispatch an EMBED batch first; otherwise consume c2e to produce an
-        UNEMBED batch (finish in-flight work before admitting new work, to
-        keep EMBED from being squeezed out of the depth quota by the decode
-        return trip)."""
+        """Dispatch refills and EMBED batches before consuming cloud results."""
+        if self._lwd_pending_refills:
+            return self._lwd_dispatch_refill(self._lwd_pending_refills.popleft())
         LwdControlDiag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
@@ -237,7 +261,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return None
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
-        held = account.pending_chunks() >= LWD_MAX_PENDING_CHUNKS
+        held = account.pending_chunks() >= account.max_pending_chunks
         if held != account.gate_held:
             account.gate_held = held
             lwd_logger.info(
@@ -306,6 +330,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
         for dp_idx, watermark in watermarks.items():
             self._lwd_accounts[dp_idx].note_send_watermark(watermark)
+            self._lwd_announced_refills = {
+                key
+                for key in getattr(self, "_lwd_announced_refills", set())
+                if key[0] != dp_idx or key[1] > watermark
+            }
         batch = getattr(scheduler_output, "lwd_batch", None)
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
@@ -373,7 +402,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
         # accepted, so token presence/absence is used instead
         accepts = notify.num_accepted_tokens
+        prefix_nonces = notify.prefix_nonces
+        if prefix_nonces and len(prefix_nonces) != len(notify.req_ids):
+            raise RuntimeError("[LWD] C2E prefix_nonces is not aligned with req_ids")
         for index, request_id in enumerate(notify.req_ids):
+            if prefix_nonces:
+                request = self.requests.get(request_id)
+                current_nonce = getattr(request, "lwd_prefix_nonce", 0)
+                if request is None or prefix_nonces[index] != current_nonce:
+                    lwd_logger.warning(
+                        "[edge-deliver] drop stale generation req=%s nonce=%d "
+                        "current=%d",
+                        request_id,
+                        prefix_nonces[index],
+                        current_nonce,
+                    )
+                    continue
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
@@ -473,7 +517,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if self._lwd_dp_of(r.request_id) == dp_idx
         ]
         waiting = [
-            LwdPrefillCandidate(r.request_id, r.num_prompt_tokens, 0)
+            LwdPrefillCandidate(
+                r.request_id, r.num_prompt_tokens, r.num_computed_tokens
+            )
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
         ]
@@ -524,6 +570,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if not req.is_finished()
         )
 
+    def lwd_edge_request_active(self, request_id: str) -> bool:
+        if request_id in self._lwd_route or request_id in self.requests:
+            return True
+        announced = getattr(self, "_lwd_announced_refills", set())
+        return any(
+            (account.dp_idx, seqno) in announced and request_id in request_ids
+            for account in self._lwd_accounts
+            for seqno, request_ids in account.pending_batches.items()
+        )
+
     def lwd_admit_request(self, request: Request) -> int:
         """Scheduler-local half of request admission: mode boundary
         validation, mrope precomputation and routing. Returns the routed
@@ -533,6 +589,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
         return self._lwd_route_request(request.request_id)
+
+    def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
+        hash_block_size = self._lwd_prefix_hash_block_size
+        valid = 0 <= hit_tokens < request.num_prompt_tokens and (
+            hash_block_size <= 0 or hit_tokens % hash_block_size == 0
+        )
+        if not valid:
+            lwd_logger.error(
+                "[prefix] invalid READY hit req=%s hit=%d",
+                request.request_id,
+                hit_tokens,
+            )
+            request.num_computed_tokens = 0
+            return False
+        request.num_computed_tokens = hit_tokens
+        return True
+
+    def lwd_edge_cancel_admission(self, request_id: str) -> None:
+        self._lwd_settle_request(request_id)
+        self._lwd_mrope_positions_dict.pop(request_id, None)
 
     @staticmethod
     def _lwd_request_has_mm(request: Request) -> bool:
@@ -635,6 +711,134 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         self._lwd_aborted_req_ids[dp_idx] = []
 
+    def lwd_edge_build_refill(
+        self, notify: LwdRefillNotify
+    ) -> list[SchedulerOutput] | None:
+        request_id = notify.request_id
+        request = self.requests.get(request_id)
+        dp_idx = self._lwd_dp_of_settling(request_id)
+        if request is None or dp_idx is None:
+            return []
+        prefix_nonce = getattr(request, "lwd_prefix_nonce", 0)
+        if notify.prefix_nonce != prefix_nonce:
+            lwd_logger.warning(
+                "[edge-refill] stale req=%s nonce=%d ignored: current=%d",
+                request_id,
+                notify.prefix_nonce,
+                prefix_nonce,
+            )
+            return []
+        if request.prompt_token_ids is None:
+            return None
+        start, end = notify.start_row, notify.end_row
+        if not 0 <= start < end <= request.num_prompt_tokens:
+            lwd_logger.error(
+                "[edge-refill] req=%s invalid range [%d, %d)",
+                request_id,
+                start,
+                end,
+            )
+            return None
+        chunk_size = min(
+            self._lwd_chunk_unit, self.scheduler_config.max_num_batched_tokens
+        )
+        if chunk_size <= 0:
+            return None
+
+        outputs: list[SchedulerOutput] = []
+        for chunk_start in range(start, end, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, end)
+            scheduler_output = SchedulerOutput.make_empty()
+            if request.mm_features:
+                scheduler_output.scheduled_new_reqs = [
+                    NewRequestData(
+                        req_id=request_id,
+                        prompt_token_ids=None,
+                        mm_features=list(request.mm_features),
+                        sampling_params=None,
+                        pooling_params=None,
+                        block_ids=tuple(),
+                        num_computed_tokens=chunk_start,
+                        lora_request=None,
+                        lwd_mrope_positions=self.lwd_mrope_positions(request_id),
+                    )
+                ]
+            batch_meta = LwdEmbedBatch(
+                req_ids=[request_id],
+                token_ids=[list(request.prompt_token_ids[chunk_start:chunk_end])],
+                prompt_offsets=[chunk_start],
+                has_mrope=[False],
+                dp_idx=dp_idx,
+            )
+            batch_meta.is_refill = True
+            batch_meta.lwd_prefix_nonce = prefix_nonce
+            scheduler_output.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=-1,
+                batch_meta=batch_meta,
+            )
+            outputs.append(scheduler_output)
+        return outputs
+
+    def lwd_edge_queue_refill(self, outputs: list[SchedulerOutput]) -> None:
+        self._lwd_pending_refills.extend(outputs)
+
+    def _lwd_dispatch_refill(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        batch = scheduler_output.lwd_batch
+        assert batch is not None and batch.batch_meta is not None
+        meta = batch.batch_meta
+        request_id = meta.req_ids[0]
+        dp_idx = meta.dp_idx
+        request = self.requests.get(request_id)
+        prefix_nonce = getattr(meta, "lwd_prefix_nonce", 0)
+        if (
+            request is None
+            or getattr(request, "lwd_prefix_nonce", 0) != prefix_nonce
+            or self._lwd_dp_of_settling(request_id) != dp_idx
+        ):
+            lwd_logger.warning(
+                "[edge-refill] drop stale queued chunk req=%s nonce=%d",
+                request_id,
+                prefix_nonce,
+            )
+            return SchedulerOutput.make_empty()
+
+        start = meta.prompt_offsets[0]
+        item = LwdRangeItem(
+            request_id=request_id,
+            offset=start,
+            num_tokens=len(meta.token_ids[0]),
+            is_refill=True,
+            prefix_nonce=prefix_nonce,
+        )
+        account = self._lwd_accounts[dp_idx]
+        seqno = account.seqno
+        assert self.lwd_send_to_cloud is not None, "cloud not connected"
+        try:
+            self.lwd_send_to_cloud(dp_idx, LwdRangeNotify(seqno=seqno, items=[item]))
+        except Exception:
+            lwd_logger.exception("[edge-refill] send failed req=%s", request_id)
+            if self.lwd_refill_abort is None:
+                raise
+            self.lwd_refill_abort(request_id)
+            return SchedulerOutput.make_empty()
+        account.take_seqno()
+        account.register_batch(seqno, {request_id})
+        self._lwd_announced_refills.add((dp_idx, seqno))
+        batch.seqno = seqno
+        lwd_logger.info(
+            "[edge-refill] req=%s dp%d rows=[%d, %d) seqno=%d nonce=%d",
+            request_id,
+            dp_idx,
+            start,
+            start + item.num_tokens,
+            seqno,
+            prefix_nonce,
+        )
+        return scheduler_output
+
     def _lwd_build_range_items(
         self, scheduled: dict[str, int]
     ) -> (
@@ -663,6 +867,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
+                    prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
                 )
             )
             req_ids.append(request_id)
@@ -677,12 +882,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def lwd_edge_abort(self, request_ids: list[str]) -> list[tuple[int, str]]:
         """Settle aborted requests and return their original DP routes."""
+        aborted = set(request_ids)
+        self._lwd_pending_refills = deque(
+            output
+            for output in getattr(self, "_lwd_pending_refills", ())
+            if not aborted.intersection(output.lwd_batch.batch_meta.req_ids)
+        )
         routed_aborts = []
         for request_id in request_ids:
             dp_idx = self._lwd_dp_of_settling(request_id)
             if dp_idx is not None:
                 routed_aborts.append((dp_idx, request_id))
                 self._lwd_aborted_req_ids[dp_idx].append(request_id)
+            self._lwd_mrope_positions_dict.pop(request_id, None)
             self._lwd_settle_request(request_id)
         return routed_aborts
 
@@ -715,7 +927,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if first_token:
             account.note_prefill_done(request_id)
             return
+        refill_batches = {
+            seqno: set(account.pending_batches[seqno])
+            for dp_idx, seqno in getattr(self, "_lwd_announced_refills", set())
+            if dp_idx == account.dp_idx
+            and seqno in account.pending_batches
+            and request_id in account.pending_batches[seqno]
+        }
         account.drop_request(request_id)
+        account.pending_batches.update(refill_batches)
         was_awaiting = request_id not in account.prefill_requests
         account.note_request_settled(request_id, was_awaiting)
         self._lwd_route.pop(request_id, None)

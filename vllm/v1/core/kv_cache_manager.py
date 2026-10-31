@@ -158,6 +158,7 @@ class KVCacheManager:
             max_in_flight_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        self.lwd_prefix_caching = False
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats
@@ -293,11 +294,21 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens, num_uncached = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        if self.lwd_prefix_caching:
+            reservations = getattr(self, "lwd_prefix_reservations", None)
+            if reservations is None:
+                raise RuntimeError("LWD prefix reservations are not initialized")
+            computed_blocks, num_new_computed_tokens = reservations.snapshot(request)
+            shared_prefix_boundary = 0
+        else:
+            computed_blocks, num_new_computed_tokens, num_uncached = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
             )
-        )
+            shared_prefix_boundary = (
+                num_new_computed_tokens + num_uncached if num_uncached else 0
+            )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -308,14 +319,6 @@ class KVCacheManager:
             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
         ):
             self.coordinator.emit_cached_block_events(request, computed_blocks)
-
-        # The junction to pin is where the lagging sparse-retention group stops
-        # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
-        # the longest single-group hit. Sub-block gaps are left to the mask,
-        # which floors to the alignment boundary (a no-op there).
-        shared_prefix_boundary = (
-            num_new_computed_tokens + num_uncached if num_uncached else 0
-        )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
@@ -341,6 +344,9 @@ class KVCacheManager:
             The ``get_computed_blocks`` triple (blocks, number of local computed
             tokens, shared-prefix boundary) plus ``hit_diverged``.
         """
+        if self.lwd_prefix_caching:
+            return *self.get_computed_blocks(request), False
+
         coordinator = self.coordinator
         if not (
             self.kv_cache_config.has_mamba_layers
@@ -596,6 +602,8 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
+        if self.lwd_prefix_caching:
+            num_tokens_to_cache = min(num_tokens_to_cache, request.num_prompt_tokens)
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
@@ -794,6 +802,10 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            if self.lwd_prefix_caching:
+                num_computed_tokens = min(
+                    num_computed_tokens, request.num_prompt_tokens
+                )
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

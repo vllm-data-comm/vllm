@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from enum import Enum, auto
+from typing import Any
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -137,6 +138,11 @@ class LwdBaseScheduler(AsyncScheduler):
         out = None
         try:
             out = super().schedule()
+            reservations = getattr(self, "lwd_prefix_reservations", None)
+            if reservations is not None and out is not None:
+                for request_id, num_tokens in out.num_scheduled_tokens.items():
+                    if num_tokens > 0:
+                        reservations.release(request_id)
         finally:
             self.max_num_running_reqs = saved_cap
             self.max_num_scheduled_tokens = saved_budget
@@ -159,3 +165,17 @@ class LwdBaseScheduler(AsyncScheduler):
                 self.waiting.prepend_request(request)
             self.skipped_waiting.prepend_requests(post[2])
         return out
+
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        reservations = getattr(self, "lwd_prefix_reservations", None)
+        if reservations is not None:
+            reservations.release(request.request_id)
+        refill_gate = getattr(self, "_lwd_refill_gate", None)
+        if refill_gate is not None:
+            refill_gate.discard(request.request_id)
+        refill_pending = getattr(self, "_lwd_refill_pending", None)
+        if refill_pending is not None:
+            refill_pending.pop(request.request_id, None)
+        return super()._free_request(request, delay_free_blocks)
