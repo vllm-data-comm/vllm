@@ -53,7 +53,6 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
-    lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
@@ -111,16 +110,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # delivering link's dp_idx, consumed within a scheduling step to
         # produce an UNEMBED batch
         self.unembed_notify_queue: deque[tuple[int, LwdC2eNotify]] = deque()
-        # MTP budget factor (decode consumes 1+k tokens per request per
-        # step); edge/cloud budgets are deployment-aligned, the cap reads the
-        # local config directly, the sole home of the formula is
-        # lwd_base_scheduler.lwd_spec_factor
-        self._lwd_spec_factor: int = lwd_spec_factor(self.vllm_config)
         # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
-        # tensor, computed once at admission, sliced per chunk and sent to
-        # the worker with LwdEmbedBatch); removed on embedding
-        # completion/abort. Key present = has_mrope is always true for every
-        # chunk of that request.
+        # tensor, computed once at admission and sent in RequestNotify);
+        # removed on embedding completion/abort. Key present = has_mrope is
+        # always true for every chunk of that request.
         self._lwd_mrope_positions_dict: dict[str, torch.Tensor] = {}
         # Lazily resolved model-class static method
         # _get_mrope_input_positions (cache the method itself rather than
@@ -136,25 +129,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_chunk_unit: int = (
             threshold if threshold > 0 else self.max_num_scheduled_tokens
         )
-        self._lwd_check_deadlock_config()
-
-    def _lwd_check_deadlock_config(self) -> None:
-        """Liveness fail-fast: if the cap stays < 1 even at worst-case
-        inflight (full occupancy of one engine), it is a deadlock
-        configuration; reject at startup."""
-        if (
-            self.max_num_scheduled_tokens
-            - self.max_num_running_reqs * self._lwd_spec_factor
-            < 1
-        ):
-            raise RuntimeError(
-                f"[LWD] deadlock config: max_num_batched_tokens("
-                f"{self.max_num_scheduled_tokens}) - max_num_seqs("
-                f"{self.max_num_running_reqs}) * spec_factor("
-                f"{self._lwd_spec_factor}) < 1, resume chunks would never "
-                "have a schedulable budget; please increase "
-                "max_num_batched_tokens or decrease max_num_seqs"
-            )
 
     # ------------------------------------------------------------- routing
 
@@ -203,14 +177,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------- stepping
 
     def has_requests(self) -> bool:
-        """Liveness predicate for native stepping: has a dispatchable batch
-        (EMBED dispatchable / c2e pending consumption). False when every
-        engine's gate is HOLD with nothing in flight; the engine then
-        sleeps via has_work -- whenever schedule() is called there must be
-        a real batch, and empty batches never enter the queue (native
-        batch-queue contract; an empty batch would blow up the harvest path
-        with a None result)."""
-        return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
+        """Keep stepping while any UP send still needs watermark settlement.
+
+        A full pending gate stops new EMBED batches, but the empty UNEMBED
+        step still executes the worker and harvests completed sends. Without
+        this predicate the edge can sleep forever with pending sends that no
+        later batch can clear.
+        """
+        return (
+            bool(self.unembed_notify_queue)
+            or any(account.pending_chunks() for account in self._lwd_accounts)
+            or self._lwd_embed_dispatchable()
+        )
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         """Dispatch an EMBED batch first; otherwise consume c2e to produce an
@@ -302,8 +280,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         decode phase); UNEMBED batches deliver per request via the
         worker-filled req_ids x sampled_token_ids; placeholder batches
         without lwd_batch (the underlying layer returns None on normal
-        completion, replaced by the engine proxy with a placeholder) are a
-        no-op."""
+        completion, replaced by the engine proxy with a placeholder) only
+        consume send watermarks."""
+        watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
+        for dp_idx, watermark in watermarks.items():
+            self._lwd_accounts[dp_idx].note_send_watermark(watermark)
         batch = getattr(scheduler_output, "lwd_batch", None)
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
@@ -456,7 +437,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         free_seq from that engine's account."""
         account = self._lwd_accounts[dp_idx]
         inflight = account.load
-        cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
+        cap = self.max_num_scheduled_tokens
         free_seq = self.max_num_running_reqs - inflight
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
@@ -585,6 +566,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # (runs on the edge engine main thread; the scheduling loop stalls
         # meanwhile; used for MM degradation attribution)
 
+    def lwd_mrope_positions(self, request_id: str) -> bytes:
+        """Return full-prompt positions for the engine's RequestNotify."""
+        positions = self._lwd_mrope_positions_dict.get(request_id)
+        if positions is None:
+            return b""
+        return positions.contiguous().numpy().tobytes()
+
     def lwd_edge_notify_range(
         self, dp_idx: int, scheduler_output: SchedulerOutput
     ) -> None:
@@ -610,9 +598,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # seqno is the pairing key of the data-plane tensor sent to the
         # cloud (same value as registered by the cloud-side RangeNotify);
         # the embed payload is this batch's per-request token slices (the
-        # edge worker flattens them in req_ids order); mrope positions
-        # already went to the control plane with the RangeNotify, so the
-        # edge worker no longer builds aux frames
+        # edge worker flattens them in req_ids order).
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -631,9 +617,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         tuple[list[LwdRangeItem], list[str], list[list[int]], list[int], list[bool]]
         | None
     ):
-        """Assemble per-request RangeItems and EMBED payload slices for the
-        batch; per-chunk mrope column slices are serialized as raw bytes and
-        travel the control plane with the item.
+        """Assemble per-request RangeItems and EMBED payload slices.
         Returns None when there are no entries."""
         items: list[LwdRangeItem] = []
         req_ids: list[str] = []
@@ -648,24 +632,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # optimistically; the start offset must step back by this
             # step's amount
             offset = request.num_computed_tokens - num_tokens
-            positions = self._lwd_mrope_positions_dict.get(request_id)
-            req_has_mrope = positions is not None
-            mrope_bytes = b""
-            if req_has_mrope:
-                assert positions is not None
-                mrope_bytes = (
-                    positions[:, offset : offset + num_tokens]
-                    .contiguous()
-                    .numpy()
-                    .tobytes()
-                )
+            req_has_mrope = request_id in self._lwd_mrope_positions_dict
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
-                    mrope_positions=mrope_bytes,
                 )
             )
             req_ids.append(request_id)
@@ -679,22 +652,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
 
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """Ledger removal on abort (a pending watermark defense; failing to
-        remove would push up the prefill gate); the cloud-side abort notify
-        feature is not yet available, terminal cleanup goes through native
-        abort_requests."""
+        """Settle aborted requests in their original DP accounts."""
         for request_id in request_ids:
             self._lwd_settle_request(request_id)
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
     ) -> bool:
-        """Cloud result reconciliation: the request is claimed if it is
-        still in native requests (decode phase); on first token arrival the
-        pending ledger entry of its engine drops (removing again on
-        finished is idempotent; failing to remove would leak the watermark
-        and push up the gate); terminated/unknown requests are idempotently
-        dropped."""
+        """Claim a live cloud result and move its load to decode exactly once;
+        terminated/unknown requests are idempotently dropped."""
         request = self.requests.get(request_id)
         if request is None or request.is_finished():
             # A late cloud result racing the request's own finish: the
@@ -711,18 +677,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return True
 
     def _lwd_settle_request(self, request_id: str, first_token: bool = False) -> None:
-        """Drop a request from its engine's books: pending batches first
-        (abort/finish/first token), then the load count and the routing
-        table (only when the request fully left; a first token keeps the
-        decode load -- every delivery calls in here, so the prefill->decode
-        move is gated inside the account and happens exactly once)."""
+        """Move load on delivery, or drop all request state on finish/abort.
+        Send watermarks alone release pending batches after first token."""
         account = self._lwd_account_of(request_id)
         if account is None:
             return
-        account.drop_request(request_id)
         if first_token:
             account.note_prefill_done(request_id)
             return
+        account.drop_request(request_id)
         was_awaiting = request_id not in account.prefill_requests
         account.note_request_settled(request_id, was_awaiting)
         self._lwd_route.pop(request_id, None)

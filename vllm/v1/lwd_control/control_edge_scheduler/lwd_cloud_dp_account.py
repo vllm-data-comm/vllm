@@ -18,12 +18,7 @@ gate check.
 
 from __future__ import annotations
 
-# Pending cap, counted in unconsumed chunks (seqno): one seqno = one
-# cloud-step consumption unit. When the number of unconsumed chunks of one
-# engine reaches the cap, new prefill admission to that engine stops --
-# its requests accumulate in the edge waiting queue and the gate reopens
-# once that engine drains. One engine's full gate never holds the others.
-LWD_MAX_PENDING_CHUNKS = 3
+LWD_MAX_PENDING_CHUNKS = 10
 
 
 class LwdCloudDpAccount:
@@ -35,8 +30,8 @@ class LwdCloudDpAccount:
         """Next UP pairing number of this engine; taken only by a range
         notify that was sent."""
         self.pending_batches: dict[int, set[str]] = {}
-        """seqno -> in-batch request ids whose result has not arrived. A
-        batch entry leaves once every request received its first token."""
+        """seqno -> in-batch request ids awaiting UP send completion, request
+        settlement, or a covering send watermark."""
         self.prefill_requests: set[str] = set()
         """Request ids whose prefill_load entry this account still holds.
         Every delivery of a request reaches the books (not only its first
@@ -100,19 +95,20 @@ class LwdCloudDpAccount:
     def pending_chunks(self) -> int:
         return len(self.pending_batches)
 
-    def note_first_token(self, request_id: str) -> None:
-        """First token of a request arrived; drop it from its batch entry
-        and remove entries that fully drained."""
+    def note_send_watermark(self, watermark: int) -> None:
+        """Release this DP's batches whose sends completed in order."""
         for seqno in list(self.pending_batches):
-            batch = self.pending_batches[seqno]
-            batch.discard(request_id)
-            if not batch:
+            if seqno <= watermark:
                 del self.pending_batches[seqno]
 
     def drop_request(self, request_id: str) -> None:
         """Remove a request from every batch entry (abort or finish);
         idempotent for requests in no batch."""
-        self.note_first_token(request_id)
+        for seqno in list(self.pending_batches):
+            batch = self.pending_batches[seqno]
+            batch.discard(request_id)
+            if not batch:
+                del self.pending_batches[seqno]
 
     # ------------------------------------------------------------------ gate
 
