@@ -39,6 +39,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
+    LwdAbortNotify,
     LwdC2eNotify,
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
@@ -203,8 +204,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         super().add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
-        """Settle local scheduler state, then finish natively."""
-        self.scheduler.lwd_edge_abort(request_ids)
+        """Notify each request's original cloud DP, then finish natively."""
+        routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
+        for dp_idx, request_id in routed_aborts:
+            self._lwd_send_to_cloud(dp_idx, LwdAbortNotify(request_id))
         super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, dp_idx: int, request: Request) -> None:

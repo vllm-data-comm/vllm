@@ -97,6 +97,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_accounts: tuple[LwdCloudDpAccount, ...] = tuple(
             LwdCloudDpAccount(dp_idx) for dp_idx in range(len(lwd_config.connections))
         )
+        self._lwd_aborted_req_ids: dict[int, list[str]] = {
+            account.dp_idx: [] for account in self._lwd_accounts
+        }
         self._lwd_route: dict[str, int] = {}
         """Request id -> dp_idx, pinned at admission, never changes."""
         self._lwd_last_engine = -1
@@ -186,6 +189,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """
         return (
             bool(self.unembed_notify_queue)
+            or any(self._lwd_aborted_req_ids.values())
             or any(account.pending_chunks() for account in self._lwd_accounts)
             or self._lwd_embed_dispatchable()
         )
@@ -259,12 +263,29 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         that cannot be sent raises instead."""
         dp_idx = self._lwd_pick_serving_engine()
         if dp_idx is None:
-            return None
+            return self._lwd_schedule_abort_notice()
         out = self._lwd_schedule_batch(dp_idx)
         if not out.num_scheduled_tokens:
-            return None
+            return self._lwd_schedule_abort_notice()
         self.lwd_edge_notify_range(dp_idx, out)
         return out
+
+    def _lwd_schedule_abort_notice(self) -> SchedulerOutput | None:
+        for dp_idx, request_ids in self._lwd_aborted_req_ids.items():
+            if not request_ids:
+                continue
+            out = SchedulerOutput.make_empty()
+            out.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=-1,
+                batch_meta=LwdEmbedBatch(
+                    aborted_req_ids=request_ids,
+                    dp_idx=dp_idx,
+                ),
+            )
+            self._lwd_aborted_req_ids[dp_idx] = []
+            return out
+        return None
 
     def _lwd_schedule_unembed(self) -> SchedulerOutput:
         """Consume a c2e notify to produce an UNEMBED batch."""
@@ -599,6 +620,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # cloud (same value as registered by the cloud-side RangeNotify);
         # the embed payload is this batch's per-request token slices (the
         # edge worker flattens them in req_ids order).
+        aborted_req_ids = self._lwd_aborted_req_ids[dp_idx]
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -608,8 +630,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 prompt_offsets=prompt_offsets,
                 has_mrope=has_mrope,
                 dp_idx=dp_idx,
+                aborted_req_ids=aborted_req_ids,
             ),
         )
+        self._lwd_aborted_req_ids[dp_idx] = []
 
     def _lwd_build_range_items(
         self, scheduled: dict[str, int]
@@ -651,10 +675,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             (items, req_ids, token_slices, prompt_offsets, has_mrope) if items else None
         )
 
-    def lwd_edge_abort(self, request_ids: list[str]) -> None:
-        """Settle aborted requests in their original DP accounts."""
+    def lwd_edge_abort(self, request_ids: list[str]) -> list[tuple[int, str]]:
+        """Settle aborted requests and return their original DP routes."""
+        routed_aborts = []
         for request_id in request_ids:
+            dp_idx = self._lwd_dp_of_settling(request_id)
+            if dp_idx is not None:
+                routed_aborts.append((dp_idx, request_id))
+                self._lwd_aborted_req_ids[dp_idx].append(request_id)
             self._lwd_settle_request(request_id)
+        return routed_aborts
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool

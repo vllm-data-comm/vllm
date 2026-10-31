@@ -14,13 +14,19 @@ fast if native scheduling reports the latter.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.lwd_logger import lwd_logger
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import (
+    LwdBatch,
+    LwdBatchType,
+    LwdEmbedBatch,
+    SchedulerOutput,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
@@ -30,7 +36,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdC2eNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs
@@ -64,9 +70,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.lwd_recv_rows: dict[str, int] = {}
+        self._lwd_dropped: set[str] = set()
+        self._lwd_abort_pending: list[str] = []
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
+
+    def has_requests(self) -> bool:
+        """Keep the engine alive until an abort-only worker notice is sent."""
+        return bool(self._lwd_abort_pending) or super().has_requests()
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         decode_ids = self._lwd_collect_decode_requests()
@@ -82,6 +94,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
         self._lwd_attach_mrope_positions(out)
+        self._lwd_attach_abort_notice(out)
         return out
 
     def _lwd_collect_decode_requests(self) -> list[str]:
@@ -130,7 +143,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             if room <= 0:
                 break
             request_id = request.request_id
-            if request.is_finished():
+            if request_id in self._lwd_dropped or request.is_finished():
                 continue
             start = request.num_computed_tokens
             if start >= request.num_prompt_tokens:
@@ -217,6 +230,58 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 positions = getattr(request, "lwd_mrope_positions", b"")
                 data.lwd_mrope_positions = b"" if positions is None else positions
 
+    def finish_requests(
+        self,
+        request_ids: str | Iterable[str] | None,
+        finished_status: RequestStatus,
+    ) -> list[Request]:
+        if finished_status == RequestStatus.FINISHED_ABORTED:
+            if request_ids is None:
+                request_ids = list(self.requests)
+            elif isinstance(request_ids, str):
+                request_ids = (request_ids,)
+            else:
+                request_ids = tuple(request_ids)
+            for request_id in request_ids:
+                self._lwd_drop_request(request_id)
+        return super().finish_requests(request_ids, finished_status)
+
+    def _lwd_drop_request(self, request_id: str) -> None:
+        if request_id in self._lwd_dropped:
+            return
+        self._lwd_dropped.add(request_id)
+        self._lwd_abort_pending.append(request_id)
+        request = self.requests.get(request_id)
+        if request is not None:
+            remaining = max(request.num_prompt_tokens - request.num_computed_tokens, 0)
+            lwd_logger.info(
+                "[cloud-sched] abort dropped req=%s remaining_rows=%d",
+                request_id,
+                remaining,
+            )
+
+    def _lwd_attach_abort_notice(self, out: SchedulerOutput) -> None:
+        pending = self._lwd_abort_pending
+        if not pending:
+            return
+        batch = out.lwd_batch
+        if batch is None:
+            out.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=-1,
+                batch_meta=LwdEmbedBatch(aborted_req_ids=list(pending)),
+            )
+        elif (
+            batch.batch_type is LwdBatchType.LWD_EMBED and batch.batch_meta is not None
+        ):
+            existing = list(batch.batch_meta.aborted_req_ids or ())
+            batch.batch_meta.aborted_req_ids = existing + [
+                request_id for request_id in pending if request_id not in existing
+            ]
+        else:
+            return
+        self._lwd_abort_pending = []
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -242,6 +307,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         for outputs in engine_core_outputs.values():
             for request_id in outputs.finished_requests or ():
                 self.lwd_recv_rows.pop(request_id, None)
+                self._lwd_dropped.discard(request_id)
 
     def _lwd_append_carrier_c2e(
         self,
