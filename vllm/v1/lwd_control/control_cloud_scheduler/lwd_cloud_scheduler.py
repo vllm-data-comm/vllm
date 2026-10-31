@@ -6,9 +6,9 @@
 RangeNotify only drives early data-plane receives. The scheduler opens a
 per-request window from the cumulative arrived-row high watermark and the
 native computed-token watermark, then lets the native scheduler allocate and
-account for the mixed batch. Prefix caching and cloud-side preemption are not
-supported: the engine rejects the former at startup and this scheduler fails
-fast if native scheduling reports the latter.
+account for the mixed batch. Prefix caching is rejected at startup. Native
+preemption resets the computed-token watermark while the arrived-row high
+watermark is retained for the next step.
 """
 
 from __future__ import annotations
@@ -89,7 +89,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
             out = self._lwd_dispatch_windows(windows, decode_ids, decode_exact)
         else:
             out = self._lwd_schedule(decode_ids)
-        self._lwd_fail_if_preempted(out)
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
@@ -177,14 +176,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         finally:
             for window in windows:
                 window.request.lwd_window_cap = None
-
-    @staticmethod
-    def _lwd_fail_if_preempted(out: SchedulerOutput) -> None:
-        if out.preempted_req_ids:
-            raise RuntimeError(
-                "[LWD] cloud preemption is unsupported; preempted_req_ids="
-                f"{sorted(out.preempted_req_ids)}"
-            )
 
     def _lwd_verify_w2(
         self,

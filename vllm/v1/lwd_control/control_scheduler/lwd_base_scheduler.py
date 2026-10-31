@@ -99,8 +99,10 @@ class LwdBaseScheduler(AsyncScheduler):
         waiting/skipped sources go through native admission
         (allocate/state transition/accounting all intact), running sources
         go through resume. Reassembly: still-scheduled requests are
-        appended after the hidden running, preempted ones go to the waiting
-        tail, skipped ones go to the skipped queue head.
+        appended after the hidden running, non-preempted waiting requests
+        are appended after the hidden waiting, and preempted requests are
+        prepended in their native post-schedule order. Skipped requests go
+        to the skipped queue head.
 
         token_budget_cap / chunk_threshold only tighten, never loosen, the
         native limits: the edge side passes a cap to reproduce the picker's
@@ -132,6 +134,7 @@ class LwdBaseScheduler(AsyncScheduler):
         saved_threshold = sched_cfg.long_prefill_token_threshold
         if chunk_threshold is not None:
             sched_cfg.long_prefill_token_threshold = chunk_threshold
+        out = None
         try:
             out = super().schedule()
         finally:
@@ -139,8 +142,20 @@ class LwdBaseScheduler(AsyncScheduler):
             self.max_num_scheduled_tokens = saved_budget
             sched_cfg.long_prefill_token_threshold = saved_threshold
             post = (self.running, self.waiting, self.skipped_waiting)
+            preempted_req_ids = (
+                (out.preempted_req_ids or set()) if out is not None else set()
+            )
+            preempted: list[Request] = []
+            rest: list[Request] = []
+            for request in post[1]:
+                if request.request_id in preempted_req_ids:
+                    preempted.append(request)
+                else:
+                    rest.append(request)
             self.running, self.waiting, self.skipped_waiting = saved
             self.running += post[0]
-            self.waiting.extend(post[1])
+            self.waiting.extend(rest)
+            for request in reversed(preempted):
+                self.waiting.prepend_request(request)
             self.skipped_waiting.prepend_requests(post[2])
         return out
