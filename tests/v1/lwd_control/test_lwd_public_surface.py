@@ -41,7 +41,6 @@ def test_module_inventory():
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler",
         "vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine",
         "vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler",
-        "vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefill_notify_queue",
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker",
     ]:
         assert _spec(name) is not None, name
@@ -51,6 +50,7 @@ def test_deleted_modules_gone():
     """PD 分离相位机、旧配置/台账模块已删,不可再 import。"""
     for name in [
         "vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler",
+        "vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefill_notify_queue",
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble",
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_awaiting_tracker",
         "vllm.v1.lwd_control.lwd_config",
@@ -176,8 +176,7 @@ def test_review_deleted_code_stays_deleted():
     - 零接受活行剔除(_filter_deliver_rows,4 卡问题修复,后续再带上);
     - 边调度器请求入口编排 lwd_edge_add_request(收编进引擎 add_request);
     - 云侧哈希链前缀缓存(_lwd_build_hashed_request / local_hasher /
-      request_block_hasher,前缀缓存功能另上);
-    - abort 通告接线(功能未上,wire 结构 LwdAbortNotify 保留)。"""
+      request_block_hasher,前缀缓存功能另上)。"""
     cloud_sched = (
         VLLM_DIR
         / "v1"
@@ -205,7 +204,6 @@ def test_review_deleted_code_stays_deleted():
         "_lwd_build_hashed_request",
         "local_hasher",
         "request_block_hasher",
-        "LwdAbortNotify",
     ):
         assert banned not in cloud_engine, banned
     assert "LwdAbortNotify" not in edge_sched
@@ -216,7 +214,24 @@ def test_review_deleted_code_stays_deleted():
         / "control_edge_scheduler"
         / "lwd_edge_engine.py"
     ).read_text()
-    assert "LwdAbortNotify" not in edge_engine
+    assert "LwdAbortNotify" in edge_engine
+    assert "self.scheduler.lwd_edge_abort(request_ids)" in edge_engine
+
+
+def test_cloud_abort_uses_native_abort_path():
+    source = (
+        VLLM_DIR
+        / "v1"
+        / "lwd_control"
+        / "control_cloud_scheduler"
+        / "lwd_cloud_engine.py"
+    ).read_text()
+    assert (
+        "isinstance(msg, (LwdRangeNotify, LwdRequestNotify, LwdAbortNotify))" in source
+    )
+    assert "def _lwd_handle_abort_notify" in source
+    assert "self.aborts_queue.put_nowait([request_id])" in source
+    assert "EngineCoreRequestType.ABORT" in source
 
 
 def test_edge_add_request_communication_in_engine():

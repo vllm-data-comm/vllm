@@ -57,7 +57,7 @@ def test_settling_a_prefill_request_covers_abort_before_first_token() -> None:
     assert "r1" not in account.prefill_requests
 
 
-def test_pending_batches_drop_on_first_token_and_finish() -> None:
+def test_pending_batches_release_on_watermark_and_request_settlement() -> None:
     account = LwdCloudDpAccount(0)
     for seqno in range(3):
         account.register_batch(
@@ -66,15 +66,12 @@ def test_pending_batches_drop_on_first_token_and_finish() -> None:
     assert account.pending_chunks() == 3
     assert account.seqno == 3
 
-    # A first token removes that request from every batch entry; entries
-    # whose requests all received their first token leave the ledger.
-    account.note_first_token("r1")
-    assert account.pending_chunks() == 3  # batches still hold r2 / r3
-    account.note_first_token("r2")
-    assert account.pending_chunks() == 1  # both r1+r2 batches drained
-
-    # A finish drops the request from its batch without touching the loads
-    # (the caller settles the loads separately).
+    account.note_send_watermark(0)
+    assert list(account.pending_batches) == [1, 2]
+    account.drop_request("r1")
+    assert account.pending_batches == {1: {"r2"}, 2: {"r3"}}
+    account.drop_request("r2")
+    assert account.pending_batches == {2: {"r3"}}
     account.drop_request("r3")
     assert account.pending_chunks() == 0
 
