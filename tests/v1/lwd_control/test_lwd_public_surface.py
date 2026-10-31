@@ -175,8 +175,7 @@ def test_review_deleted_code_stays_deleted():
     """评审裁剪的代码不再回流(后续功能落地时随功能整体回归):
     - 零接受活行剔除(_filter_deliver_rows,4 卡问题修复,后续再带上);
     - 边调度器请求入口编排 lwd_edge_add_request(收编进引擎 add_request);
-    - 云侧哈希链前缀缓存(_lwd_build_hashed_request / local_hasher /
-      request_block_hasher,前缀缓存功能另上)。"""
+    - 云侧 wire-aware 哈希链统一在 _lwd_build_request,不回流旧构造helper。"""
     cloud_sched = (
         VLLM_DIR
         / "v1"
@@ -200,12 +199,8 @@ def test_review_deleted_code_stays_deleted():
         / "control_cloud_scheduler"
         / "lwd_cloud_engine.py"
     ).read_text()
-    for banned in (
-        "_lwd_build_hashed_request",
-        "local_hasher",
-        "request_block_hasher",
-    ):
-        assert banned not in cloud_engine, banned
+    assert "_lwd_build_hashed_request" not in cloud_engine
+    assert "block_hasher=block_hasher" in cloud_engine
     assert "LwdAbortNotify" not in edge_sched
     edge_engine = (
         VLLM_DIR

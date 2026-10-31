@@ -20,107 +20,175 @@ def candidate(rid: str, prompt: int, computed: int = 0) -> LwdPrefillCandidate:
 
 @pytest.mark.parametrize(
     (
-        "running", "waiting", "cap", "free_seq",
-        "chunk_unit", "single_min", "want",
+        "running",
+        "waiting",
+        "cap",
+        "free_seq",
+        "chunk_unit",
+        "single_min",
+        "want",
     ),
     [
         # cap < 1:空批
         ([], [candidate("a", 100)], 0, 5, 8192, 0, {}),
         # 简单开新:FCFS 前缀
         (
-            [], [candidate("a", 100), candidate("b", 50)],
-            200, 5, 8192, 0,
+            [],
+            [candidate("a", 100), candidate("b", 50)],
+            200,
+            5,
+            8192,
+            0,
             {"a": 100, "b": 50},
         ),
         # 续传优先:running 未发完的先收尾,再开新
         (
-            [candidate("r", 300, computed=100)], [candidate("a", 100)],
-            400, 5, 8192, 0,
+            [candidate("r", 300, computed=100)],
+            [candidate("a", 100)],
+            400,
+            5,
+            8192,
+            0,
             {"r": 200, "a": 100},
         ),
         # 续传剩余耗尽(computed == prompt):跳过
         (
-            [candidate("r", 100, computed=100)], [candidate("a", 10)],
-            400, 5, 8192, 0,
+            [candidate("r", 100, computed=100)],
+            [candidate("a", 10)],
+            400,
+            5,
+            8192,
+            0,
             {"a": 10},
         ),
         # 末位截断:最后条目被剩余额度截尾,Σ == cap
         (
-            [], [candidate("a", 100), candidate("b", 100)],
-            150, 5, 8192, 0,
+            [],
+            [candidate("a", 100), candidate("b", 100)],
+            150,
+            5,
+            8192,
+            0,
             {"a": 100, "b": 50},
         ),
         # 截断剩余额度为 0:该条目不入批
         (
-            [], [candidate("a", 100), candidate("b", 10)],
-            100, 5, 8192, 0,
+            [],
+            [candidate("a", 100), candidate("b", 10)],
+            100,
+            5,
+            8192,
+            0,
             {"a": 100},
         ),
         # 截断块占预算:后续开新不超批(真机事故:漏记 used 超批 2x)
         (
-            [], [candidate("a", 4000), candidate("b", 3000)],
-            6000, 5, 8192, 0,
+            [],
+            [candidate("a", 4000), candidate("b", 3000)],
+            6000,
+            5,
+            8192,
+            0,
             {"a": 4000, "b": 2000},
         ),
         # 续传段截断
         (
-            [candidate("r", 500)], [],
-            300, 5, 8192, 0,
+            [candidate("r", 500)],
+            [],
+            300,
+            5,
+            8192,
+            0,
             {"r": 300},
         ),
         # free_seq 钳制:开新名额耗尽即停
         (
-            [], [candidate("a", 10), candidate("b", 10)],
-            100, 1, 8192, 0,
+            [],
+            [candidate("a", 10), candidate("b", 10)],
+            100,
+            1,
+            8192,
+            0,
             {"a": 10},
         ),
         # free_seq = 0:一个新请求都不开
         (
-            [], [candidate("a", 10)],
-            100, 0, 8192, 0,
+            [],
+            [candidate("a", 10)],
+            100,
+            0,
+            8192,
+            0,
             {},
         ),
         # chunk_unit 切块:开新 c = min(prompt, C)
         (
-            [], [candidate("a", 100)],
-            1000, 5, 30, 0,
+            [],
+            [candidate("a", 100)],
+            1000,
+            5,
+            30,
+            0,
             {"a": 30},
         ),
         # chunk_unit 切块:续传 c = min(剩余, C)
         (
-            [candidate("r", 100, computed=70)], [],
-            1000, 5, 40, 0,
+            [candidate("r", 100, computed=70)],
+            [],
+            1000,
+            5,
+            40,
+            0,
             {"r": 30},
         ),
         # single_prefill:达标请求在队首,独占整批
         (
-            [], [candidate("b", 9000), candidate("a", 100)],
-            20000, 5, 8192, 8000,
+            [],
+            [candidate("b", 9000), candidate("a", 100)],
+            20000,
+            5,
+            8192,
+            8000,
             {"b": 8192},
         ),
         # single_prefill:达标请求在后,前面短请求收批,长请求留下一批
         (
-            [], [candidate("a", 100), candidate("b", 9000)],
-            20000, 5, 8192, 8000,
+            [],
+            [candidate("a", 100), candidate("b", 9000)],
+            20000,
+            5,
+            8192,
+            8000,
             {"a": 100},
         ),
         # single_prefill:running 中段出现,当前批收口(短请求先行)
         (
             [candidate("s", 100), candidate("r", 9000)],
             [candidate("a", 100)],
-            20000, 5, 8192, 8000,
+            20000,
+            5,
+            8192,
+            8000,
             {"s": 100},
         ),
         # single_prefill:续传段命中,标志跨进开新循环,本批不再装新
         (
-            [candidate("r", 9000)], [candidate("a", 100)],
-            20000, 5, 8192, 8000,
+            [candidate("r", 9000)],
+            [candidate("a", 100)],
+            20000,
+            5,
+            8192,
+            8000,
             {"r": 8192},
         ),
         # single_prefill 关闭(阈值 0):长请求正常合批
         (
-            [], [candidate("a", 100), candidate("b", 9000)],
-            20000, 5, 8192, 0,
+            [],
+            [candidate("a", 100), candidate("b", 9000)],
+            20000,
+            5,
+            8192,
+            0,
             {"a": 100, "b": 8192},
         ),
     ],
@@ -150,3 +218,16 @@ def test_pick_order_is_running_then_waiting():
         chunk_unit=8192,
     )
     assert req_ids == ["r", "a"]
+
+
+def test_waiting_candidates_use_negotiated_computed_tokens():
+    req_ids, got = lwd_pick_prefill_batch(
+        [],
+        [candidate("hit", 100, computed=64), candidate("done", 32, computed=32)],
+        cap=100,
+        free_seq=5,
+        chunk_unit=16,
+    )
+
+    assert req_ids == ["hit"]
+    assert got == {"hit": 16}
