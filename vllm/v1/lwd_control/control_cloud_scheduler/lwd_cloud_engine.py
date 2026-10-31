@@ -32,6 +32,9 @@ from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdown
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    init_lwd_prefix_cache,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
@@ -46,7 +49,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdCloudToEdgeMessage,
     LwdEdgeToCloudMessage,
     LwdMessage,
+    LwdPrefixReadyNotify,
     LwdRangeNotify,
+    LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_edge_to_cloud,
 )
@@ -70,8 +75,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
         vllm_config = kwargs["vllm_config"]
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise ValueError("[LWD] cloud prefix caching is unsupported")
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            and getattr(vllm_config, "kv_transfer_config", None) is not None
+        ):
+            raise ValueError(
+                "[LWD] prefix caching with KV connector is unsupported: "
+                "external hits bypass the negotiated READY boundary"
+            )
         # Pre-recv hint MQ must exist before super().__init__ spawns the
         # executor workers (same process): create_hint_mq() publishes the
         # handle through the environment, and only processes spawned after
@@ -105,12 +116,30 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_done_mq = MessageQueue.create_from_handle(handles[0], 0)
         lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
 
+    def _lwd_init_prefix_cache(self) -> None:
+        state = init_lwd_prefix_cache(
+            self.vllm_config,
+            self.scheduler.kv_cache_config,
+            self.scheduler.kv_cache_manager,
+            use_eagle=bool(getattr(self.scheduler, "use_eagle", False)),
+        )
+        self._lwd_prefix_state = state
+        self._lwd_prefix_enabled = state.enabled
+        self._lwd_hash_block_size = state.hash_block_size
+        if state.enabled:
+            self.scheduler.lwd_prefix_reservations = state.reservations
+            self.scheduler.lwd_refill_sender = self._lwd_send_refill
+
     def _lwd_assemble(self) -> None:
+        self._lwd_init_prefix_cache()
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
         self._lwd_prompt_lens: dict[str, int] = {}
         self._lwd_retired_prompt_lens: dict[str, int] = {}
+        self._lwd_request_nonces: dict[str, int] = {}
+        self._lwd_retired_nonces: dict[str, int] = {}
         self._lwd_retired_req_ids: set[str] = set()
+        self._lwd_rejected_nonces: dict[str, int] = {}
         self._lwd_pending_seqnos: dict[int, set[str]] = {}
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqno = -1
@@ -124,6 +153,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
             dp_coordinator_addr=self._lwd_dp_coordinator_addr(),
+            prefix_caching=self._lwd_prefix_enabled,
+            hash_block_size=self._lwd_hash_block_size,
+            prefix_alignment_tokens=self._lwd_prefix_state.alignment_tokens,
+            prefix_alignment_required=self._lwd_prefix_state.alignment_required,
+            prefix_use_eagle=self._lwd_prefix_state.use_eagle,
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -181,6 +215,86 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 return
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+
+    def _lwd_send_prefix_ready(
+        self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
+    ) -> None:
+        assert self._lwd_edge is not None, "prefix reply before edge registration"
+        self._lwd_send_until_queued(
+            self._lwd_edge,
+            LwdPrefixReadyNotify(request_id, hit_tokens, nonce, error),
+        )
+        lwd_logger.info(
+            "[prefix] READY req=%s hit=%d nonce=%d error=%r",
+            request_id,
+            hit_tokens,
+            nonce,
+            error,
+        )
+
+    def _lwd_send_refill(
+        self, request_id: str, start_row: int, end_row: int, prefix_nonce: int
+    ) -> None:
+        assert self._lwd_edge is not None, "refill before edge registration"
+        self._lwd_send_until_queued(
+            self._lwd_edge,
+            LwdRefillNotify(request_id, start_row, end_row, prefix_nonce),
+        )
+        lwd_logger.info(
+            "[prefix] REFILL req=%s rows=[%d, %d) nonce=%d",
+            request_id,
+            start_row,
+            end_row,
+            prefix_nonce,
+        )
+
+    def add_request(self, request: Request, request_wave: int = 0) -> None:
+        nonce = getattr(request, "lwd_prefix_nonce", 0)
+        if not nonce:
+            if self._lwd_prefix_enabled:
+                lwd_logger.error(
+                    "[prefix] reject req=%s: missing prefix nonce",
+                    request.request_id,
+                )
+                return
+            super().add_request(request, request_wave)
+            return
+
+        request_id = request.request_id
+        if request_id in getattr(self.scheduler, "requests", {}):
+            self._lwd_send_prefix_ready(
+                request_id, 0, nonce, error="duplicate active request id"
+            )
+            return
+        reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
+        if reservations is None:
+            self._lwd_send_prefix_ready(
+                request_id, 0, nonce, error="cloud prefix caching is disabled"
+            )
+            return
+        if not getattr(request, "lwd_wire_hashes_adopted", False):
+            self._lwd_send_prefix_ready(
+                request_id,
+                0,
+                nonce,
+                error="prefix hash chain does not match cloud hash block size",
+            )
+            return
+        try:
+            hit_tokens = reservations.reserve(request)
+        except Exception as exc:
+            lwd_logger.exception("[prefix] reserve failed req=%s", request_id)
+            self._lwd_send_prefix_ready(request_id, 0, nonce, error=str(exc))
+            return
+        try:
+            super().add_request(request, request_wave)
+        except Exception:
+            reservations.release(request_id)
+            self._lwd_send_prefix_ready(
+                request_id, 0, nonce, error="cloud admission failed"
+            )
+            raise
+        self._lwd_send_prefix_ready(request_id, hit_tokens, nonce)
 
     def _lwd_register_recv_hint(self) -> None:
         """[LWD][pre-recv] Early receive: the hint delivery channel =
@@ -246,6 +360,25 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_handle_range_notify(self, notify: LwdRangeNotify) -> None:
         """Post each new extended hint exactly once, including mixed batches."""
+        rejected = getattr(self, "_lwd_rejected_nonces", {})
+        if any(
+            rejected.get(item.request_id) == item.prefix_nonce for item in notify.items
+        ):
+            lwd_logger.info(
+                "[cloud] ignore RangeNotify for rejected generation seqno=%d",
+                notify.seqno,
+            )
+            return
+        current_nonces = getattr(self, "_lwd_request_nonces", {})
+        if any(
+            item.request_id in current_nonces
+            and current_nonces[item.request_id] != item.prefix_nonce
+            for item in notify.items
+        ):
+            lwd_logger.warning(
+                "[cloud] ignore stale RangeNotify seqno=%d", notify.seqno
+            )
+            return
         if notify.seqno <= self._lwd_latest_seqno:
             lwd_logger.info(
                 "[cloud] ignore duplicate RangeNotify seqno=%d", notify.seqno
@@ -277,17 +410,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             num_tokens,
             time.monotonic(),
         )
-        post_irecv_hint(
-            make_recv_hint(
-                notify.seqno,
-                num_tokens,
-                0,
-                req_ids=request_ids,
-                rows=[item.num_tokens for item in items],
-                prompt_offsets=[item.offset for item in items],
-                prompt_lens=prompt_lens,
-            )
-        )
+        hint_fields: dict[str, Any] = {
+            "req_ids": request_ids,
+            "rows": [item.num_tokens for item in items],
+            "prompt_offsets": [item.offset for item in items],
+            "prompt_lens": prompt_lens,
+            "prefix_nonces": [item.prefix_nonce for item in items],
+        }
+        if any(item.is_refill for item in items):
+            hint_fields["refills"] = [item.is_refill for item in items]
+        post_irecv_hint(make_recv_hint(notify.seqno, num_tokens, 0, **hint_fields))
 
     def _lwd_track_range(self, seqno: int, request_ids: list[str]) -> None:
         self._lwd_latest_seqno = seqno
@@ -310,21 +442,34 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 self._lwd_clear_retired(request_id)
 
     def _lwd_handle_request_notify(self, notify: LwdRequestNotify) -> None:
-        if self._lwd_request_seqnos.get(notify.request_id):
-            raise RuntimeError(
-                f"[LWD] request_id {notify.request_id} reused while the "
-                "previous generation still has pending receives"
+        request_id = notify.request_id
+        current = getattr(self, "_lwd_request_nonces", {}).get(request_id)
+        if (self._lwd_request_seqnos.get(request_id) and current is None) or (
+            current is not None and current != notify.prefix_nonce
+        ):
+            self._lwd_rejected_nonces[request_id] = notify.prefix_nonce
+            self._lwd_send_prefix_ready(
+                request_id,
+                0,
+                notify.prefix_nonce,
+                error="request id reused before previous generation drained",
             )
-        self._lwd_prompt_lens[notify.request_id] = notify.num_prompt_tokens
+            lwd_logger.warning(
+                "[cloud] reject early reuse req=%s nonce=%d",
+                request_id,
+                notify.prefix_nonce,
+            )
+            return
+        self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
+        self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
-            "[cloud] request added req=%s tokens=%d",
-            notify.request_id,
+            "[cloud] request added req=%s tokens=%d nonce=%d",
+            request_id,
             notify.num_prompt_tokens,
+            notify.prefix_nonce,
         )
-        # The local request proves work exists even if the coordinator's
-        # FIRST_REQ wake-up could not reach this DP engine.
         if not self.engines_running:
             self.engines_running = True
             lwd_logger.info(
@@ -333,8 +478,52 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_handle_abort_notify(self, notify: LwdAbortNotify) -> None:
         request_id = notify.request_id
+        current = getattr(self, "_lwd_request_nonces", {}).get(request_id)
+        retired = getattr(self, "_lwd_retired_nonces", {}).get(request_id)
+        if request_id in self._lwd_retired_req_ids and retired == notify.prefix_nonce:
+            lwd_logger.info(
+                "[cloud] ignore duplicate abort req=%s nonce=%d",
+                request_id,
+                notify.prefix_nonce,
+            )
+            return
+        if (
+            getattr(self, "_lwd_rejected_nonces", {}).get(request_id)
+            == notify.prefix_nonce
+        ):
+            lwd_logger.info(
+                "[cloud] ignore abort for rejected generation req=%s nonce=%d",
+                request_id,
+                notify.prefix_nonce,
+            )
+            return
+        if current is not None and current != notify.prefix_nonce:
+            lwd_logger.warning(
+                "[cloud] ignore stale abort req=%s nonce=%d current=%d",
+                request_id,
+                notify.prefix_nonce,
+                current,
+            )
+            return
+        if current is None and retired is not None and retired != notify.prefix_nonce:
+            lwd_logger.warning(
+                "[cloud] ignore stale abort req=%s nonce=%d retired=%d",
+                request_id,
+                notify.prefix_nonce,
+                retired,
+            )
+            return
+        if current is None and retired is None and notify.prefix_nonce != 0:
+            lwd_logger.warning(
+                "[cloud] ignore abort for unknown generation req=%s nonce=%d",
+                request_id,
+                notify.prefix_nonce,
+            )
+            return
         self._lwd_retire_request(request_id, preserve_prompt=True)
-        lwd_logger.info("[cloud] abort req=%s", request_id)
+        lwd_logger.info(
+            "[cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
+        )
         self.aborts_queue.put_nowait([request_id])
         self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
 
@@ -342,6 +531,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self, request_id: str, preserve_prompt: bool = False
     ) -> None:
         self.scheduler.lwd_recv_rows.pop(request_id, None)
+        retired_nonces = getattr(self, "_lwd_retired_nonces", None)
+        if retired_nonces is not None:
+            retired_nonces[request_id] = getattr(self, "_lwd_request_nonces", {}).get(
+                request_id, 0
+            )
         if not self._lwd_request_seqnos.get(request_id):
             self._lwd_clear_retired(request_id)
             return
@@ -354,8 +548,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_clear_retired(self, request_id: str) -> None:
         self._lwd_retired_req_ids.discard(request_id)
         self._lwd_retired_prompt_lens.pop(request_id, None)
+        getattr(self, "_lwd_retired_nonces", {}).pop(request_id, None)
+        getattr(self, "_lwd_request_nonces", {}).pop(request_id, None)
         self._lwd_request_seqnos.pop(request_id, None)
         self._lwd_prompt_lens.pop(request_id, None)
+        getattr(self, "_lwd_rejected_nonces", {}).pop(request_id, None)
 
     def shutdown(self) -> None:
         # Before the executor goes: a pre-recv hint blocks on its queue.
@@ -365,41 +562,58 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
-        """Request building (the sole request-creation point): sampling
-        params rebuilt from the request notify + placeholder meta
-        embeds (shape only, no storage; prompt length is the row
-        count; the worker rebuilds a local zeroed buffer from is_meta,
-        and the UP inject writes straight into that buffer window).
-        Prefix caching is rejected before engine startup."""
+        """Build a placeholder request whose initial hashes come from the edge."""
         sampling_params = self._lwd_build_sampling_params(req_notify)
-        # Meta embeds carry only the prompt shape. Full-prompt M-RoPE
-        # positions travel separately to scheduled_new_reqs.
         prompt_embeds = torch.empty(
             req_notify.num_prompt_tokens,
             self.vllm_config.model_config.get_hidden_size(),
             dtype=self.vllm_config.model_config.dtype,
             device="meta",
         )
+        local_hasher = getattr(self, "request_block_hasher", None)
+        hash_block_size = getattr(self, "_lwd_hash_block_size", 0)
+        expected = (
+            req_notify.num_prompt_tokens // hash_block_size
+            if local_hasher is not None and hash_block_size > 0
+            else 0
+        )
+
+        def block_hasher(request: Request) -> list[bytes]:
+            if request.num_output_tokens > 0:
+                return []
+            if (
+                local_hasher is not None
+                and not request.block_hashes
+                and len(req_notify.block_hashes) == expected
+            ):
+                return list(req_notify.block_hashes)
+            assert local_hasher is not None
+            return local_hasher(request)
+
         request = Request(
             request_id=req_notify.request_id,
             prompt_token_ids=None,
             prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
+            block_hasher=block_hasher if local_hasher is not None else None,
         )
         request.lwd_mrope_positions = req_notify.mrope_positions
+        request.lwd_prefix_nonce = req_notify.prefix_nonce
+        request.lwd_wire_hashes_adopted = (
+            local_hasher is not None and len(req_notify.block_hashes) == expected
+        )
         return request
 
     @staticmethod
     def _lwd_build_sampling_params(req_notify: LwdRequestNotify) -> SamplingParams:
-        """Sampling params rebuilt from the request notify (field-table
-        driven); eos_token_id goes through the native backfill entry
-        (sets _eos_token_id and adds it to _all_stop_token_ids for the
-        min_tokens check; the cloud has no client generation_config,
-        so pass empty)."""
+        """Rebuild sampling state carried by the request notify."""
         values = {f: getattr(req_notify, f) for f in LWD_SAMPLING_DEFAULTS}
         values["stop_token_ids"] = list(values["stop_token_ids"])
-        sampling_params = SamplingParams(**values)
+        sampling_params = SamplingParams(
+            **values,
+            skip_reading_prefix_cache=req_notify.skip_reading_prefix_cache,
+        )
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
         return sampling_params
@@ -453,6 +667,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             if isinstance(item, tuple) and len(item) == 3 and item[0] == "error":
                 self._lwd_fail(f"[LWD] worker receive error seqno={item[1]}: {item[2]}")
                 return
+            if (
+                isinstance(item, tuple)
+                and len(item) in (2, 3)
+                and item[0] == "refill_done"
+            ):
+                if len(item) == 2:
+                    self.scheduler.lwd_refill_done(str(item[1]))
+                else:
+                    self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
+                continue
             if (
                 isinstance(item, tuple)
                 and len(item) == 2

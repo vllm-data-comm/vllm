@@ -117,6 +117,7 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
     scheduler.requests["r1"] = SimpleNamespace(
         num_computed_tokens=5,
         prompt_token_ids=[0, 1, 2, 3, 4],
+        lwd_prefix_nonce=11,
     )
 
     built = scheduler._lwd_build_range_items({"r1": 2})
@@ -124,6 +125,7 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
     assert built is not None
     items, _, _, _, _ = built
     assert items[0].has_mrope
+    assert items[0].prefix_nonce == 11
     assert items[0].mrope_positions == b""
     assert scheduler.lwd_mrope_positions("r1") == b"full-prompt"
 

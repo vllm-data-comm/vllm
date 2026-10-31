@@ -177,7 +177,10 @@ def _pick_new_requests(
         )
         if single_prefill and picked:
             break
-        chunk = min(cand.num_prompt_tokens, chunk_unit)
+        remaining = cand.num_prompt_tokens - cand.num_computed_tokens
+        if remaining <= 0:
+            continue
+        chunk = min(remaining, chunk_unit)
         if new_count >= free_seq:
             break
         used, batch_closed = _append_chunk(

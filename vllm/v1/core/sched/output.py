@@ -62,6 +62,7 @@ class LwdEmbedBatch:
     """Cloud DP rank this batch travels to; the edge worker picks the UP
     channel of this DP connection. 0 keeps single-cloud behaviour."""
     aborted_req_ids: list[str] = field(default_factory=list)
+    is_refill: bool = False
 
 
 @dataclass

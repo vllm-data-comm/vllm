@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -19,6 +20,9 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
     _LwdPrefillWindow,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    LwdPrefixReservations,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
@@ -28,6 +32,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRangeNotify,
     LwdRequestNotify,
 )
+from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 
@@ -35,11 +40,24 @@ class _Request(SimpleNamespace):
     __hash__ = object.__hash__
 
 
-def _request(request_id: str = "p", prompt: int = 10, computed: int = 2):
+def _request(
+    request_id: str = "p",
+    prompt: int = 10,
+    computed: int = 2,
+    *,
+    preemptions: int = 0,
+    skip: bool = False,
+    floor: int = 0,
+):
     return _Request(
         request_id=request_id,
         num_prompt_tokens=prompt,
+        num_tokens=prompt,
         num_computed_tokens=computed,
+        num_preemptions=preemptions,
+        block_hashes=[],
+        skip_reading_prefix_cache=skip,
+        lwd_resume_cap_tokens=floor,
         is_finished=lambda: False,
         lwd_window_cap=None,
     )
@@ -67,6 +85,23 @@ def _scheduler(request) -> LwdCloudScheduler:
     scheduler.lwd_recv_rows = {}
     scheduler._lwd_dropped = set()
     scheduler._lwd_abort_pending = []
+    scheduler._lwd_prefix_enabled = False
+    scheduler._lwd_refill_gate = set()
+    scheduler._lwd_refill_pending = {}
+    return scheduler
+
+
+def _prefix_scheduler(request, groups, hit: int, recv_rows: int):
+    scheduler = _scheduler(request)
+    scheduler._lwd_prefix_enabled = True
+    scheduler.lwd_recv_rows[request.request_id] = recv_rows
+    scheduler.lwd_refill_sender = Mock()
+    manager = SimpleNamespace(coordinator=Mock(), block_pool=Mock())
+    manager.coordinator.find_longest_cache_hit.return_value = (groups, hit, 0)
+    manager.coordinator.single_type_managers = (SimpleNamespace(block_size=16),)
+    manager.coordinator.scheduler_block_size = 16
+    scheduler.kv_cache_manager = manager
+    scheduler.lwd_prefix_reservations = LwdPrefixReservations(manager)
     return scheduler
 
 
@@ -74,7 +109,10 @@ def _engine(prompt_lens: dict[str, int] | None = None) -> LwdCloudEngineCoreMixi
     engine = LwdCloudEngineCoreMixin.__new__(LwdCloudEngineCoreMixin)
     engine._lwd_prompt_lens = dict(prompt_lens or {})
     engine._lwd_retired_prompt_lens = {}
+    engine._lwd_request_nonces = {}
+    engine._lwd_retired_nonces = {}
     engine._lwd_retired_req_ids = set()
+    engine._lwd_rejected_nonces = {}
     engine._lwd_pending_seqnos = {}
     engine._lwd_request_seqnos = {}
     engine._lwd_latest_seqno = -1
@@ -316,7 +354,10 @@ def test_range_notify_posts_only_extended_hint(monkeypatch):
     monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
     notify = LwdRangeNotify(
         7,
-        [LwdRangeItem("a", 2, 3), LwdRangeItem("b", 1, 2)],
+        [
+            LwdRangeItem("a", 2, 3, prefix_nonce=3),
+            LwdRangeItem("b", 1, 2, prefix_nonce=5),
+        ],
     )
 
     engine._lwd_handle_range_notify(notify)
@@ -327,6 +368,7 @@ def test_range_notify_posts_only_extended_hint(monkeypatch):
         "rows": [3, 2],
         "prompt_offsets": [2, 1],
         "prompt_lens": [8, 6],
+        "prefix_nonces": [3, 5],
     }
 
 
@@ -478,15 +520,98 @@ def test_drained_retirement_allows_same_id_reuse(retire_kind):
     assert engine.scheduler.lwd_recv_rows == {"p": 4}
 
 
-def test_request_id_reuse_fails_while_previous_generation_drains():
+def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch) -> None:
+    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
+
     engine = _engine({"p": 4})
+    engine._lwd_request_nonces["p"] = 1
     engine._lwd_track_range(1, ["p"])
     engine._lwd_retire_request("p", preserve_prompt=True)
     _allow_request_add(engine)
+    engine.aborts_queue = queue.Queue()
+    engine._lwd_send_prefix_ready = Mock()
+    posted = []
+    monkeypatch.setattr(
+        lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
+    )
+    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
 
-    with pytest.raises(RuntimeError, match="previous generation"):
-        engine._lwd_handle_request_notify(LwdRequestNotify("p", 4))
+    engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
+
+    ready_args = engine._lwd_send_prefix_ready.call_args
+    assert ready_args.args[:3] == ("p", 0, 2)
+    assert "previous generation" in ready_args.kwargs["error"]
+    assert engine._lwd_rejected_nonces == {"p": 2}
     assert engine.input_queue.empty()
+    assert engine._lwd_prompt_lens["p"] == 4
+
+    engine._lwd_handle_range_notify(
+        LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
+    )
+    engine._lwd_handle_abort_notify(LwdAbortNotify("p", prefix_nonce=2))
+
+    assert not posted
+    assert engine.aborts_queue.empty()
+    assert engine._lwd_latest_seqno == 1
+    assert engine._lwd_pending_seqnos == {1: {"p"}}
+
+    engine._lwd_complete_seqno(1)
+
+    assert engine._lwd_rejected_nonces == {}
+    engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
+    request_type, (request, _wave) = engine.input_queue.get_nowait()
+    assert request_type.name == "ADD"
+    assert request.lwd_prefix_nonce == 2
+    assert engine._lwd_prompt_lens["p"] == 8
+
+    engine._lwd_handle_range_notify(
+        LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
+    )
+    assert len(posted) == 1
+    assert engine._lwd_pending_seqnos == {2: {"p"}}
+
+
+def test_rejected_range_does_not_block_other_seqnos(monkeypatch) -> None:
+    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
+
+    engine = _engine({"p": 4, "q": 6})
+    engine._lwd_request_nonces.update({"p": 1, "q": 1})
+    engine._lwd_track_range(1, ["p"])
+    engine._lwd_retire_request("p", preserve_prompt=True)
+    _allow_request_add(engine)
+    engine._lwd_send_prefix_ready = Mock()
+    posted = []
+    monkeypatch.setattr(
+        lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
+    )
+    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
+    engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
+    engine._lwd_handle_range_notify(
+        LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
+    )
+
+    engine._lwd_handle_range_notify(
+        LwdRangeNotify(3, [LwdRangeItem("q", 0, 6, prefix_nonce=1)])
+    )
+
+    assert [args[0] for args, _kwargs in posted] == [3]
+    assert engine._lwd_latest_seqno == 3
+    assert engine._lwd_pending_seqnos == {1: {"p"}, 3: {"q"}}
+
+
+def test_stale_abort_is_ignored_for_current_generation() -> None:
+    engine = _engine({"p": 8})
+    engine._lwd_request_nonces["p"] = 2
+    engine._lwd_retired_nonces["p"] = 1
+    engine.aborts_queue = queue.Queue()
+    engine.input_queue = queue.Queue()
+
+    engine._lwd_handle_abort_notify(LwdAbortNotify("p", prefix_nonce=1))
+
+    assert engine.input_queue.empty()
+    assert engine.aborts_queue.empty()
+    assert engine._lwd_request_nonces["p"] == 2
+    assert engine._lwd_prompt_lens["p"] == 8
 
 
 def test_retired_state_is_bounded_after_drain():
@@ -542,7 +667,133 @@ def test_worker_error_fails_engine_without_advancing_watermark(monkeypatch):
     assert watermark == []
 
 
-def test_prefix_caching_is_rejected_before_engine_startup():
-    config = SimpleNamespace(cache_config=SimpleNamespace(enable_prefix_caching=True))
-    with pytest.raises(ValueError, match="prefix caching is unsupported"):
-        LwdCloudEngineCoreMixin(vllm_config=config, lwd_dp_size=1)
+@pytest.mark.parametrize("floor", [16, 32])
+def test_prefix_readmission_self_hit_uses_frozen_start(floor):
+    blocks = [SimpleNamespace(is_null=False) for _ in range(2)]
+    request = _request(prompt=64, computed=0, preemptions=1, floor=floor)
+    scheduler = _prefix_scheduler(request, (blocks,), hit=32, recv_rows=40)
+
+    windows = scheduler._lwd_collect_prefill_windows(room=8)
+
+    assert [(w.start, w.num_rows) for w in windows] == [(32, 8)]
+    assert scheduler.lwd_prefix_reservations.hit_of("p") == 32
+    scheduler.lwd_refill_sender.assert_not_called()
+    scheduler.kv_cache_manager.block_pool.touch.assert_called_once_with(blocks)
+
+
+def test_prefix_readmission_clamps_to_arrival_and_scheduler_block():
+    blocks = [SimpleNamespace(is_null=False) for _ in range(2)]
+    request = _request(prompt=64, computed=0, preemptions=1)
+    scheduler = _prefix_scheduler(request, (blocks,), hit=32, recv_rows=24)
+
+    windows = scheduler._lwd_collect_prefill_windows(room=8)
+
+    assert [(w.start, w.num_rows) for w in windows] == [(16, 8)]
+    scheduler.kv_cache_manager.block_pool.touch.assert_called_once_with(blocks[:1])
+
+
+def test_prefix_readmission_refill_gates_then_done_advances_floor():
+    blocks = [SimpleNamespace(is_null=False) for _ in range(2)]
+    request = _request(prompt=64, computed=0, preemptions=1, floor=32)
+    request.lwd_prefix_nonce = 11
+    scheduler = _prefix_scheduler(request, (blocks,), hit=32, recv_rows=0)
+
+    assert scheduler._lwd_collect_prefill_windows(room=32) == []
+    scheduler.lwd_refill_sender.assert_called_once_with("p", 0, 32, 11)
+    assert scheduler._lwd_refill_gate == {"p"}
+    pending = scheduler._lwd_refill_pending["p"]
+    assert (pending.hit_tokens, pending.prefix_nonce) == (0, 11)
+
+    scheduler.lwd_refill_done("p", 10)
+    assert scheduler._lwd_refill_gate == {"p"}
+    assert scheduler._lwd_refill_pending == {"p": pending}
+    scheduler.lwd_refill_done("p", 11)
+    scheduler.lwd_recv_rows["p"] = 32
+    windows = scheduler._lwd_collect_prefill_windows(room=32)
+    assert request.lwd_resume_cap_tokens == 0
+    assert scheduler._lwd_refill_gate == set()
+    assert [(w.start, w.num_rows) for w in windows] == [(0, 32)]
+    assert scheduler.kv_cache_manager.coordinator.find_longest_cache_hit.call_count == 1
+
+
+def test_skip_reading_readmission_does_not_lookup():
+    request = _request(prompt=32, computed=0, preemptions=1, skip=True)
+    scheduler = _prefix_scheduler(request, (), hit=32, recv_rows=16)
+
+    windows = scheduler._lwd_collect_prefill_windows(room=16)
+
+    assert [(w.start, w.num_rows) for w in windows] == [(0, 16)]
+    scheduler.kv_cache_manager.coordinator.find_longest_cache_hit.assert_not_called()
+    scheduler.kv_cache_manager.block_pool.touch.assert_not_called()
+
+
+def test_c2e_prefix_nonces_read_from_snapshot() -> None:
+    request = _request()
+    scheduler = _scheduler(request)
+
+    assert scheduler._lwd_c2e_prefix_nonces(["p", "missing"], {"p": 7}) == [7, 0]
+
+
+@pytest.mark.parametrize(("nonce", "finish_code"), [(7, 0), (9, 2)])
+def test_update_c2e_preserves_nonce_after_finish_and_abort(
+    monkeypatch, nonce, finish_code
+) -> None:
+    request = _request()
+    request.lwd_prefix_nonce = nonce
+    scheduler = _scheduler(request)
+    scheduler.pending_c2e = []
+    scheduler._lwd_diag = SimpleNamespace(observe_spec_acceptance=Mock())
+
+    def finish_and_delete(self, scheduler_output, model_runner_output):
+        self.requests.clear()
+        output = SimpleNamespace(
+            request_id="p", finish_reason=finish_code, new_token_ids=[]
+        )
+        return {0: SimpleNamespace(finished_requests={"p"}, outputs=[output])}
+
+    monkeypatch.setattr(AsyncScheduler, "update_from_output", finish_and_delete)
+    monkeypatch.setattr(LwdControlDiag, "disable_down_enabled", lambda: True)
+    monkeypatch.setattr(LwdControlDiag, "disable_down_rows", lambda outputs: {"p": []})
+
+    scheduler.update_from_output(
+        SchedulerOutput.make_empty(), SimpleNamespace(lwd_down_carrier=None)
+    )
+
+    assert scheduler.requests == {}
+    assert scheduler.pending_c2e[0].prefix_nonces == [nonce]
+    assert scheduler.pending_c2e[0].finish_reasons == [finish_code]
+
+
+def test_visible_set_releases_only_successful_prefix_allocation(monkeypatch):
+    p1 = _request("p1")
+    p2 = _request("p2")
+    scheduler = _visible_set_scheduler([p1, p2], [])
+    scheduler.lwd_prefix_reservations = Mock()
+
+    def native_schedule(self, throttle_prefills=False):
+        out = SchedulerOutput.make_empty()
+        out.num_scheduled_tokens = {"p1": 4, "p2": 0}
+        return out
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", native_schedule)
+    scheduler._lwd_schedule(["p1", "p2"])
+
+    scheduler.lwd_prefix_reservations.release.assert_called_once_with("p1")
+
+
+def test_free_request_cleans_prefix_reservation_and_refill_gate(monkeypatch):
+    request = _request()
+    scheduler = _visible_set_scheduler([request], [])
+    scheduler.lwd_prefix_reservations = Mock()
+    scheduler._lwd_refill_gate = {"p"}
+    scheduler._lwd_refill_pending = {"p": 16}
+    monkeypatch.setattr(
+        AsyncScheduler,
+        "_free_request",
+        lambda self, request, delay_free_blocks=False: (None, None),
+    )
+
+    assert scheduler._free_request(request) == (None, None)
+    scheduler.lwd_prefix_reservations.release.assert_called_once_with("p")
+    assert scheduler._lwd_refill_gate == set()
+    assert scheduler._lwd_refill_pending == {}
