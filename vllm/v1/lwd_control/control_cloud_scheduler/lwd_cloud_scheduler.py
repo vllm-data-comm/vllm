@@ -27,6 +27,7 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     prefix_start,
 )
@@ -34,6 +35,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
@@ -88,6 +90,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
+        self._lwd_prefill_group_cursor = 0
+        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+        self.lwd_edge_chains: dict[str, tuple[int, list[bytes]]] | None = None
+        self.lwd_hash_block_size = 0
+        self.lwd_prefix_coordinator = None
+        self.lwd_prefix_hits: dict[str, int] = {}
+        self.lwd_refill_sender = None
+        self._lwd_refill_gate: set[str] = set()
+        self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -149,9 +160,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
-        """Freeze a preempted request's arrival-clamped hit before admission."""
-        reservations = self.lwd_prefix_reservations
-        floor = getattr(request, "lwd_resume_cap_tokens", 0)
+        """Revalidate a preempted request against live blocks and arrivals."""
+        coordinator = getattr(self, "lwd_prefix_coordinator", None)
+        reservations = coordinator or getattr(self, "lwd_prefix_reservations", None)
+        assert reservations is not None
+        floor = self.lwd_prefix_hits.get(
+            request.request_id, getattr(request, "lwd_resume_cap_tokens", 0)
+        )
         if request.skip_reading_prefix_cache:
             groups, h_prime = (), 0
         else:
@@ -166,15 +181,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         alignment = self.kv_cache_manager.coordinator.scheduler_block_size
         clamped_hit = min(h_prime, recv_rows // alignment * alignment)
         if clamped_hit < h_prime:
-            lwd_logger.info(
-                "[cloud-sched] clamp readmission req=%s hit=%d -> %d "
-                "recv_rows=%d alignment=%d",
-                request.request_id,
-                h_prime,
-                clamped_hit,
-                recv_rows,
-                alignment,
-            )
             groups = reservations.truncate(groups, clamped_hit)
             h_prime = clamped_hit
 
@@ -190,13 +196,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending[request.request_id] = _LwdRefillPending(
             h_prime, prefix_nonce
         )
-        lwd_logger.info(
-            "[cloud-sched] refill req=%s hit=%d floor=%d nonce=%d",
-            request.request_id,
-            h_prime,
-            floor,
-            prefix_nonce,
-        )
         sender(request.request_id, h_prime, floor, prefix_nonce)
         return False
 
@@ -204,26 +203,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """Lift only the gate belonging to this exact request generation."""
         pending = self._lwd_refill_pending.get(request_id)
         request = self.requests.get(request_id)
-        if pending is None:
-            lwd_logger.warning(
-                "[cloud-sched] stale refill_done req=%s ignored", request_id
-            )
-            return
         current_nonce = getattr(request, "lwd_prefix_nonce", 0) if request else 0
-        if prefix_nonce != pending.prefix_nonce or (
+        if pending is None or prefix_nonce != pending.prefix_nonce or (
             request is not None and current_nonce != pending.prefix_nonce
         ):
             lwd_logger.warning(
-                "[cloud-sched] stale refill_done req=%s nonce=%d ignored: "
-                "pending=%d current=%d",
+                "[cloud-sched] stale refill_done req=%s nonce=%d ignored",
                 request_id,
                 prefix_nonce,
-                pending.prefix_nonce,
-                current_nonce,
             )
             return
         self._lwd_refill_pending.pop(request_id)
         self._lwd_refill_gate.discard(request_id)
+        self.lwd_prefix_hits[request_id] = pending.hit_tokens
         if request is not None:
             request.lwd_resume_cap_tokens = pending.hit_tokens
 
@@ -231,27 +223,49 @@ class LwdCloudScheduler(LwdBaseScheduler):
         windows: list[_LwdPrefillWindow] = []
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
-        for request in itertools.chain(
-            self.running, self.waiting, self.skipped_waiting
-        ):
+        requests = list(
+            itertools.chain(self.running, self.waiting, self.skipped_waiting)
+        )
+        grouped: dict[int, list[Request]] = {}
+        for request in requests:
+            edge_id, _ = parse_edge_id(request.request_id)
+            grouped.setdefault(edge_id, []).append(request)
+        edge_ids = sorted(grouped)
+        if edge_ids:
+            start = self._lwd_prefill_group_cursor % len(edge_ids)
+            self._lwd_prefill_group_cursor = start + 1
+            edge_ids = edge_ids[start:] + edge_ids[:start]
+        ordered = itertools.chain.from_iterable(grouped[edge_id] for edge_id in edge_ids)
+        for request in ordered:
             if room <= 0:
                 break
             request_id = request.request_id
             if request_id in self._lwd_dropped or request.is_finished():
                 continue
             start = request.num_computed_tokens
+            coordinator = getattr(self, "lwd_prefix_coordinator", None)
             if prefix_enabled:
                 if request_id in self._lwd_refill_gate:
                     continue
                 if start == 0:
-                    if (
-                        request.num_preemptions > 0
-                        and reservations is not None
-                        and not reservations.has(request_id)
-                        and not self._lwd_prep_prefix_readmission(request)
-                    ):
-                        continue
-                    start = prefix_start(request, reservations)
+                    if coordinator is not None:
+                        if (
+                            request.num_preemptions > 0
+                            and not coordinator.has_pending_snapshot(request_id)
+                            and not self._lwd_prep_prefix_readmission(request)
+                        ):
+                            continue
+                        if coordinator.has_pending_snapshot(request_id):
+                            start = coordinator.hit_of(request_id)
+                    else:
+                        if (
+                            request.num_preemptions > 0
+                            and reservations is not None
+                            and not reservations.has(request_id)
+                            and not self._lwd_prep_prefix_readmission(request)
+                        ):
+                            continue
+                        start = prefix_start(request, reservations)
             if start >= request.num_prompt_tokens:
                 continue
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
@@ -328,18 +342,60 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 positions = getattr(request, "lwd_mrope_positions", b"")
                 data.lwd_mrope_positions = b"" if positions is None else positions
 
+    def _lwd_cache_tokens(self, request: Request) -> int:
+        """Cap native block publication to the edge-authenticated hash chain."""
+        computed = request.num_computed_tokens - request.num_output_placeholders
+        chains = self.lwd_edge_chains
+        if chains is None:
+            return computed
+        prompt_end = request.num_prompt_tokens
+        if computed <= prompt_end:
+            return computed
+        entry = chains.get(request.request_id)
+        if entry is None:
+            return prompt_end
+        block_size, chain = entry
+        if block_size != self.lwd_hash_block_size:
+            return prompt_end
+        # cache_blocks indexes this list; replace it only on the engine thread.
+        request.block_hashes = list(chain)
+        return min(computed, max(prompt_end, len(chain) * block_size))
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        new_token_ids, stopped = _NativeScheduler._update_request_with_output(
+            self, request, new_token_ids
+        )
+        if not is_stale:
+            request.num_output_placeholders -= len(new_token_ids)
+            assert request.num_output_placeholders >= 0
+        if status_before_update == RequestStatus.RUNNING:
+            self.kv_cache_manager.cache_blocks(
+                request, self._lwd_cache_tokens(request)
+            )
+        return new_token_ids, stopped
+
     def finish_requests(
         self,
         request_ids: str | Iterable[str] | None,
         finished_status: RequestStatus,
     ) -> list[Request]:
+        if request_ids is None:
+            request_ids = list(self.requests)
+        elif isinstance(request_ids, str):
+            request_ids = (request_ids,)
+        else:
+            request_ids = tuple(request_ids)
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            if request is not None:
+                self.lwd_finished_records[request_id] = (
+                    request.num_prompt_tokens,
+                    request.num_output_tokens,
+                )
         if finished_status == RequestStatus.FINISHED_ABORTED:
-            if request_ids is None:
-                request_ids = list(self.requests)
-            elif isinstance(request_ids, str):
-                request_ids = (request_ids,)
-            else:
-                request_ids = tuple(request_ids)
             for request_id in request_ids:
                 self._lwd_drop_request(request_id)
         return super().finish_requests(request_ids, finished_status)
@@ -396,11 +452,18 @@ class LwdCloudScheduler(LwdBaseScheduler):
             scheduler_output, model_runner_output
         )
         self._lwd_cleanup_arrivals(engine_core_outputs)
-        carrier = getattr(model_runner_output, "lwd_down_carrier", None)
-        if carrier is not None:
-            self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
-        elif LwdControlDiag.disable_down_enabled():
-            self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
+        carriers = getattr(model_runner_output, "lwd_down_carriers", None)
+        if carriers:
+            for carrier in carriers:
+                self._lwd_append_carrier_c2e(
+                    carrier[:4], engine_core_outputs, nonce_snapshot
+                )
+        else:
+            carrier = getattr(model_runner_output, "lwd_down_carrier", None)
+            if carrier is not None:
+                self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
+            elif LwdControlDiag.disable_down_enabled():
+                self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
         return engine_core_outputs
 
     def _lwd_cleanup_arrivals(
@@ -409,6 +472,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         for outputs in engine_core_outputs.values():
             for request_id in outputs.finished_requests or ():
                 self.lwd_recv_rows.pop(request_id, None)
+                self.lwd_prefix_hits.pop(request_id, None)
+                self._lwd_refill_gate.discard(request_id)
+                self._lwd_refill_pending.pop(request_id, None)
                 self._lwd_dropped.discard(request_id)
 
     def _lwd_c2e_prefix_nonces(
@@ -463,21 +529,28 @@ class LwdCloudScheduler(LwdBaseScheduler):
         rows = LwdControlDiag.disable_down_rows(engine_core_outputs)
         if not rows:
             return
-        request_ids = list(rows)
-        self.pending_c2e.append(
-            LwdC2eNotify(
-                hidden_num_elements=0,
-                top_id_ths=[],
-                num_accepted_tokens=[],
-                req_ids=request_ids,
-                finish_reasons=self._lwd_c2e_finish_reasons(
-                    request_ids, engine_core_outputs
-                ),
-                down_seqno=-1,
-                token_ids=[rows[request_id] for request_id in request_ids],
-                prefix_nonces=self._lwd_c2e_prefix_nonces(request_ids, nonce_snapshot),
+        rows_by_edge: dict[int, dict[str, list[int]]] = {}
+        for request_id, token_ids in rows.items():
+            edge_id, _ = parse_edge_id(request_id)
+            rows_by_edge.setdefault(edge_id, {})[request_id] = token_ids
+        for edge_rows in rows_by_edge.values():
+            request_ids = list(edge_rows)
+            self.pending_c2e.append(
+                LwdC2eNotify(
+                    hidden_num_elements=0,
+                    top_id_ths=[],
+                    num_accepted_tokens=[],
+                    req_ids=request_ids,
+                    finish_reasons=self._lwd_c2e_finish_reasons(
+                        request_ids, engine_core_outputs
+                    ),
+                    down_seqno=-1,
+                    token_ids=[edge_rows[request_id] for request_id in request_ids],
+                    prefix_nonces=self._lwd_c2e_prefix_nonces(
+                        request_ids, nonce_snapshot
+                    ),
+                )
             )
-        )
 
     @staticmethod
     def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:

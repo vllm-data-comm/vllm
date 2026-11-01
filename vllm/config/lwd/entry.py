@@ -55,6 +55,14 @@ class LwdConfig:
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)
+            unknown_clouds = set(coordination.control_url_map) - {
+                cloud.id for cloud in topology.clouds
+            }
+            if unknown_clouds:
+                raise ValueError(
+                    f"[LWD] control_url_map references unknown clouds "
+                    f"{sorted(unknown_clouds)}"
+                )
         return cls(
             path,
             role,
@@ -64,10 +72,27 @@ class LwdConfig:
             api=api if api is not None else LwdAPIConfig(),
         )
 
+    def skips_module(self, path: str) -> bool:
+        """Whether this role replaces a model component with a placeholder."""
+        if self.role == "edge":
+            return path == "model.norm" or path.endswith(".model.norm")
+        if self.role == "cloud":
+            return path == "visual" or path.endswith(".visual")
+        return False
+
     @property
     def instance(self) -> LwdInstance:
         return self.topology.instance(self.role, self.instance_id)
 
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:
+        if self.role == "edge" and self.topology.deployment.scene == "edge_share":
+            # All logical frontends share this one physical engine. It owns
+            # every logical edge -> cloud connection, while attach-only API
+            # processes never create a second engine or HCCL world.
+            return tuple(
+                connection
+                for edge in self.topology.edges
+                for connection in self.topology.connections("edge", edge.id)
+            )
         return self.topology.connections(self.role, self.instance_id)
