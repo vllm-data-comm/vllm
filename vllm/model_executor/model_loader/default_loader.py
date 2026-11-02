@@ -5,7 +5,6 @@ import glob
 import os
 import time
 from collections.abc import Callable, Generator, Iterable
-from functools import partial
 from typing import cast
 
 import torch
@@ -308,6 +307,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        skip_name=skip_name,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -359,18 +359,15 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        role = lwd_role()
-        skip_name: Callable[[str], bool] | None = (
-            None if role is None else partial(lwd_should_skip_weight, role=role)
+        # Filter placeholders inside the safetensors iterator so skipped
+        # tensors are never read from disk. The outer filter remains the
+        # fallback for other load formats.
+        skip_keys = parse_skip_keys(self._placeholder_module_names(model))
+        skip_name = (
+            (lambda name: name_is_skipped(name, skip_keys)) if skip_keys else None
         )
-        if role is not None:
-            logger.info_once(
-                "[LWD] role=%s skips loading tensors of %s",
-                role,
-                ", ".join(sorted(parse_skip_keys(role))),
-            )
-        yield from _skip_unowned_weights(
-            self._get_weights_iterator(primary_weights, skip_name), skip_name
+        yield from self._skip_unbuilt_weights(
+            model, self._get_weights_iterator(primary_weights, skip_name)
         )
 
         secondary_weights = cast(
@@ -378,8 +375,8 @@ class DefaultModelLoader(BaseModelLoader):
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from _skip_unowned_weights(
-                self._get_weights_iterator(source, skip_name), skip_name
+            yield from self._skip_unbuilt_weights(
+                model, self._get_weights_iterator(source, skip_name)
             )
 
     def download_model(self, model_config: ModelConfig) -> None:

@@ -17,6 +17,7 @@ publishing) unchanged.
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -68,37 +69,18 @@ from vllm.v1.request import Request
 # Sleep between retries of a full outbound queue: step metadata must not be
 # lost, the edge posts its receive of the exact size from it.
 _LWD_SEND_RETRY_SLEEP_S = 0.05
-_LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 
 
-def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
-    """Full-payload log of one cloud->edge control-plane message once queued
-    for the peer; pairs with the edge-side `[edge] c2e received` log. The
-    per-step c2e notify gets per-row detail (top tree / token payloads are
-    reduced to lengths to bound log volume)."""
-    if isinstance(message, LwdC2eNotify):
-        lwd_logger.info(
-            "[cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
-            "req_ids=%s accepted=%s finish=%s nonces=%s top_tree_lens=%s "
-            "token_lens=%s",
-            peer,
-            message.down_seqno,
-            len(message.req_ids),
-            message.hidden_num_elements,
-            message.req_ids,
-            message.num_accepted_tokens,
-            message.finish_reasons,
-            message.prefix_nonces,
-            [len(top) for top in message.top_id_ths],
-            [len(tokens) for tokens in message.token_ids],
-        )
-    else:
-        lwd_logger.info(
-            "[cloud] %s sent to edge %s: %s",
-            type(message).__name__,
-            peer,
-            message,
-        )
+def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
+    """Rebuild the frontend-validated structured-output parameters."""
+    if not payload:
+        return None
+    data = json.loads(payload)
+    backend = data.pop("_backend", None)
+    data.pop("_backend_was_auto", None)
+    params = StructuredOutputsParams(**data)
+    params._backend = backend
+    return params
 
 
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
@@ -197,7 +179,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "compilation and the sampling bitmask happen on the cloud"
             )
         self._lwd_init_prefix_cache()
-        self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edges: set[LwdPeer] = set()
         self._lwd_prompt_lens: dict[str, int] = {}
         self._lwd_retired_prompt_lens: dict[str, int] = {}
@@ -287,16 +268,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             prefix_hash_block_size=prefix_hash_block_size,
         )
         self._lwd_register_recv_hint()
-        # Edge messages are handled off the IO thread: building a request
-        # allocates its placeholder embeds and the pre-recv hint may block,
-        # which must not delay step metadata going out.
-        self._lwd_ingest_queue: queue.SimpleQueue[_LwdIngestItem | None] = (
-            queue.SimpleQueue()
-        )
-        self._lwd_ingest_thread = threading.Thread(
-            target=self._lwd_ingest_loop, name="lwd-cloud-ingest", daemon=True
-        )
-        self._lwd_ingest_thread.start()
+        # Business messages are handed to the engine input queue. Request,
+        # reservation, routing and coordinator state therefore have one owner:
+        # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
 
@@ -467,7 +441,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
 
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
-        """IO thread: hand all edge business notifies to the ingest thread."""
+        """IO thread: preserve order and hand business messages to the engine."""
         if not isinstance(
             msg,
             (
@@ -479,19 +453,28 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ),
         ):
             return False
-        self._lwd_ingest_queue.put((peer, msg))
+        self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, (peer, msg)))
         return True
 
-    def _lwd_ingest_loop(self) -> None:
-        while (item := self._lwd_ingest_queue.get()) is not None:
+    def _handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        if (
+            request_type == EngineCoreRequestType.WAKEUP
+            and isinstance(request, tuple)
+            and len(request) == 2
+            and isinstance(request[0], LwdPeer)
+        ):
+            peer, msg = request
             try:
-                self._lwd_handle_edge_message(*item)
-            except Exception as e:
+                self._lwd_handle_edge_message(peer, msg)
+            except Exception as exc:
                 lwd_logger.exception(
-                    "[cloud] ingest of %s failed", type(item[1]).__name__
+                    "[cloud] ingest of %s failed", type(msg).__name__
                 )
-                self._lwd_fail(f"ingest of {type(item[1]).__name__}: {e!r}")
-                return
+                self._lwd_fail(f"ingest of {type(msg).__name__}: {exc!r}")
+            return
+        super()._handle_client_request(request_type, request)
 
     def _lwd_handle_edge_message(
         self, peer: LwdPeer, msg: LwdEdgeToCloudMessage
@@ -568,19 +551,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
         return LwdConnectionId(
             peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
-        )
-
-    def _lwd_send_refill(
-        self, request_id: str, start_row: int, end_row: int, prefix_nonce: int
-    ) -> None:
-        peer = self._lwd_request_routes.get(request_id)
-        if peer is None:
-            raise RuntimeError(f"[LWD] refill route missing for {request_id}")
-        self._lwd_send_until_queued(
-            peer,
-            LwdRefillNotify(
-                unwrap_req_id(request_id), start_row, end_row, prefix_nonce
-            ),
         )
 
     def _lwd_handle_range_notify(
@@ -759,22 +729,34 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                         edge_request_id, hit, notify.prefix_nonce
                     ),
                 )
-            elif notify.skip_reading_prefix_cache:
+            elif (
+                notify.skip_reading_prefix_cache
+                or (
+                    not notify.prefix_probe_succeeded
+                    and notify.prefix_hit_tokens == 0
+                )
+            ):
+                # Fail-open and placement-only send the full prompt, so any
+                # late/stale probe reservation must not select a cloud hit.
                 coordinator.discard(notify.request_id)
                 self._lwd_prefix_hits[notify.request_id] = 0
             else:
                 hit = coordinator.claim(notify.request_id)
-                if hit is not None:
-                    self._lwd_prefix_hits[notify.request_id] = hit
+                if hit is None or hit != notify.prefix_hit_tokens:
+                    coordinator.discard(notify.request_id)
+                    raise RuntimeError(
+                        "[LWD] gateway prefix boundary mismatch for "
+                        f"{notify.request_id}: edge={notify.prefix_hit_tokens} "
+                        f"cloud={hit}; refusing to consume trimmed embeddings"
+                    )
+                self._lwd_prefix_hits[notify.request_id] = hit
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         if notify.prefix_nonce:
             self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
         if request.use_structured_output:
             # This path constructs Request directly and therefore bypasses
-            # EngineCore.preprocess_add_request, the native grammar-init hook;
-            # without this explicit init the request would sit in
-            # WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR forever with no error.
+            # EngineCore.preprocess_add_request, the native grammar-init hook.
             self.structured_output_manager.grammar_init(request)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
@@ -856,10 +838,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         getattr(self, "_lwd_rejected_nonces", {}).pop(request_id, None)
 
     def shutdown(self) -> None:
-        # Before the executor goes: a pre-recv hint blocks on its queue.
-        if self._lwd_ingest_thread is not None:
-            self._lwd_ingest_queue.put(None)
-            self._lwd_ingest_thread.join(_LWD_INGEST_JOIN_TIMEOUT_S)
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
@@ -916,6 +894,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         sampling_params = SamplingParams(
             **values,
             skip_reading_prefix_cache=req_notify.skip_reading_prefix_cache,
+            structured_outputs=_lwd_decode_structured_outputs(
+                req_notify.structured_outputs
+            ),
         )
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         if req_notify.structured_outputs:

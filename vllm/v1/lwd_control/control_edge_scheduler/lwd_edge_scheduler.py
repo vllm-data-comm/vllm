@@ -523,6 +523,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
+    @staticmethod
+    def _lwd_grammar_ready(request: Request) -> bool:
+        """Keep grammar-compiling requests out of the native visible set."""
+        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            return True
+        structured = request.structured_output_request
+        return bool(structured and structured.grammar)
+
     def _lwd_pick_prefill_batch(
         self, dp_idx: LwdConnectionId
     ) -> tuple[list[str], dict[str, int], int]:
@@ -554,9 +562,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
-            and lwd_grammar_ready(
-                r, RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
-            )
+            and self._lwd_grammar_ready(r)
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,

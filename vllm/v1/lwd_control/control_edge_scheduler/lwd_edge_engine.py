@@ -339,8 +339,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         completion: LwdProbeCompletion | None = None,
     ) -> None:
         preferred = self._lwd_preferred_connection(completion)
+        request.lwd_prefix_probe_succeeded = False
         if completion is not None and completion.result is not None:
             coordination = self.lwd_config.coordination
+            request.lwd_prefix_probe_succeeded = not coordination.placement_only
             hit = 0 if coordination.placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
             alignment = completion.result.alignment_tokens
@@ -452,6 +454,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 eos_token_id=sampling_params.eos_token_id,
                 prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
                 skip_reading_prefix_cache=request.skip_reading_prefix_cache,
+                prefix_hit_tokens=request.num_computed_tokens,
+                prefix_probe_succeeded=getattr(
+                    request, "lwd_prefix_probe_succeeded", False
+                ),
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
                 structured_outputs=(
                     ""

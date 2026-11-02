@@ -104,61 +104,7 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     misses while allowing fail-open requests to discard stale reservations.
     """
     structured_outputs: str = ""
-    """`lwd_encode_structured_outputs` wire JSON of the validated
-    `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
-    the params, compiles the grammar and applies the sampling bitmask; the
-    edge compiles its own copy only for the picker's grammar-ready filter."""
-
-
-def lwd_encode_structured_outputs(params: Any) -> str:
-    """JSON wire form of a validated `StructuredOutputsParams`.
-
-    The private fields (`_backend*`, `init=False`) never ride the field
-    dict: `params_cls(**fields)` rejects them as constructor keywords, so the
-    edge-chosen backend travels next to the fields in the envelope and is
-    re-attached after decode. This is the single implementation shared by the
-    edge packer and the cloud rebuild.
-    """
-    data = dataclasses.asdict(params)
-    backend = data.pop("_backend", None)
-    data.pop("_backend_was_auto", None)
-    return json.dumps({"fields": data, "backend": backend})
-
-
-def lwd_decode_structured_outputs(payload: str, params_cls: type[T]) -> T | None:
-    """Rebuild the constraint params from the wire JSON; None if plain.
-
-    Args:
-        payload: The `LwdRequestNotify.structured_outputs` string.
-        params_cls: The dataclass to rebuild (its public, `init=True` fields
-            must match the envelope's `fields` dict).
-
-    Returns:
-        The rebuilt params with `_backend` re-attached, or None when the
-        payload is the plain-request empty string.
-
-    Raises:
-        ValueError: The payload is not a well-formed envelope.
-    """
-    if not payload:
-        return None
-    try:
-        envelope = json.loads(payload)
-        fields = envelope["fields"]
-        backend = envelope["backend"]
-        if not isinstance(fields, dict):
-            raise TypeError(f"fields must be a dict, got {type(fields).__name__}")
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise ValueError(f"malformed structured_outputs payload {payload!r}") from exc
-    try:
-        params = params_cls(**fields)
-    except TypeError as exc:
-        raise ValueError(
-            f"structured_outputs fields do not fit {params_cls}: {exc}"
-        ) from exc
-    # init=False private field: cannot ride the constructor, reattach here.
-    cast(Any, params)._backend = backend
-    return params
+    """JSON-serialized StructuredOutputsParams, including the validated backend."""
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
@@ -205,24 +151,6 @@ class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-
     completion_tokens: int
     full_block_hashes: list[bytes] = []
     publish_cache: bool = True
-
-
-class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
-    """Cloud -> edge. Result of native single-instance prefix negotiation."""
-
-    request_id: str
-    hit_tokens: int
-    nonce: int
-    error: str = ""
-
-
-class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
-    """Cloud -> edge. Absolute prompt hole to refill after preemption."""
-
-    request_id: str
-    start_row: int
-    end_row: int
-    prefix_nonce: int
 
 
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
