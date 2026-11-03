@@ -70,6 +70,8 @@ from vllm.v1.request import Request
 # lost, the edge posts its receive of the exact size from it.
 _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_RETIRED_ROUTE_CAP = 4096
+# Debug-level cloud concurrency snapshot interval.
+_LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
 
 
 def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
@@ -82,6 +84,36 @@ def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | No
     params = StructuredOutputsParams(**data)
     params._backend = backend
     return params
+
+
+def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
+    """Full-payload log of one cloud->edge control-plane message once queued
+    for the peer; pairs with the edge-side `[edge] c2e received` log. The
+    per-step c2e notify gets per-row detail (top tree / token payloads are
+    reduced to lengths to bound log volume)."""
+    if isinstance(message, LwdC2eNotify):
+        lwd_logger.info(
+            "[cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
+            "req_ids=%s accepted=%s finish=%s nonces=%s top_tree_lens=%s "
+            "token_lens=%s",
+            peer,
+            message.down_seqno,
+            len(message.req_ids),
+            message.hidden_num_elements,
+            message.req_ids,
+            message.num_accepted_tokens,
+            message.finish_reasons,
+            message.prefix_nonces,
+            [len(top) for top in message.top_id_ths],
+            [len(tokens) for tokens in message.token_ids],
+        )
+    else:
+        lwd_logger.info(
+            "[cloud] %s sent to edge %s: %s",
+            type(message).__name__,
+            peer,
+            message,
+        )
 
 
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
@@ -249,6 +281,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 name="lwd-ctrl-wake",
                 daemon=True,
             ).start()
+        self._lwd_cloud_conc_last_log = 0.0
         self._lwd_engine_index = int(
             self.vllm_config.parallel_config.data_parallel_index
         )
@@ -318,6 +351,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 return
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        _lwd_log_sent_to_edge(peer, message)
 
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
@@ -1158,9 +1192,36 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if touched:
             lwd_logger.info("[cloud] arrival high watermarks updated: %s", touched)
 
+    def _lwd_log_cloud_concurrency(self) -> None:
+        """Debug-level snapshot of this engine's concurrency: how many
+        requests it is running right now, plus the backlog and the KV
+        cache occupancy they hold."""
+        now = time.monotonic()
+        if now - self._lwd_cloud_conc_last_log < _LWD_CLOUD_CONC_LOG_INTERVAL_S:
+            return
+        self._lwd_cloud_conc_last_log = now
+        scheduler = self.scheduler
+        block_pool = scheduler.kv_cache_manager.block_pool
+        lwd_logger.debug(
+            "[Lwd][dbg] cloud concurrency cloud_id=%d engine=%d running=%d "
+            "waiting=%d skipped=%d total=%d step=%d | kv_cache usage=%.1f%% "
+            "free=%d total=%d",
+            self.lwd_config.instance_id,
+            self._lwd_engine_index,
+            len(scheduler.running),
+            len(scheduler.waiting),
+            len(scheduler.skipped_waiting),
+            len(scheduler.requests),
+            scheduler.current_step,
+            block_pool.get_usage() * 100.0,
+            block_pool.get_num_free_blocks(),
+            max(0, block_pool.num_gpu_blocks - 1),
+        )
+
     def post_step(self, model_executed: bool) -> None:
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
+        self._lwd_log_cloud_concurrency()
         if self.scheduler.pending_c2e:
             finished_ids: list[str] = []
             for notify in self.scheduler.pending_c2e:
