@@ -128,11 +128,12 @@ class LwdPrefillCandidate(NamedTuple):
 def lwd_pick_prefill_batch(
     running: Sequence[LwdPrefillCandidate], waiting: Sequence[LwdPrefillCandidate],
     *, cap: int, free_seq: int, chunk_unit: int,
-    single_prefill_min_tokens: int = 0,   # >0：总长达到该值的请求独占整批
 ) -> tuple[list[str], dict[str, int]]
 ```
 
-命名沿用原实现词汇：候选（原 `candidates` 变量）、`single_prefill`（原独占规则变量名）、`chunk_unit`（原 `_lwd_chunk_unit`）。内部 `_append_chunk / _pick_resumes / _pick_new_requests` 三函数逐句翻译原两个循环（含 single_prefill 标志跨循环传递、末位截断、free_seq 门）；预算断言随行。调度器侧缩为约 40 行适配层（候选组装 + cap/free_seq 计算 + deepseek_v4 → `single_prefill_min_tokens=8000`），逃生通道分支不复存在。
+命名沿用原实现词汇：候选（原 `candidates` 变量）、`chunk_unit`（原 `_lwd_chunk_unit`）。内部 `_append_chunk / _pick_resumes / _pick_new_requests` 三函数逐句翻译原两个循环（末位截断、free_seq 门）；预算断言随行。调度器侧缩为约 40 行适配层（候选组装 + cap/free_seq 计算），逃生通道分支不复存在。
+
+> 后记：picker 原有的 `single_prefill` 独占规则（长 prompt 独占整批，调度器对 DeepSeek V4 传 8000）已于后续变更移除，长请求与短请求正常合批，签名不再带 `single_prefill_min_tokens`。
 
 ### 6.3 `lwd_edge_awaiting_tracker.py`（约 105 行）——P6
 
@@ -181,7 +182,7 @@ class LwdPrefillNotifyQueue:   # 一把 threading.Lock + deque
 | I1 | wire 协议字节零变化 | 改动集不含 notify/传输层 |
 | I2 | PD_mix 路径行为逐字节不变（选型、组批、闸门、preflight、双钳制、日志行） | 单测 + 真机冒烟比对 |
 | I3 | 诊断开关严格 `== "1"`，env 名不变，调用点现读时机不变，vllm-ascend 侧不动 | `test_lwd_config` |
-| I4 | picker 输出与原实现逐请求一致（续传序、FCFS、末位截断、独占规则、Σ≤cap） | `test_lwd_edge_picker` 表驱动（含边界：cap<1、c=0 不入批、free_seq=0、single_prefill 跨循环传递） |
+| I4 | picker 输出与原实现逐请求一致（续传序、FCFS、末位截断、Σ≤cap） | `test_lwd_edge_picker` 表驱动（含边界：cap<1、c=0 不入批、free_seq=0） |
 | I5 | 台账语义：迟到幂等丢弃、abort 三账齐摘、pending_chunks 定义不变、批全到齐即移除 | `test_lwd_edge_awaiting_tracker` |
 | I5a | 已修复（2026-10-08，移植 aolin PR #10）：原语义下首 token 即终结的请求被摘出首 token 集后，其所在批若仍有未到账成员将永久留存——bench 长跑泄漏累积使 pending 水位只涨不降，prefill 闸门永久 HOLD（4 卡 + MTP 实测：云侧空转刷 c2e_meta=None）。修复方式：finish 路径复用 abort 的摘账逻辑（`_lwd_purge_request_ledger`：摘首 token 集 + 各批剔除该请求，批摘空或只剩已见者整条移除），与"finish 视同已消费"等价防漏且与 abort 语义对齐；tracker 内联时该行为曾按用户决定回退为原语义并视作良性，PR #10 证实为死锁，予以修复 | 代码评审 + 真机冒烟（长跑 bench 观察闸门不再永久 HOLD） |
 | I6 | inbox 次序语义：FIFO、条目级 purge、purge 与 peek 并发安全 | `test_lwd_prefill_notify_queue`（含双线程烟雾） |

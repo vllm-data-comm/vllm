@@ -89,7 +89,7 @@ EMBED 优先（防被 decode 回程挤出深度配额）→ 两道门（满员 /
 | `LwdBaseEngineCore`（40 行） | 调度器注入先于 super（一次性消费）、chunked prefill 恢复（0 KV 组模型的上游禁用对边侧 chunk 记账不适用）、两面生命周期 |
 | `Subscriber.start(handler)` | 接收线程骨架上提，云侧保留自管循环保 zmq 线程亲和 |
 | `LwdPrefillNotifyQueue`（72 行） | 一把锁持有 IO 线程/主循环的线程纪律（append/peek/pop_front/purge），替代散在注释里的契约 |
-| `lwd_edge_picker`（161 行） | 组批纯函数（续传优先/FCFS 前缀/末位截断/独占规则），17 用例表驱动 + 20000 组与基线 oracle 对拍零分歧 |
+| `lwd_edge_picker` | 组批纯函数（续传优先/FCFS 前缀/末位截断；独占规则后已移除），表驱动 + 20000 组与基线 oracle 对拍零分歧 |
 | `LWD_SAMPLING_FIELDS` | 采样参数一张表边组包/云建请求共用 |
 | 配置上提 `vllm/config/lwd.py` | 搭 additional_config 解析 + env 覆盖坏值告警；serve 守卫删除，部署校验内联 `_lwd_setup_zmq` 头部 |
 
@@ -114,7 +114,7 @@ EMBED 优先（防被 decode 回程挤出深度配额）→ 两道门（满员 /
 | 手段 | 内容 |
 | --- | --- |
 | picker 对拍 | 基线 oracle（逐字转录）× 现实现，20000 组随机（含 8000 阈值两侧/65536 长 prompt/cap 0-16384/free_seq 0-4/deepseek 开关），零分歧 |
-| 表驱动边界 | 17 用例锁死截断/名额/独占/续传序 |
+| 表驱动边界 | 用例锁死截断/名额/续传序（独占用例已随规则移除） |
 | 接口守卫 | 云不 import 边（扫描+测试）、core.py 零 LWD 钩子、已删模块 find_spec 为 None |
 | 语义等价迁移 | 步进/收割/生命周期的每条路径在流程差异文档 §2-§5 逐项对账 |
 | 有意偏差清单 | ① 防御核验删除（拍板）② wire 删 4 死字段（同版本部署内安全，ascend 零代码引用）③ 空步 finished_req_ids 交付滞后（基线固有） |

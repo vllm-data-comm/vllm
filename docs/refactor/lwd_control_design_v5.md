@@ -159,7 +159,7 @@ classDiagram
     LwdEdgeExecutorProxy ..> LwdControlDiag : 直通判定
 ```
 
-模块级函数（非类）：`lwd_pick_prefill_batch(running, waiting, *, cap, free_seq, chunk_unit, single_prefill_min_tokens)` 与候选 `LwdPrefillCandidate`（边侧 picker）；`lwd_build_unembed_batch(notify)`（边侧 UNEMBED 批构造）。
+模块级函数（非类）：`lwd_pick_prefill_batch(running, waiting, *, cap, free_seq, chunk_unit)` 与候选 `LwdPrefillCandidate`（边侧 picker）；`lwd_build_unembed_batch(notify)`（边侧 UNEMBED 批构造）。
 
 ## 4 · 接口清单（对外签名）
 
@@ -181,7 +181,7 @@ classDiagram
 | `LwdEdgeScheduler.update_from_output(scheduler_output, model_runner_output)` | LWD 收割：UNEMBED 逐请求交付（完成码映射原生 finish），EMBED 无本地出账；mrope 对账回收 |
 | `lwd_admit_request(request) / lwd_edge_notify_range(scheduler_output) / lwd_edge_abort` | 边准入（校验+mrope，本地账）/ 批发布（seqno 与发布成功绑定）/ abort 台账摘除；云预告与入队归引擎 `add_request`（通信在引擎） |
 | `_lwd_drop_pending_request(request_id)` | pending 台账消除（首 token/终结/abort 三路共用），批内清空即整条移除 |
-| `lwd_pick_prefill_batch(...)` | 组批纯函数：续传优先 + FCFS 前缀 + 末位截断 + 独占规则，不变量 Σexpected ≤ cap |
+| `lwd_pick_prefill_batch(...)` | 组批纯函数：续传优先 + FCFS 前缀 + 末位截断，不变量 Σexpected ≤ cap |
 | `LwdEdgeExecutorProxy.execute_model(so)` | 三项契约：None→空占位、诊断直通（判定来自 diag）、属性透传 |
 
 ### 4.3 云侧 `control_cloud_scheduler/`
@@ -336,11 +336,11 @@ flowchart LR
 1. **张量在预告后面飞**：云侧排程量必须逐请求等于预告量。实现 = 可见集（必然被访问）× 五出口封死（逐字复刻 decode 消耗推导 / 恰好预算 / 阈值上界 / 名额扣减 / KV 上界预估）。算术保证，无步后断言——`_lwd_verify_full_admission` 随 v4 移除，是否恢复轻量核验为待拍板项。
 2. **一步只产一个 SchedulerOutput**：decode 消耗预先推导（`_lwd_compute_decode_consumption`），预告当预算用（token_budget_cap），c2e 记账与发布分离（pending_c2e + post_step）。
 
-## 8 · 测试面（38 用例）
+## 8 · 测试面
 
 | 文件 | 覆盖 |
 | --- | --- |
-| `test_lwd_edge_picker.py` | 组批算术 18 例表驱动（截断/名额/独占/次序） |
+| `test_lwd_edge_picker.py` | 组批算术表驱动（截断/名额/次序） |
 | `test_lwd_prefill_notify_queue.py` | FIFO/身份弹队/条目级 purge/双线程烟雾 |
 | `test_lwd_control_diag.py` | 开关严格性与现读/载荷对齐/spec 口径/直通门控 |
 | `test_lwd_edge_executor_proxy.py` | None 适配/透传/直通短路底层/内部类不外泄 |
