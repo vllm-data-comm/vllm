@@ -62,9 +62,6 @@ class LwdParallelGroupsSpec:
         """Derive the groups, or raise before any process creates one.
 
         Raises:
-            NotImplementedError: Instances share a rank allocation, or a
-                rank holds the channels of several DP connections, outside
-                single_instance.
             ValueError: Allocations of distinct instances or DPs overlap.
         """
         scene = topology.deployment.scene
@@ -86,9 +83,12 @@ class LwdParallelGroupsSpec:
                     f"overlapping ranks {sorted(seen.intersection(allocation))}"
                 )
             seen.update(allocation)
-        # 2. Endpoints are the first ranks; the cloud one broadcasts to its
-        # TP group. In single_instance the edge process serves every DP
-        # connection, so its endpoint rank holds several channels by design.
+        # 2. The edge endpoint is the first rank of its instance. The cloud
+        # endpoint rotates across the DP's ranks by edge id, so connections
+        # from several edges do not all land on the DP leader; the endpoint
+        # then broadcasts its payload within the DP's TP group. In
+        # single_instance the edge process serves every DP connection, so its
+        # endpoint rank holds several channels by design.
         connections = [
             connection
             for edge in topology.edges
