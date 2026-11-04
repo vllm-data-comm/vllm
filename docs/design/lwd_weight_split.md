@@ -1,7 +1,7 @@
 # F2: LWD 权重划分 (checkpoint split by role)
 
 > RFC issue: #TBD. 上游总览: [lwd_migration_overview.md](lwd_migration_overview.md).
-> 前置: [lwd_role_module_skip.md](lwd_role_module_skip.md) (规则互为镜像).
+> 前置: [lwd_role_module_skip.md](lwd_role_module_skip.md) (归属表同源, 方案 A).
 
 ## 1. 目标
 
@@ -48,13 +48,13 @@ flowchart LR
 | `embed` / `embed_tokens` | 保留 | 保留 | 边嵌入入口; 云 decode 嵌新 token |
 | `lm_head` | 保留 | 保留 | **rank-replay 前提**: 边 unembed 回放、云采样+秩编码各需一份 |
 | `layers.*` | 丢弃 | 保留 | 与 `make_layers` LWD 分支镜像 |
-| `norm.*` | **按 D2** | 保留 | 若 F1 采"边裁 norm", edge 丢弃; 见 F1 文档 §3.3 |
-| `visual.*` | 保留 | 丢弃 | 多模态编码只在边 |
+| `norm.*` | 丢弃 | 保留 | D2 定案: 边裁 norm (云 forward 末 norm, 下行 hidden 已 post-norm); 证据链见 F1 §3.5 |
+| `visual.*` | 保留 | 丢弃 | D3 定案: 多模态编码只在边 (F1 归属表 `visual → edge`) |
 | `mtp.*` / draft | 丢弃 | 保留 | drafter 在云 |
 | `tid2eid` | 保留 (正则特例) | layers 规则覆盖 | 边虽不建层, vllm-ascend 按路径直接读 (Hash MoE 路由表) |
 | 其余 | **报错** | **报错** | fail-fast: 规则未覆盖的张量必须显式归类后才能放行 |
 
-**镜像纪律**: 本表与 F1 的 `lwd_skips_module` 规则同源 (同一份规则表推导两侧), 改一侧必须审计另一侧, 两处放同一评审周期. 老代码的实现方式是脚本内置规则表与运行时 `parse_skip_keys` 共享语义 — 迁入时保持"单一事实源": 脚本可 import `lwd_weight_filter.parse_skip_keys` (允许脚本依赖 vllm 包, 作为可选路径; 无 vllm 环境时退回内置表并校验一致性), 或直接复制并在两处单测里断言等价. 二选一由评审定, 不允许静默漂移.
+**镜像纪律 (方案 A 定案)**: ROLE_RULES 不再手抄——由 F1 的 `LWD_MODULE_OWNERSHIP` 表 (PR1 落 `models/utils.py`) 推导: 表内每行 (后缀, 归属集) 展开为两侧的张量名规则, 加上 `layers.`/`tid2eid` 两个张量级特例 (正则, 张量名≠模块点路径, 特例显式登记). 脚本 `import vllm.model_executor.models.utils` 拿到同一对象 (允许脚本依赖 vllm 包; 无 vllm 环境的离线主机可退回 vendored 副本, 但单测断言两份等价, 禁止静默漂移).
 
 ## 5. METADATA_RULES
 

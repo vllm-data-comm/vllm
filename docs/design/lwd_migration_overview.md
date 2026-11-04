@@ -54,7 +54,7 @@ flowchart LR
         A -->|同规则| C[cloud 切片目录]
     end
     subgraph F1 ["F1 按角色裁剪 (运行时)"]
-        D["构建期: PPMissingLayer 占位\n(edge 裁 norm / cloud 裁 visual)"]
+        D["构建期: LWD_MODULE_OWNERSHIP 归属表\n+ 5 处守卫, PPMissingLayer 占位\n(edge 裁 norm / cloud 裁 visual)"]
         E["装载期: lwd_weight_filter\n(完整 checkpoint 兜底)"]
     end
     subgraph F3 ["F3 结构化输出 (运行时)"]
@@ -62,25 +62,25 @@ flowchart LR
     end
     B -->|"边侧只含本方参数,\nloader 不缺权重"| D
     C -->|"云侧只含本方参数"| D
-    D ---|"ROLE_RULES 与裁剪规则互为镜像,\n改一侧必须审计另一侧"| F2
+    D ---|"ROLE_RULES 由 LWD_MODULE_OWNERSHIP 推导\n(单一事实源, 非约定镜像)"| F2
     C -->|"云切片含 tokenizer 全家桶\n(F3 编译文法的前提)"| F
 ```
 
-核心耦合: **F2 的张量归属规则必须与 F1 的模块裁剪规则镜像**; F3 依赖 F2 的 METADATA_RULES 把 tokenizer 文件放进云侧切片.
+核心耦合: **F2 的张量归属规则与 F1 的模块裁剪规则共用 `LWD_MODULE_OWNERSHIP` 这一张表** (方案 A, 单一事实源); F3 依赖 F2 的 METADATA_RULES 把 tokenizer 文件放进云侧切片.
 
-## 5. 决策点 (评审先定调)
+## 5. 决策点 (已定案 2026-11-04, 依据见 F1 文档)
 
-| # | 决策 | 建议 |
+| # | 决策 | **定案** |
 | --- | --- | --- |
-| D1 | F1 规则的配置宿主: 老代码 `LwdConfig` 是行为配置 (enabled/mode/层切分), 本仓 `vllm/config/lwd/entry.py::LwdConfig` 是纯拓扑身份 | 不整体搬入老配置类; `skips_module` 做成纯函数 (入参 role + 模块点路径), 规则推导只依赖 `lwd_config.role` |
-| D2 | norm 归属: 老设计边侧不建 norm (云侧 norm 后 hidden 下行); 本仓 pp=1 边侧 `is_last_rank=True`, 当前会建 norm | 实施前先核边侧 unembed 回放路径是否重复 norm; 若采老语义, F1 裁 norm 与 F2 `norm.*` 规则必须同 PR 联动 |
-| D3 | 云侧关多模态的表达: 老代码用 `mm_encoder_remote`, 本仓只有 `mm_encoder_only` (语义相反) | 不自造近义词; 模型侧靠 F1 的 visual 裁剪表达, processor 侧在 lwd 云引擎 bootstrap 跳过初始化 |
-| D4 | F1 装载过滤文件位置 | 镜像同目录先例 `model_executor/model_loader/ep_weight_filter.py`: 新建 `lwd_weight_filter.py` |
+| D1 | F1 规则的配置宿主: 老代码 `LwdConfig` 是行为配置 (enabled/mode/层切分), 本仓 `vllm/config/lwd/entry.py::LwdConfig` 是纯拓扑身份 | **方案 A**: 声明式归属表 `LWD_MODULE_OWNERSHIP` + 纯函数 `lwd_skips_module(module_path, role)` 落 `models/utils.py` (紧邻 make_layers); role 读已存在的 `lwd_config.role`, **LwdConfig 零改动**. 备选方案对比见 F1 §7 |
+| D2 | norm 归属: 老设计边侧不建 norm (云侧 norm 后 hidden 下行); 本仓 pp=1 边侧 `is_last_rank=True`, 当前会建 norm | **边裁 norm**, 已核验回放路径: 云 forward 末 norm (deepseek_v2.py:1585) → 下行 hidden 已 post-norm; 边 `execute_lwd_unembed` 直调 `compute_logits` (无 norm). 证据链与 dspark 反例警示见 F1 §3.5 |
+| D3 | 云侧关多模态的表达: 老代码用 `mm_encoder_remote`, 本仓只有 `mm_encoder_only` (语义相反) | **不迁**: 模型侧靠 F1 的 visual 裁剪表达 (`visual → edge`), processor 侧用既有 `role != "edge"` 网关 (F1 §5) |
+| D4 | F1 装载过滤文件位置 | **镜像同目录先例** `model_executor/model_loader/ep_weight_filter.py`: 新建 `lwd_weight_filter.py`, skip 键从归属表推导 (F1 §4) |
 
 ## 6. 实施顺序
 
 ```text
-PR1  F1 构建期裁剪     lwd_skips_module + 5 处模型守卫 + 单测
+PR1  F1 构建期裁剪     LWD_MODULE_OWNERSHIP + lwd_skips_module + lwd_role + 5 处模型守卫 + 单测
 PR2  F1 装载期兜底     lwd_weight_filter.py + _get_weights_iterator skip_name 管道 + 单测
 PR3  F2 切分脚本       scripts/lwd/split_lwd_checkpoint.py (规则与 PR1/PR2 镜像锁定)
 PR4  F3 结构化输出     LWD_MESSAGE_VERSION bump + 5 接缝 + picker 过滤
