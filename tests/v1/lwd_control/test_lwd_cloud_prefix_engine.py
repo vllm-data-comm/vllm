@@ -104,7 +104,7 @@ def test_request_build_adopts_wire_hashes_and_skip_reading() -> None:
     assert request.block_hashes == [b"h0", b"h1"]
     assert request.lwd_wire_hashes_adopted
     assert request.lwd_prefix_nonce == 7
-    assert request.skip_reading_prefix_cache
+    assert request.prefix_cache_hit_limit == 0
 
 
 @pytest.mark.parametrize("prompt_tokens", [3, 4])

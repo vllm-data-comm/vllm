@@ -37,13 +37,16 @@ class LwdPrefixReservations:
         """Reserve the negotiated hit and freeze its snapshot."""
         if request.request_id in self._reservations:
             raise ValueError(f"duplicate LWD prefix reservation: {request.request_id}")
-        if request.skip_reading_prefix_cache:
+        max_cache_hit_length = request.get_max_cache_hit_length(
+            max(0, request.num_prompt_tokens - 1)
+        )
+        if max_cache_hit_length <= 0:
             groups: tuple[Sequence[KVCacheBlock], ...] = ()
             hit = 0
         else:
             groups, hit, _ = self.manager.coordinator.find_longest_cache_hit(
                 request.block_hashes,
-                max_cache_hit_length=max(0, request.num_prompt_tokens - 1),
+                max_cache_hit_length=max_cache_hit_length,
             )
         return self._touch_and_snapshot(request, groups, hit, set_floor=True)
 
@@ -71,19 +74,31 @@ class LwdPrefixReservations:
         return pinned
 
     def snapshot(
-        self, request: Request
+        self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[tuple[Sequence[KVCacheBlock], ...], int]:
         """Return the frozen hit, refusing to renegotiate a trimmed request."""
+        max_cache_hit_length = min(
+            request.get_max_cache_hit_length(max_cache_hit_length),
+            max(0, request.num_prompt_tokens - 1),
+        )
         entry = self._reservations.get(request.request_id)
         if entry is not None:
+            # The edge already skipped these embeddings; never trim a frozen hit.
+            if entry.hit_tokens > max_cache_hit_length:
+                raise RuntimeError(
+                    f"LWD reserved prefix for {request.request_id} exceeds "
+                    f"cache hit limit {max_cache_hit_length}"
+                )
             return entry.groups, entry.hit_tokens
         if getattr(request, "lwd_resume_cap_tokens", None) is not None:
             raise RuntimeError(
                 f"LWD reserved prefix for {request.request_id} is unavailable; "
                 "cannot consume trimmed embeddings"
             )
+        if max_cache_hit_length <= 0:
+            return (), 0
         groups, hit, _ = self.manager.coordinator.find_longest_cache_hit(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes, max_cache_hit_length
         )
         return groups, hit
 

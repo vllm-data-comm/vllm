@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import LwdBatch, LwdBatchType, SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
@@ -33,11 +34,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRequestNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
-from vllm.v1.request import RequestStatus
-
-
-class _Request(SimpleNamespace):
-    __hash__ = object.__hash__
+from vllm.v1.request import Request, RequestStatus
 
 
 def _request(
@@ -48,26 +45,26 @@ def _request(
     preemptions: int = 0,
     skip: bool = False,
     floor: int = 0,
-):
-    return _Request(
+) -> Request:
+    request = Request(
         request_id=request_id,
-        num_prompt_tokens=prompt,
-        num_tokens=prompt,
-        num_computed_tokens=computed,
-        num_preemptions=preemptions,
-        block_hashes=[],
-        skip_reading_prefix_cache=skip,
-        lwd_resume_cap_tokens=floor,
-        is_finished=lambda: False,
-        lwd_window_cap=None,
+        prompt_token_ids=list(range(prompt)),
+        sampling_params=SamplingParams(skip_reading_prefix_cache=skip),
+        pooling_params=None,
     )
+    request.num_computed_tokens = computed
+    request.num_preemptions = preemptions
+    request.lwd_resume_cap_tokens = floor
+    request.lwd_window_cap = None
+    return request
 
 
 def _visible_set_scheduler(running, waiting) -> LwdBaseScheduler:
     scheduler = LwdBaseScheduler.__new__(LwdBaseScheduler)
     scheduler.running = running
     scheduler.waiting = FCFSRequestQueue(waiting)
-    scheduler.skipped_waiting = FCFSRequestQueue()
+    scheduler.kv_holding_waiting = FCFSRequestQueue()
+    scheduler.deferred_waiting = set()
     scheduler.requests = {r.request_id: r for r in running + waiting}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.max_num_running_reqs = len(running)
@@ -80,7 +77,8 @@ def _scheduler(request) -> LwdCloudScheduler:
     scheduler = LwdCloudScheduler.__new__(LwdCloudScheduler)
     scheduler.running = [request]
     scheduler.waiting = []
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     scheduler.requests = {request.request_id: request}
     scheduler.lwd_recv_rows = {}
     scheduler._lwd_dropped = set()

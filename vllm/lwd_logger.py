@@ -27,6 +27,8 @@ _LWD_LOG_LEVELS = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+# Cache factory-owned levels once so native dictConfig cannot replace them.
+_LWD_LOGGERS: dict[str, int] = {}
 
 
 def _use_color() -> bool:
@@ -61,13 +63,24 @@ def init_lwd_logger(name: str) -> logging.Logger:
     nothing).
     """
     lwd_logger = logging.getLogger(name)
-    if lwd_logger.handlers:
+    if name in _LWD_LOGGERS:
         return lwd_logger
 
     raw_level = envs.VLLM_LWD_LOG_LEVEL
     level = _LWD_LOG_LEVELS.get(raw_level, logging.CRITICAL + 1)
+    _configure_lwd_logger(lwd_logger, level)
+    _LWD_LOGGERS[name] = level
+    return lwd_logger
+
+
+def _configure_lwd_logger(lwd_logger: logging.Logger, level: int) -> None:
+    for handler in lwd_logger.handlers[:]:
+        lwd_logger.removeHandler(handler)
+        if any(isinstance(flt, _LwdPrefixFilter) for flt in handler.filters):
+            handler.close()
     lwd_logger.setLevel(level)
     lwd_logger.propagate = False
+    lwd_logger.disabled = False
 
     stream = (
         sys.stdout
@@ -82,7 +95,11 @@ def init_lwd_logger(name: str) -> logging.Logger:
 
     lwd_logger.addHandler(handler)
 
-    return lwd_logger
+
+def reconfigure_lwd_loggers() -> None:
+    """Restore factory-owned loggers after native logging reconfiguration."""
+    for name, level in tuple(_LWD_LOGGERS.items()):
+        _configure_lwd_logger(logging.getLogger(name), level)
 
 
 lwd_logger = init_lwd_logger("vllm.lwd")

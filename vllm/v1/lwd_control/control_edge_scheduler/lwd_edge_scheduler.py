@@ -520,7 +520,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             LwdPrefillCandidate(
                 r.request_id, r.num_prompt_tokens, r.num_computed_tokens
             )
-            for r in [*self.skipped_waiting, *self.waiting]
+            for r in [*self.kv_holding_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
         ]
         req_ids, expected = lwd_pick_prefill_batch(
@@ -533,12 +533,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return req_ids, expected, cap
 
     def _lwd_schedule_batch(self, dp_idx: int) -> SchedulerOutput:
-        """Chunk batch assembly: the picker selects the batch of one engine,
-        scheduled via the base-class visible-set mechanism (budget clamped
-        to that engine's cap; the chunk split is guaranteed by the clamping
-        parameters to be reproduced natively)."""
-        req_ids, _expected, cap = self._lwd_pick_prefill_batch(dp_idx)
-        return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        """Schedule one engine's picked batch within its per-request chunk caps."""
+        req_ids, expected, cap = self._lwd_pick_prefill_batch(dp_idx)
+        windows = [(self.requests[req_id], expected[req_id]) for req_id in req_ids]
+        # Native single-request/adaptive thresholds must not enlarge picker chunks.
+        for request, num_rows in windows:
+            request.lwd_window_cap = num_rows
+        try:
+            return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        finally:
+            for request, _ in windows:
+                request.lwd_window_cap = None
 
     def _try_schedule_encoder_inputs(
         self,
@@ -547,11 +552,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """Edge-side passthrough: encoder execution and caching are managed
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
-        return [], num_new_tokens, encoder_compute_budget, []
+        return [], num_new_tokens, encoder_compute_budget, [], []
 
     def _lwd_has_prefill_chunk_inflight(self, dp_idx: int) -> bool:
         """Whether dp_idx has an embed request not fully sent; same
