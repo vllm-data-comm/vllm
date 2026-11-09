@@ -303,10 +303,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler.lwd_ttft_meter.note_routed(request.request_id)
         client = self._lwd_coord_clients.get(dp_idx)
         # Three unrelated things share this stretch, and only timing them
-        # apart says which one costs the tens of seconds the send segment
-        # reports: the coordinator wake-up contends for a lock the stats
-        # thread holds across a poll, the metadata builds a tensor over
-        # the whole prompt, and the wire encodes and retries.
+        # apart says which one a slow announcement spent its time on: the
+        # coordinator wake-up, the metadata building a tensor over the
+        # whole prompt, and the wire encoding and retrying.
         self._lwd_send_retries = 0
         started = time.monotonic()
         try:

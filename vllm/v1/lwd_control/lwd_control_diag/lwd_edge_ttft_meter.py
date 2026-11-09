@@ -204,15 +204,12 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
 class LwdEdgeSendMeter(LwdIntervalMeter):
     """What the send half of admission spends its time on.
 
-    `send` is where a loaded edge loses tens of seconds per request, and
-    the two obvious explanations both fail on the numbers: the coordinator
-    wake-up is a non-blocking ZMQ send, and the outbound retry budget caps
-    out around three seconds before raising. Something else in that stretch
-    is slow, and the three things it does are unrelated:
+    The three things it does are unrelated, and a measurement that adds
+    them cannot say which one grew:
 
-      - coord: the FIRST_REQ wake-up. Non-blocking on the socket, but it
-        takes a lock the stats thread holds across a poll, so its cost is
-        contention rather than transmission.
+      - coord: the FIRST_REQ wake-up. A non-blocking send on a socket no
+        other thread touches, so anything above zero here means the edge
+        is contending for the coordinator link again.
       - meta: the per-request metadata the notify carries. Builds a tensor
         over the whole prompt and scans it for image runs, per request.
       - wire: encoding the notify and handing it to the link, including
