@@ -65,6 +65,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 from vllm.v1.lwd_control.lwd_control_diag import (
     LwdControlDiag,
     LwdEdgeIntakeMeter,
+    LwdEdgeSendMeter,
     LwdEdgeTtftMeter,
 )
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
@@ -150,6 +151,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self.lwd_intake_meter = LwdEdgeIntakeMeter()
         """Cost of the engine's input-queue poll. Public for the same
         reason: the poll belongs to the engine, not the scheduler."""
+        self.lwd_send_meter = LwdEdgeSendMeter()
+        """What the announcement spends its time on; the engine owns the
+        announcement, so it does the timing."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the

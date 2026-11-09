@@ -77,7 +77,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # Set before the control plane starts: the first client request can
         # reach the poll as soon as the engine is reachable.
         self._lwd_intake_taken = 0
+        self._lwd_intake_busy = 0.0
         self._lwd_last_step_ts = 0.0
+        self._lwd_send_retries = 0
+        self._lwd_meta_done = 0.0
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
@@ -256,6 +259,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         cloud = self._lwd_clouds[dp_idx]
         for attempt in range(_LWD_SEND_RETRY_STEPS):
             if self._lwd_send(cloud, message):
+                # Charged to the announcement being timed, if any: a wire
+                # that is slow and a queue that was merely full both cost
+                # the same seconds and have different fixes.
+                self._lwd_send_retries += attempt
                 return
             time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
@@ -295,13 +302,27 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # Splits the prompt-side admission work from the wait on the link.
         self.scheduler.lwd_ttft_meter.note_routed(request.request_id)
         client = self._lwd_coord_clients.get(dp_idx)
+        # Three unrelated things share this stretch, and only timing them
+        # apart says which one costs the tens of seconds the send segment
+        # reports: the coordinator wake-up contends for a lock the stats
+        # thread holds across a poll, the metadata builds a tensor over
+        # the whole prompt, and the wire encodes and retries.
+        self._lwd_send_retries = 0
+        started = time.monotonic()
         try:
             if client is not None:
                 client.send_first_req()
+            coord_done = time.monotonic()
             self._lwd_notify_request(dp_idx, request)
         except Exception:
             self.scheduler.lwd_edge_cancel_admission(request.request_id)
             raise
+        self.scheduler.lwd_send_meter.note_send(
+            coord_s=coord_done - started,
+            meta_s=self._lwd_meta_done - coord_done,
+            wire_s=time.monotonic() - self._lwd_meta_done,
+            retries=self._lwd_send_retries,
+        )
 
     def _lwd_enqueue_request(self, request: Request) -> None:
         super().add_request(request)
@@ -316,18 +337,34 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         a large `dispatch`, and only this says which one it was.
         """
         self._lwd_intake_taken = 0
+        self._lwd_intake_busy = 0.0
         started = time.monotonic()
         gap = started - self._lwd_last_step_ts if self._lwd_last_step_ts else 0.0
         super()._process_input_queue()
         self._lwd_last_step_ts = time.monotonic()
         self.scheduler.lwd_intake_meter.note_poll(
-            self._lwd_intake_taken, self._lwd_last_step_ts - started, gap
+            self._lwd_intake_taken,
+            self._lwd_last_step_ts - started,
+            self._lwd_intake_busy,
+            gap,
         )
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        # Accumulated rather than measured around the whole poll: the
+        # native loop blocks on an empty queue between batches, and that
+        # wait is not the serial admission the meter is looking for.
         self._lwd_intake_taken += 1
+        started = time.monotonic()
+        try:
+            self._lwd_handle_client_request(request_type, request)
+        finally:
+            self._lwd_intake_busy += time.monotonic() - started
+
+    def _lwd_handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None and control.handle_client_request(request_type, request):
             return
@@ -382,6 +419,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
         metadata = self.scheduler.lwd_model_family.request_metadata(request)
+        mrope_positions = self.scheduler.lwd_mrope_positions(request.request_id)
+        # Boundary between the per-request metadata and the wire, read by
+        # the caller that times the two.
+        self._lwd_meta_done = time.monotonic()
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(
@@ -393,7 +434,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     getattr(sampling_params, "skip_reading_prefix_cache", False)
                 ),
                 eos_token_id=sampling_params.eos_token_id,
-                mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
+                mrope_positions=mrope_positions,
                 image_placeholder_spans=metadata.image_placeholder_spans,
                 **values,
             ),

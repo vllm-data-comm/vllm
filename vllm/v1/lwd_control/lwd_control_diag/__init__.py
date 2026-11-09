@@ -10,6 +10,7 @@ from vllm.v1.lwd_control.lwd_control_diag.lwd_control_diag import (
 )
 from vllm.v1.lwd_control.lwd_control_diag.lwd_edge_ttft_meter import (
     LwdEdgeIntakeMeter,
+    LwdEdgeSendMeter,
     LwdEdgeTtftMeter,
 )
 from vllm.v1.lwd_control.lwd_control_diag.lwd_ttft_meter import (
@@ -23,5 +24,6 @@ __all__ = [
     "LwdCloudTtftMeter",
     "LwdControlDiag",
     "LwdEdgeIntakeMeter",
+    "LwdEdgeSendMeter",
     "LwdEdgeTtftMeter",
 ]

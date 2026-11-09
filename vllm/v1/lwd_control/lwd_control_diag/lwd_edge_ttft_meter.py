@@ -201,6 +201,64 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
         )
 
 
+class LwdEdgeSendMeter(LwdIntervalMeter):
+    """What the send half of admission spends its time on.
+
+    `send` is where a loaded edge loses tens of seconds per request, and
+    the two obvious explanations both fail on the numbers: the coordinator
+    wake-up is a non-blocking ZMQ send, and the outbound retry budget caps
+    out around three seconds before raising. Something else in that stretch
+    is slow, and the three things it does are unrelated:
+
+      - coord: the FIRST_REQ wake-up. Non-blocking on the socket, but it
+        takes a lock the stats thread holds across a poll, so its cost is
+        contention rather than transmission.
+      - meta: the per-request metadata the notify carries. Builds a tensor
+        over the whole prompt and scans it for image runs, per request.
+      - wire: encoding the notify and handing it to the link, including
+        every retry of a full outbound queue. `retries` counts those, so a
+        slow wire can be told from a queue that was merely full.
+
+    Summed per request these are the `send` the TTFT meter reports, so the
+    two lines can be read against each other.
+    """
+
+    def _reset(self) -> None:
+        self._calls = 0
+        self._retried = 0
+        self._retries = 0
+        self._coord = LwdSpan()
+        self._meta = LwdSpan()
+        self._wire = LwdSpan()
+
+    def note_send(
+        self, coord_s: float, meta_s: float, wire_s: float, retries: int
+    ) -> None:
+        """One request's announcement, split by what it was doing."""
+        self._calls += 1
+        self._coord.add(coord_s)
+        self._meta.add(meta_s)
+        self._wire.add(wire_s)
+        self._retries += retries
+        if retries:
+            self._retried += 1
+        self._roll()
+
+    def _report(self) -> None:
+        if not self._calls:
+            return
+        logger.info(
+            "[lwd][edge-send] %d announced: coord=%s meta=%s wire=%s "
+            "(avg/max ms); calls that retried=%d retries=%d",
+            self._calls,
+            self._coord,
+            self._meta,
+            self._wire,
+            self._retried,
+            self._retries,
+        )
+
+
 class LwdEdgeIntakeMeter(LwdIntervalMeter):
     """How long the engine thread spends taking requests in, and how many
     it takes in before it steps again.
@@ -212,11 +270,20 @@ class LwdEdgeIntakeMeter(LwdIntervalMeter):
     first request's wait for dispatch cover the whole batch's admission.
 
     That shape is visible today only as an arithmetic coincidence between
-    two averages on different lines. This measures it directly: `batch` is
-    requests taken in per poll, `held` is how long the poll kept the
+    two averages on different lines. This measures it directly: `taken` is
+    messages taken in per poll, `held` is how long the poll kept the
     thread, and `gap` is how long the engine went without stepping. A poll
-    that takes in tens of requests and holds the thread for minutes is
+    that takes in tens of messages and holds the thread for minutes is
     the hypothesis confirmed; short holds mean the wait is elsewhere.
+
+    `held` is split, because the native poll blocks on an empty queue when
+    the engine has no work: `idle` is that wait, `busy` is time spent
+    inside message handlers. Only `busy` is the serial admission this is
+    looking for, and between batches the whole hold is `idle`.
+
+    `taken` counts messages, not user requests: aborts, wake-ups and
+    prefix replies all arrive through the same queue. The burst it reports
+    is therefore an upper bound on how many requests were admitted.
     """
 
     def _reset(self) -> None:
@@ -224,19 +291,26 @@ class LwdEdgeIntakeMeter(LwdIntervalMeter):
         self._taken = 0
         self._bursts = 0
         self._max_batch = 0
-        self._held = LwdSpan()
+        self._idle = LwdSpan()
+        self._busy = LwdSpan()
         self._gap = LwdSpan()
 
-    def note_poll(self, taken: int, held_s: float, gap_s: float) -> None:
-        """One trip through the input-queue poll: how many requests it
-        handled, how long it ran, and how long since the last step."""
+    def note_poll(
+        self, taken: int, held_s: float, busy_s: float, gap_s: float
+    ) -> None:
+        """One trip through the input-queue poll: how many messages it
+        handled, how long it ran, how much of that was inside handlers,
+        and how long since the last step."""
         self._polls += 1
         self._taken += taken
         self._max_batch = max(self._max_batch, taken)
         if taken > 1:
             self._bursts += 1
-        if held_s > 0:
-            self._held.add(held_s)
+        if busy_s > 0:
+            self._busy.add(busy_s)
+        idle_s = held_s - busy_s
+        if idle_s > 0:
+            self._idle.add(idle_s)
         if gap_s > 0:
             self._gap.add(gap_s)
         self._roll()
@@ -245,12 +319,13 @@ class LwdEdgeIntakeMeter(LwdIntervalMeter):
         if not self._polls:
             return
         logger.info(
-            "[lwd][edge-intake] %d polls took in %d requests: bursts=%d "
-            "max batch=%d; held=%s step gap=%s (avg/max ms)",
+            "[lwd][edge-intake] %d polls took in %d messages: bursts=%d "
+            "max batch=%d; busy=%s idle=%s step gap=%s (avg/max ms)",
             self._polls,
             self._taken,
             self._bursts,
             self._max_batch,
-            self._held,
+            self._busy,
+            self._idle,
             self._gap,
         )
