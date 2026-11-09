@@ -23,12 +23,10 @@ single-cloud behaviour.
 from __future__ import annotations
 
 import copy
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import (
     LwdBatch,
@@ -66,7 +64,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import (
     LwdControlDiag,
-    LwdEdgeDispatchMeter,
+    LwdEdgeIntakeMeter,
     LwdEdgeTtftMeter,
 )
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
@@ -79,16 +77,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
-logger = init_logger(__name__)
 
 LwdSendToCloud = Callable[[int, LwdEdgeToCloudMessage], None]
 """Sends one message to the cloud DP rank of dp_idx; raises instead of
 losing it."""
 
-# How often an edge that stays idle while holding unsent prompts repeats
-# that report. Long enough not to flood a run, short enough to show the
-# state persisting rather than flickering.
-_LWD_UNSEEN_REPORT_S = 5.0
 
 # Cloud finish code -> edge terminal state (frontend reason goes through the
 # output channel; ERROR maps to ABORTED)
@@ -151,16 +144,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Engines already reported as having drifted books."""
         self._lwd_last_fleet_seats: tuple[int, ...] | None = None
         """Last reported per-engine seat ledger; transition logging only."""
-        self._lwd_dispatch_meter = LwdEdgeDispatchMeter()
-        """Share of steps lost to each gate term; the stall log says a
-        stall happened, this says what it cost."""
         self.lwd_ttft_meter = LwdEdgeTtftMeter()
         """Hop stamps of the edge's share of TTFT. Public because the
         first two hops are seen by the engine's request entry, not here."""
-        self._lwd_unseen_since: float | None = None
-        """When the edge first went idle holding requests that still owe
-        prompt rows; None whenever it holds none."""
-        self._lwd_unseen_last_report = 0.0
+        self.lwd_intake_meter = LwdEdgeIntakeMeter()
+        """Cost of the engine's input-queue poll. Public for the same
+        reason: the poll belongs to the engine, not the scheduler."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -401,18 +390,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if self._lwd_has_prefill_work(account.dp_idx)
         ]
         if not pending:
-            self._lwd_dispatch_meter.note_idle(self._lwd_report_unseen_prefill())
             return
-        # Which term each gated engine held on. Seats held means the cloud
-        # is full and waiting is correct; chunks held means the pending-send
-        # window is the limit, which is a number we can raise.
-        self._lwd_dispatch_meter.note_gated(
-            sum(account.inflight >= self.max_num_running_reqs for account in pending),
-            sum(
-                account.pending_chunks() >= account.max_pending_chunks
-                for account in pending
-            ),
-        )
         for account in pending:
             self._lwd_log_gate_transition(account)
         reported = self._lwd_note_dispatch_stall(
@@ -424,97 +402,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # on every step that is still in it.
         if reported:
             self._lwd_audit_accounts()
-
-    def _lwd_report_unseen_prefill(self) -> bool:
-        """Requests still owing prompt rows that the work predicate cannot
-        see. Returns whether any exist, so the meter can split these steps
-        from a genuinely idle edge.
-
-        `_lwd_has_prefill_work` reads exactly three places: running (not
-        fully sent), waiting and skipped_waiting. A request that owes rows
-        and sits in none of them is invisible to it, so the edge reports no
-        work and parks -- while the request waits for a wakeup that only an
-        unrelated event will bring. That is the shape of a first token that
-        takes 30 s on one run and 8 s on the next with identical
-        throughput, and no counter distinguishes it from a genuinely idle
-        edge: both are a step with nothing to do.
-
-        Reported on entry and again when the state outlives one report
-        interval, with how long it has lasted: a request parked for 20 s
-        and one parked for 20 ms are the same line otherwise, and only the
-        first explains a 30 s first token. A deployment where this is zero
-        (the edge is simply between batches) stays silent, or the line
-        that matters drowns in the one that does not.
-
-        This runs on every idle step, and idle is most steps, so the
-        detection is a short-circuiting scan and the locating walk only
-        runs for a step that really reports.
-        """
-        unsent = any(
-            not request.is_finished()
-            and request.num_computed_tokens < request.num_prompt_tokens
-            for request in self.requests.values()
-        )
-        now = time.monotonic()
-        if not unsent:
-            # Genuinely idle: every live request already sent its prompt.
-            if self._lwd_unseen_since is not None:
-                logger.info(
-                    "[lwd][edge-sched] idle-with-unsent cleared after %.1fs",
-                    now - self._lwd_unseen_since,
-                )
-                self._lwd_unseen_since = None
-            return False
-        if self._lwd_unseen_since is None:
-            self._lwd_unseen_since = now
-            self._lwd_unseen_last_report = now
-        elif now - self._lwd_unseen_last_report < _LWD_UNSEEN_REPORT_S:
-            return True
-        else:
-            self._lwd_unseen_last_report = now
-        held_s = now - self._lwd_unseen_since
-        unseen = [
-            request_id
-            for request_id, request in self.requests.items()
-            if not request.is_finished()
-            and request.num_computed_tokens < request.num_prompt_tokens
-        ]
-        in_running = {request.request_id for request in self.running}
-        in_waiting = {request.request_id for request in self.waiting}
-        in_skipped = {request.request_id for request in self.skipped_waiting}
-        located = {"running": 0, "waiting": 0, "skipped": 0, "nowhere": 0}
-        for request_id in unseen:
-            if request_id in in_running:
-                located["running"] += 1
-            elif request_id in in_waiting:
-                located["waiting"] += 1
-            elif request_id in in_skipped:
-                located["skipped"] += 1
-            else:
-                located["nowhere"] += 1
-        logger.info(
-            "[lwd][edge-sched] idle %.1fs while %d requests still owe prompt "
-            "rows: at=%s routed=%s unrouted=%d; first=%s; "
-            "running=%d waiting=%d skipped=%d requests=%d",
-            held_s,
-            len(unseen),
-            located,
-            [
-                sum(
-                    1
-                    for request_id in unseen
-                    if self._lwd_route.get(request_id) == account.dp_idx
-                )
-                for account in self._lwd_accounts
-            ],
-            sum(1 for request_id in unseen if request_id not in self._lwd_route),
-            sorted(unseen)[:5],
-            len(self.running),
-            len(self.waiting),
-            len(self.skipped_waiting),
-            len(self.requests),
-        )
-        return True
 
     def _lwd_gate_detail(self, pending: list[LwdCloudDpAccount]) -> str:
         """Per-engine gate terms, built only when a stall is really logged.
@@ -640,14 +527,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # every routed request already sent its prompt (the engine is
             # simply decode-saturated); a real stall when prefill work is
             # routed here and still never reaches the picker.
-            self._lwd_dispatch_meter.note_empty_batch()
             self._lwd_note_dispatch_stall(
                 f"empty-batch-{dp_idx}",
                 lambda: f"empty-batch dp{dp_idx}: "
                 f"{self._lwd_describe_candidates(dp_idx)}",
             )
             return self._lwd_schedule_abort_notice()
-        self._lwd_dispatch_meter.note_dispatch()
         self._lwd_note_dispatch_stall(None)
         self.lwd_edge_notify_range(dp_idx, out)
         return out

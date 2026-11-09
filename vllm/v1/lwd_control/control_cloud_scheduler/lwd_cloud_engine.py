@@ -56,10 +56,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRequestNotify,
     lwd_decode_edge_to_cloud,
 )
-from vllm.v1.lwd_control.lwd_control_diag import (
-    LwdCloudArrivalMeter,
-    LwdControlDiag,
-)
+from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     LwdRequestMetadataLayout,
     lwd_cloud_engram_fingerprint,
@@ -157,7 +154,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqno = -1
         self._lwd_last_arrival_ts = time.monotonic()
-        self._lwd_arrival_meter = LwdCloudArrivalMeter()
         self._lwd_starved_since: float | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits are checked by the edge. The coordinator address
@@ -430,7 +426,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
         num_tokens = sum(item.num_tokens for item in items)
-        self._lwd_arrival_meter.note_hint(notify.seqno, num_tokens)
         for request_id in request_ids:
             self.scheduler.lwd_ttft_meter.note_hint(request_id)
         lwd_logger.info(
@@ -457,9 +452,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_request_seqnos.setdefault(request_id, set()).add(seqno)
 
     def _lwd_complete_seqno(self, seqno: int) -> None:
-        # A seqno that completes without ever merging an arrival (every
-        # row aborted or retired) would otherwise keep its start time.
-        self._lwd_arrival_meter.forget(seqno)
         request_ids = self._lwd_pending_seqnos.pop(seqno, None)
         if request_ids is None:
             return
@@ -808,7 +800,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if touched:
             # Rows a window can open over exist only from here: time the
             # hop against the hint that started it.
-            self._lwd_arrival_meter.note_arrival(seqno)
             for request_id, _previous, _rows in touched:
                 self.scheduler.lwd_ttft_meter.note_arrival(request_id)
             lwd_logger.info("[cloud] arrival high watermarks updated: %s", touched)

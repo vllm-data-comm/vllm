@@ -15,9 +15,11 @@ from the client's arrival stamp to the first prompt rows leaving:
   - frontend: the client's arrival stamp to `add_request` running on the
     engine thread. HTTP, tokenization, the ZMQ hop and the engine's input
     queue -- all native vLLM, no LWD code on the path.
-  - admit: `add_request` entry to the request notify being sent. Edge
-    admission and routing, plus the prefix READY round trip when prefix
-    caching is on; close to zero when it is off.
+  - route: `add_request` entry to the request being admitted and routed.
+    Validation and model-family precomputation over the prompt, plus the
+    prefix READY round trip when prefix caching is on.
+  - send: routed to the notify reaching the cloud's link. A full outbound
+    queue is retried here, so this is where that shows up.
   - dispatch: notify sent to the first prompt rows announced for it. The
     edge scheduler choosing this request -- the picker and the gate.
 
@@ -52,18 +54,36 @@ from vllm.v1.lwd_control.lwd_control_diag.lwd_meter_base import (
 
 logger = init_logger(__name__)
 
+# Worst requests named per window. Enough to see whether one request's
+# dispatch covers a whole batch's admit, few enough to stay one line.
+_LWD_SLOWEST_KEPT = 3
+
 
 @dataclass(slots=True)
 class _LwdEdgeTimeline:
     """Monotonic stamps of one request's edge hops. Zero means not reached."""
 
     admit: float = 0.0
+    routed: float = 0.0
     notify: float = 0.0
     dispatch: float = 0.0
 
 
 class LwdEdgeTtftMeter(LwdIntervalMeter):
-    """Per-request breakdown of the edge's share of TTFT."""
+    """Per-request breakdown of the edge's share of TTFT.
+
+    `admit` is split at the point the request is routed: `route` is the
+    scheduler-local admission (validation, model-family precomputation,
+    routing) and `send` is the notify reaching the cloud's link. The two
+    have nothing in common -- one is CPU work on the prompt, the other
+    waits on an outbound queue -- and a measurement that adds them cannot
+    say which one grew.
+
+    The slowest requests are also named individually. The window averages
+    cannot show that one request's `dispatch` covers a whole batch's
+    `admit`, because the two live in different fields of the same line;
+    the per-request detail puts both on one row, for one request id.
+    """
 
     def __init__(self) -> None:
         self._timelines: dict[str, _LwdEdgeTimeline] = {}
@@ -76,8 +96,10 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
         self._arrived = 0
         self._done = 0
         self._frontend = LwdSpan()
-        self._admit = LwdSpan()
+        self._route = LwdSpan()
+        self._send = LwdSpan()
         self._dispatch = LwdSpan()
+        self._slowest: list[tuple[float, str, float, float, float]] = []
 
     def note_add_request(self, request_id: str, arrival_time: float) -> None:
         """`add_request` reached the engine thread. Closes the frontend
@@ -91,6 +113,13 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
         self._arrived += 1
         if arrival_time > 0:
             self._frontend.add(max(0.0, time.time() - arrival_time))
+
+    def note_routed(self, request_id: str) -> None:
+        """Edge admission finished and picked a cloud DP rank. Splits the
+        prompt-side CPU work from the wait on the outbound link."""
+        timeline = self._timelines.get(request_id)
+        if timeline is not None and not timeline.routed:
+            timeline.routed = time.monotonic()
 
     def note_notify(self, request_id: str) -> None:
         """The request notify went out to the routed cloud DP rank."""
@@ -107,9 +136,29 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
         now = timeline.dispatch = time.monotonic()
         del self._timelines[request_id]
         self._done += 1
-        if timeline.notify:
-            self._admit.add(timeline.notify - timeline.admit)
-            self._dispatch.add(now - timeline.notify)
+        if not timeline.notify:
+            return
+        # A request that reached notify without being routed took the
+        # prefix path; charge it all to route rather than to both.
+        routed = timeline.routed or timeline.notify
+        route = routed - timeline.admit
+        send = timeline.notify - routed
+        dispatch = now - timeline.notify
+        self._route.add(route)
+        self._send.add(send)
+        self._dispatch.add(dispatch)
+        self._note_slowest(request_id, route, send, dispatch)
+
+    def _note_slowest(
+        self, request_id: str, route: float, send: float, dispatch: float
+    ) -> None:
+        """Keep the few worst requests of the window, ranked by what they
+        spent on the edge in total."""
+        total = route + send + dispatch
+        self._slowest.append((total, request_id, route, send, dispatch))
+        if len(self._slowest) > _LWD_SLOWEST_KEPT:
+            self._slowest.sort(reverse=True)
+            del self._slowest[_LWD_SLOWEST_KEPT:]
 
     def forget(self, request_id: str) -> None:
         """A request that will announce no rows (aborted before dispatch)."""
@@ -129,11 +178,79 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
             return
         logger.info(
             "[lwd][edge-ttft] %d arrived %d dispatched: frontend=%s "
-            "admit=%s dispatch=%s (avg/max ms); queued=%d",
+            "route=%s send=%s dispatch=%s (avg/max ms); queued=%d",
             self._arrived,
             self._done,
             self._frontend,
-            self._admit,
+            self._route,
+            self._send,
             self._dispatch,
             len(self._timelines),
+        )
+        if not self._slowest:
+            return
+        self._slowest.sort(reverse=True)
+        logger.info(
+            "[lwd][edge-slow] worst %d of the window: %s",
+            len(self._slowest),
+            "; ".join(
+                f"{request_id} route={route * 1000:.0f} send={send * 1000:.0f} "
+                f"dispatch={dispatch * 1000:.0f}"
+                for _total, request_id, route, send, dispatch in self._slowest
+            ),
+        )
+
+
+class LwdEdgeIntakeMeter(LwdIntervalMeter):
+    """How long the engine thread spends taking requests in, and how many
+    it takes in before it steps again.
+
+    The native busy loop polls the input queue to exhaustion before it
+    runs a step, and on this edge each of those requests is admitted and
+    announced inline. A burst therefore admits the whole batch back to
+    back while no batch of prompt rows goes out, which would make the
+    first request's wait for dispatch cover the whole batch's admission.
+
+    That shape is visible today only as an arithmetic coincidence between
+    two averages on different lines. This measures it directly: `batch` is
+    requests taken in per poll, `held` is how long the poll kept the
+    thread, and `gap` is how long the engine went without stepping. A poll
+    that takes in tens of requests and holds the thread for minutes is
+    the hypothesis confirmed; short holds mean the wait is elsewhere.
+    """
+
+    def _reset(self) -> None:
+        self._polls = 0
+        self._taken = 0
+        self._bursts = 0
+        self._max_batch = 0
+        self._held = LwdSpan()
+        self._gap = LwdSpan()
+
+    def note_poll(self, taken: int, held_s: float, gap_s: float) -> None:
+        """One trip through the input-queue poll: how many requests it
+        handled, how long it ran, and how long since the last step."""
+        self._polls += 1
+        self._taken += taken
+        self._max_batch = max(self._max_batch, taken)
+        if taken > 1:
+            self._bursts += 1
+        if held_s > 0:
+            self._held.add(held_s)
+        if gap_s > 0:
+            self._gap.add(gap_s)
+        self._roll()
+
+    def _report(self) -> None:
+        if not self._polls:
+            return
+        logger.info(
+            "[lwd][edge-intake] %d polls took in %d requests: bursts=%d "
+            "max batch=%d; held=%s step gap=%s (avg/max ms)",
+            self._polls,
+            self._taken,
+            self._bursts,
+            self._max_batch,
+            self._held,
+            self._gap,
         )

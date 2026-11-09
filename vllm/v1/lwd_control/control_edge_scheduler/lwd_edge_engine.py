@@ -74,6 +74,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     scheduler: LwdEdgeScheduler
 
     def _lwd_assemble(self) -> None:
+        # Set before the control plane starts: the first client request can
+        # reach the poll as soon as the engine is reachable.
+        self._lwd_intake_taken = 0
+        self._lwd_last_step_ts = 0.0
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
@@ -288,6 +292,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     def _lwd_admit_and_notify(self, request: Request) -> None:
         dp_idx = self.scheduler.lwd_admit_request(request)
+        # Splits the prompt-side admission work from the wait on the link.
+        self.scheduler.lwd_ttft_meter.note_routed(request.request_id)
         client = self._lwd_coord_clients.get(dp_idx)
         try:
             if client is not None:
@@ -300,9 +306,28 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_enqueue_request(self, request: Request) -> None:
         super().add_request(request)
 
+    def _process_input_queue(self) -> None:
+        """Time the native poll, and count the requests it takes in.
+
+        The native loop polls to exhaustion before stepping, and this edge
+        admits and announces each request inline, so one poll can hold the
+        thread for as long as a whole burst takes to admit. Measuring the
+        poll is what separates that from a slow scheduler: both show up as
+        a large `dispatch`, and only this says which one it was.
+        """
+        self._lwd_intake_taken = 0
+        started = time.monotonic()
+        gap = started - self._lwd_last_step_ts if self._lwd_last_step_ts else 0.0
+        super()._process_input_queue()
+        self._lwd_last_step_ts = time.monotonic()
+        self.scheduler.lwd_intake_meter.note_poll(
+            self._lwd_intake_taken, self._lwd_last_step_ts - started, gap
+        )
+
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        self._lwd_intake_taken += 1
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None and control.handle_client_request(request_type, request):
             return

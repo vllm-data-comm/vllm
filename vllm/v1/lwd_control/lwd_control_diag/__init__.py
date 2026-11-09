@@ -4,13 +4,12 @@ debug 打点转发;只出判定与数据,不持执行适配器,不 import 调度
 
 from vllm.v1.lwd_control.lwd_control_diag.lwd_admission_meter import (
     LwdCloudAdmissionMeter,
-    LwdCloudArrivalMeter,
-    LwdEdgeDispatchMeter,
 )
 from vllm.v1.lwd_control.lwd_control_diag.lwd_control_diag import (
     LwdControlDiag,
 )
 from vllm.v1.lwd_control.lwd_control_diag.lwd_edge_ttft_meter import (
+    LwdEdgeIntakeMeter,
     LwdEdgeTtftMeter,
 )
 from vllm.v1.lwd_control.lwd_control_diag.lwd_ttft_meter import (
@@ -20,10 +19,9 @@ from vllm.v1.lwd_control.lwd_control_diag.lwd_ttft_meter import (
 
 __all__ = [
     "LwdCloudAdmissionMeter",
-    "LwdCloudArrivalMeter",
     "LwdCloudStepMeter",
     "LwdCloudTtftMeter",
     "LwdControlDiag",
-    "LwdEdgeDispatchMeter",
+    "LwdEdgeIntakeMeter",
     "LwdEdgeTtftMeter",
 ]
