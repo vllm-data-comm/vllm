@@ -44,6 +44,9 @@ from vllm.distributed.parallel_state import (
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_control.lwd_control_diag.lwd_cloud_exec_meter import (
+    LwdCloudOutputMeter,
+)
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
@@ -649,6 +652,9 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        # Only this proc's output thread touches it, and only for steps
+        # that carry LWD DOWN metadata.
+        self._lwd_output_meter = LwdCloudOutputMeter()
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -985,6 +991,8 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        harvest_s = 0.0
+        hidden_numel = 0
         inner = getattr(output, "_model_runner_output", output)
         ready_event = getattr(inner, "lwd_meta_ready_event", None)
         if ready_event is not None:
@@ -1024,7 +1032,10 @@ class WorkerProc:
                 (time.monotonic() - started) * 1000,
                 time.monotonic(),
             )
+            harvest_s = time.monotonic() - started
+            hidden_numel = carrier[3]
 
+        got = time.monotonic()
         if isinstance(output, AsyncModelRunnerOutput):
             try:
                 output = output.get_output()
@@ -1036,8 +1047,20 @@ class WorkerProc:
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
+        enqueued = time.monotonic()
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+        if carrier is not None:
+            # This thread is off the step's critical path by design, so
+            # its cost appears nowhere in the step breakdown -- yet a step
+            # cannot be collected before it has run, so time lost here
+            # resurfaces as the next step's exec_rpc.
+            self._lwd_output_meter.note_output(
+                harvest_s=harvest_s,
+                output_get_s=enqueued - got,
+                enqueue_s=time.monotonic() - enqueued,
+                hidden_numel=hidden_numel,
+            )
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,

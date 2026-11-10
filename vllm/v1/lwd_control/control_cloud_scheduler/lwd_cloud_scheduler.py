@@ -14,6 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -40,10 +41,13 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdC2eNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import (
+    LwdBatchShape,
     LwdCloudAdmissionMeter,
+    LwdCloudExecMeter,
     LwdCloudStepMeter,
     LwdCloudTtftMeter,
     LwdControlDiag,
+    LwdStepTiming,
 )
 from vllm.v1.request import Request, RequestStatus
 
@@ -98,6 +102,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_ttft_meter = LwdCloudTtftMeter()
         """Hop stamps of the cloud's share of TTFT. Public because the
         first two hops are seen by the engine's ingest thread, not here."""
+        self.lwd_exec_meter = LwdCloudExecMeter()
+        """Where a step's wall clock went. Public because the segments
+        around the scheduler -- the executor round trips, the post-step
+        send -- are only visible from the engine."""
+        self._lwd_timing = LwdStepTiming()
+        """The step being scheduled. Replaced by the engine each step; the
+        placeholder keeps a scheduler driven without one (tests) working."""
         # Per-step terms the meter reads, set by the step that computes
         # them: the drafting reservation and the queue it was charged
         # against, and the two reasons a candidate yielded no window.
@@ -118,6 +129,29 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """Keep the engine alive until an abort-only worker notice is sent."""
         return bool(self._lwd_abort_pending) or super().has_requests()
 
+    def lwd_open_step(self, timing: LwdStepTiming) -> None:
+        """The record this step's segments go into, handed over by the
+        engine before the step runs."""
+        self._lwd_timing = timing
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        """Native entry, timed: choosing a batch is the one segment of a
+        step that is pure scheduling."""
+        started = time.monotonic()
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            self._lwd_timing.sched += time.monotonic() - started
+
+    def get_grammar_bitmask(self, *args: Any, **kwargs: Any) -> Any:
+        """Native, timed: structured output is off in this deployment, so
+        this should read zero -- a number here means it is not."""
+        started = time.monotonic()
+        try:
+            return super().get_grammar_bitmask(*args, **kwargs)
+        finally:
+            self._lwd_timing.grammar += time.monotonic() - started
+
     def _lwd_schedule_step(self) -> SchedulerOutput:
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
@@ -130,28 +164,41 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
-        self._lwd_meter_prefill(out, windows, room)
+        self._lwd_meter_prefill(out, windows, room, decode_ids, decode_exact)
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
         return out
 
     def _lwd_meter_prefill(
-        self, out: SchedulerOutput, windows: list[_LwdPrefillWindow], room: int
+        self,
+        out: SchedulerOutput,
+        windows: list[_LwdPrefillWindow],
+        room: int,
+        decode_ids: list[str],
+        decode_exact: int,
     ) -> None:
-        """Feed the prefill meters what this step offered and took.
+        """Feed the prefill meters what this step offered and took, and
+        snapshot the batch's shape for the step timing.
 
-        Both read the scheduler output, not the windows: the native step
-        can cut a window short, and a window asked for is not a row run.
-        The same pass stamps each request whose rows did run, so that the
-        last stamp before its first token marks the window that finished
-        the prompt.
+        All of them read the scheduler output, not the windows: the native
+        step can cut a window short, and a window asked for is not a row
+        run. The same pass stamps each request whose rows did run, so that
+        the last stamp before its first token marks the window that
+        finished the prompt.
+
+        The shape is snapshotted here because this is where it is known
+        exactly; it travels with the step's timing, so a step that took
+        seconds is read against the batch that produced it rather than
+        against whatever was scheduled most recently.
         """
         admitted = 0
+        prefill_reqs = 0
         for window in windows:
             rows = out.num_scheduled_tokens.get(window.request.request_id, 0)
             if not rows:
                 continue
             admitted += rows
+            prefill_reqs += 1
             self.lwd_ttft_meter.note_scheduled(window.request.request_id)
         self._lwd_admission_meter.note_step(
             room=room,
@@ -160,6 +207,20 @@ class LwdCloudScheduler(LwdBaseScheduler):
             blocked=self._lwd_blocked,
             queue_depth=self._lwd_queue_depth,
             reserved=self._lwd_reserved,
+        )
+        self._lwd_timing.shape = LwdBatchShape(
+            decode_reqs=len(decode_ids),
+            decode_tokens=decode_exact,
+            prefill_reqs=prefill_reqs,
+            prefill_windows=len(windows),
+            prefill_tokens=admitted,
+            room=room,
+            reserved=self._lwd_reserved,
+            queue_depth=self._lwd_queue_depth,
+            blocked_partial=self._lwd_blocked[0],
+            blocked_no_arrival=self._lwd_blocked[1],
+            running=len(self.running),
+            waiting=len(self.waiting),
         )
 
     def _lwd_prefill_room(self, decode_ids: list[str], decode_exact: int) -> int:
@@ -489,6 +550,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        started = time.monotonic()
         nonce_snapshot = {
             request_id: getattr(request, "lwd_prefix_nonce", 0)
             for request_id, request in self.requests.items()
@@ -503,9 +565,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_cleanup_arrivals(engine_core_outputs)
         carrier = getattr(model_runner_output, "lwd_down_carrier", None)
         if carrier is not None:
+            # The DOWN pairing number, so this step's line can be matched
+            # against the worker's and the executor output thread's.
+            self._lwd_timing.down_seqno = carrier[-1]
             self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
         elif LwdControlDiag.disable_down_enabled():
             self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
+        self._lwd_timing.update += time.monotonic() - started
         return engine_core_outputs
 
     def _lwd_meter_tokens(

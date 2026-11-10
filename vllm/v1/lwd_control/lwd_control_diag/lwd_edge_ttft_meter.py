@@ -58,6 +58,11 @@ logger = init_logger(__name__)
 # dispatch covers a whole batch's admit, few enough to stay one line.
 _LWD_SLOWEST_KEPT = 3
 
+# Below this the per-request line says nothing the window averages do
+# not: a healthy edge spends about 3 ms here, so naming its three worst
+# requests every window is noise that hides the window that matters.
+_LWD_SLOW_REQUEST_S = 0.010
+
 
 @dataclass(slots=True)
 class _LwdEdgeTimeline:
@@ -79,10 +84,11 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
     waits on an outbound queue -- and a measurement that adds them cannot
     say which one grew.
 
-    The slowest requests are also named individually. The window averages
-    cannot show that one request's `dispatch` covers a whole batch's
-    `admit`, because the two live in different fields of the same line;
-    the per-request detail puts both on one row, for one request id.
+    The slowest requests are also named individually, when any was slow
+    enough to be worth a line. The window averages cannot show that one
+    request's `dispatch` covers a whole batch's `admit`, because the two
+    live in different fields of the same line; the per-request detail
+    puts both on one row, for one request id.
     """
 
     def __init__(self) -> None:
@@ -153,8 +159,12 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
         self, request_id: str, route: float, send: float, dispatch: float
     ) -> None:
         """Keep the few worst requests of the window, ranked by what they
-        spent on the edge in total."""
+        spent on the edge in total. Only requests slow enough to explain
+        something are kept: on a healthy edge every request would qualify
+        and the line would print the same few milliseconds forever."""
         total = route + send + dispatch
+        if total < _LWD_SLOW_REQUEST_S:
+            return
         self._slowest.append((total, request_id, route, send, dispatch))
         if len(self._slowest) > _LWD_SLOWEST_KEPT:
             self._slowest.sort(reverse=True)
@@ -191,7 +201,7 @@ class LwdEdgeTtftMeter(LwdIntervalMeter):
             return
         self._slowest.sort(reverse=True)
         logger.info(
-            "[lwd][edge-slow] worst %d of the window: %s",
+            "[lwd][edge-slow] worst %d of the window over 10ms: %s",
             len(self._slowest),
             "; ".join(
                 f"{request_id} route={route * 1000:.0f} send={send * 1000:.0f} "

@@ -29,6 +29,9 @@ from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_executor_proxy import (
+    LwdCloudExecutorProxy,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
@@ -57,6 +60,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_decode_edge_to_cloud,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag.lwd_cloud_exec_meter import (
+    LwdStepTiming,
+)
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     LwdRequestMetadataLayout,
     lwd_cloud_engram_fingerprint,
@@ -142,6 +148,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_assemble(self) -> None:
         self._lwd_init_prefix_cache()
+        # Timing of the step being assembled, shared with the executor
+        # proxy so a future carries the record of the step it belongs to.
+        self._lwd_timing = LwdStepTiming()
+        self._lwd_step_open = False
+        self.model_executor = LwdCloudExecutorProxy(self.model_executor)
+        self.scheduler.lwd_exec_meter.note_path(
+            self.batch_queue_size, self.async_scheduling
+        )
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
         self._lwd_prompt_lens: dict[str, int] = {}
@@ -223,10 +237,13 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_send_until_queued(
         self, peer: LwdPeer, message: LwdCloudToEdgeMessage
-    ) -> None:
+    ) -> int:
         """Retry a full outbound queue until the message is queued; gives up
         with an error once shutdown is requested, so a stalled edge cannot
-        block it."""
+        block it. Returns how many retries it took, so a step held up here
+        is told from one with a slow send; the ingest thread sends through
+        here too, and its retries belong to no step."""
+        retries = 0
         while not self._lwd_send(peer, message):
             if self.shutdown_state != EngineShutdownState.RUNNING:
                 lwd_logger.error(
@@ -235,8 +252,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     type(message).__name__,
                     peer,
                 )
-                return
+                return retries
+            retries += 1
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        return retries
 
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
@@ -662,6 +681,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def step_with_batch_queue(self):
         """Drain the early-recv watermark at the head of the step (done
         MQ -> gate readiness predicate); the rest is native."""
+        self._lwd_open_step()
         self._lwd_drain_irecv_completions()
         self._lwd_check_starvation()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
@@ -671,11 +691,48 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def step(self):
         """Same for the synchronous step path: drain the watermark at
         the head of the step, the rest is native."""
+        self._lwd_open_step()
         self._lwd_drain_irecv_completions()
         self._lwd_check_starvation()
         engine_core_outputs, model_executed = super().step()
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
+
+    def _lwd_open_step(self) -> None:
+        """Close the previous step's record and open this one's.
+
+        The previous step is reported here rather than at its own end
+        because two of its segments run after it: a DP rank's dummy batch
+        and the wave all-reduce happen in the busy loop, between one step
+        returning and the next being scheduled. Reporting at the end
+        would publish the record before they could be added to it, and
+        charge their cost to the gap instead.
+
+        The record is handed to the executor proxy rather than kept here
+        alone: with a batch queue the futures outlive the step that made
+        them, and each must charge its wait to its own batch.
+        """
+        meter = self.scheduler.lwd_exec_meter
+        previous = self._lwd_timing
+        gap = 0.0
+        if self._lwd_step_open:
+            meter.note_step(previous)
+            # The busy-loop segments ran inside this gap and are already
+            # counted; what is left is the wait and the input handling.
+            gap = max(0.0, meter.take_pre_gap() - previous.dummy - previous.dp_sync)
+        self._lwd_timing = LwdStepTiming(pre_gap=gap)
+        self._lwd_step_open = True
+        self.model_executor.lwd_open_step(self._lwd_timing)
+        self.scheduler.lwd_open_step(self._lwd_timing)
+
+    def _process_aborts_queue(self):
+        """Native, timed: aborts that arrived during model execution are
+        drained inside the step, so a slow drain is a slow step."""
+        started = time.monotonic()
+        try:
+            super()._process_aborts_queue()
+        finally:
+            self._lwd_timing.abort += time.monotonic() - started
 
     def _lwd_retire_finished_outputs(self, engine_core_outputs: Any) -> None:
         if not engine_core_outputs:
@@ -807,16 +864,28 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def post_step(self, model_executed: bool) -> None:
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
+        timing = self._lwd_timing
+        started = time.monotonic()
         if self.scheduler.pending_c2e:
             assert self._lwd_edge is not None, "c2e produced before any edge"
             for notify in self.scheduler.pending_c2e:
-                self._lwd_send_until_queued(self._lwd_edge, notify)
+                timing.c2e_retries += self._lwd_send_until_queued(
+                    self._lwd_edge, notify
+                )
                 # Last hop the cloud can see, stamped after the send so a
                 # full outbound queue shows up as the wait it is.
                 for request_id in notify.req_ids:
                     self.scheduler.lwd_ttft_meter.note_sent(request_id)
             self.scheduler.pending_c2e.clear()
+        sent = time.monotonic()
         super().post_step(model_executed)
+        now = time.monotonic()
+        timing.c2e_send += sent - started
+        timing.native_post += now - sent
+        # Last stamp inside the step. What follows -- the dummy batch and
+        # the wave all-reduce -- is still charged to this record, which is
+        # why the next step reports it rather than this one.
+        self.scheduler.lwd_exec_meter.note_step_end()
 
 
 class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
@@ -829,4 +898,27 @@ class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
     """Cloud PO engine of a MoE multi-DP cloud: the native DP engine base
     carries the wave state machine, dummy batches, START_DP_WAVE handling
     and stats publishing, so the MoE engines stay in lockstep exactly as a
-    centralized DP deployment; the LWD seams come from the mixin."""
+    centralized DP deployment; the LWD seams come from the mixin.
+
+    Two of those run outside the step, in the busy loop, and both can
+    block on another rank; timed here so neither hides inside the gap
+    between steps.
+    """
+
+    def execute_dummy_batch(self) -> None:
+        """Native, timed: a rank with nothing of its own still steps, to
+        keep the MoE ranks together."""
+        started = time.monotonic()
+        try:
+            super().execute_dummy_batch()
+        finally:
+            self._lwd_timing.dummy += time.monotonic() - started
+
+    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        """Native, timed: a blocking all-reduce, so what it costs this
+        rank is what the slowest rank was still doing."""
+        started = time.monotonic()
+        try:
+            return super()._has_global_unfinished_reqs(local_unfinished)
+        finally:
+            self._lwd_timing.dp_sync += time.monotonic() - started
