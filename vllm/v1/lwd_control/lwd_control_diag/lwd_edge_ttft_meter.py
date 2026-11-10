@@ -46,13 +46,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from vllm.logger import init_logger
 from vllm.v1.lwd_control.lwd_control_diag.lwd_meter_base import (
     LwdIntervalMeter,
     LwdSpan,
+    lwd_meter_logger,
 )
 
-logger = init_logger(__name__)
+logger = lwd_meter_logger
 
 # Worst requests named per window. Enough to see whether one request's
 # dispatch covers a whole batch's admit, few enough to stay one line.

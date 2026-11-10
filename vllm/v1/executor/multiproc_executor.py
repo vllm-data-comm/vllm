@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_control_diag.lwd_cloud_exec_meter import (
     LwdCloudOutputMeter,
+    LwdOutputRecord,
 )
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
@@ -654,7 +655,7 @@ class WorkerProc:
         self.rank = rank
         # Only this proc's output thread touches it, and only for steps
         # that carry LWD DOWN metadata.
-        self._lwd_output_meter = LwdCloudOutputMeter()
+        self._lwd_output_meter = LwdCloudOutputMeter(rank)
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -992,13 +993,19 @@ class WorkerProc:
         converted to a FAILURE response.
         """
         harvest_s = 0.0
-        hidden_numel = 0
+        harvested = False
+        hidden_numel = -1
+        seqno = -1
         inner = getattr(output, "_model_runner_output", output)
         ready_event = getattr(inner, "lwd_meta_ready_event", None)
         if ready_event is not None:
             delattr(inner, "lwd_meta_ready_event")
         carrier = getattr(inner, "lwd_down_carrier", None)
-        if carrier is not None and len(carrier) == 5:
+        # 0 = no DOWN carrier on this output, 5 = one to harvest, 4 = one
+        # already harvested. The meter reports the mix, because which of
+        # the three arrived decides what its durations can be read to mean.
+        carrier_len = 0 if carrier is None else len(carrier)
+        if carrier is not None and carrier_len == 5:
             if ready_event is None:
                 raise RuntimeError("LWD DOWN carrier is missing its ready event")
             meta_dev, seg_lens_host, req_ids, hidden_numel, seqno = carrier
@@ -1033,7 +1040,7 @@ class WorkerProc:
                 time.monotonic(),
             )
             harvest_s = time.monotonic() - started
-            hidden_numel = carrier[3]
+            harvested = True
 
         got = time.monotonic()
         if isinstance(output, AsyncModelRunnerOutput):
@@ -1050,17 +1057,29 @@ class WorkerProc:
         enqueued = time.monotonic()
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
-        if carrier is not None:
-            # This thread is off the step's critical path by design, so
-            # its cost appears nowhere in the step breakdown -- yet a step
-            # cannot be collected before it has run, so time lost here
-            # resurfaces as the next step's exec_rpc.
-            self._lwd_output_meter.note_output(
+        if carrier_len == 4:
+            # Already harvested, by this method on an earlier pass: the
+            # four-tuple is what it leaves behind. Read the identifying
+            # fields from their post-harvest positions so the line still
+            # names the step, but claim no harvest for it.
+            _buf, _req_ids, hidden_numel, seqno = carrier
+        # This thread is off the step's critical path by design, so its
+        # cost appears nowhere in the step breakdown -- yet a step cannot
+        # be collected before it has run, so time lost here resurfaces as
+        # the next step's wait. Recorded for every output, carrier or not:
+        # which ones arrive is itself the thing being established.
+        self._lwd_output_meter.note_output(
+            LwdOutputRecord(
+                carrier_len=carrier_len,
+                harvested=harvested,
                 harvest_s=harvest_s,
                 output_get_s=enqueued - got,
                 enqueue_s=time.monotonic() - enqueued,
                 hidden_numel=hidden_numel,
+                seqno=seqno,
+                output_type=type(output).__name__,
             )
+        )
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,

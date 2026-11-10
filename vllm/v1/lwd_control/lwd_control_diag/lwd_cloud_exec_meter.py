@@ -28,8 +28,8 @@ engine already has, so each segment names one suspect:
   - exec_rpc: waiting for the worker's execute_model. Input preparation,
     the forward pass, collectives and the response trip home, which only
     the worker-side meter can tell apart.
-  - sample_rpc: sampling, bookkeeping, the DOWN collect and submit, and
-    the output thread's work.
+  - sample_rpc / batch_wait: what the step blocked on, named for the path
+    (see below).
   - abort: aborts that arrived during execution.
   - update: committing tokens and building the c2e notifies.
   - c2e_send / native_post: the post-step hook, split at the send loop so
@@ -38,31 +38,68 @@ engine already has, so each segment names one suspect:
 `exec_rpc` is named for what it measures: the round trip, not the model.
 A long one does not say the NPU was busy.
 
+The two waiting segments mean different things on the two native step
+paths, so they are labelled differently:
+
+  - `step`: the step resolves the execute future, then calls
+    `sample_tokens` and blocks in it. `exec_rpc` is the model round trip
+    and `sample_rpc` is sampling plus the DOWN work -- two waits, each
+    on its own call.
+  - `step_with_batch_queue`: `sample_tokens` is launched non-blocking and
+    its future is what the step pops and waits on; the execute future is
+    resolved only to re-raise an error. So there is one wait, and it
+    covers the whole worker trip -- queueing behind an earlier batch,
+    input staging, the forward pass, collectives, sampling, the DOWN
+    collect and submit, the output thread, and the response home. It is
+    called `batch_wait`, because reading it as sampling would be wrong by
+    most of its length, and `exec_rpc` reports `-` rather than `0`: that
+    future was never awaited, so nothing was measured there.
+
+A segment the running path never samples prints `-`, never `0`. A zero
+clears a suspect; a dash says it was not looked at.
+
 The timings ride on the future rather than on "the last batch
 scheduled", because a batch queue deeper than one returns a batch that
 was scheduled several steps ago; reading the latest shape would pair
 every duration with the wrong batch. The shape of the batch that
 produced a slow step is on its own line, because an eight-second step
 over 8k prompt rows and one over 30 decode rows are different faults.
+
+One iteration of `step_with_batch_queue` can also schedule a new batch
+and wait on an older one, so `sched`/`submit` and `batch_wait`/`update`
+on one line need not belong to the same batch. The line is the step
+thread's wall clock, which is what a stall is made of; attributing a
+single batch end to end takes `down_seqno` across the engine and worker
+logs.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
-from vllm.logger import init_logger
 from vllm.v1.lwd_control.lwd_control_diag.lwd_meter_base import (
     LwdIntervalMeter,
     LwdSpan,
+    lwd_meter_logger,
 )
 
-logger = init_logger(__name__)
+logger = lwd_meter_logger
 
 # A step worth naming individually. The steady state here is 120-900 ms
 # depending on how much prefill the step carried, so a second is clear of
 # every healthy shape and still catches anything that stands out.
 LWD_SLOW_STEP_S = 1.0
+
+# A gap this long is the engine having nothing to do -- between two
+# benchmark batches, or before the first request -- not a step waiting on
+# something. Counting those tens of seconds into `pre_gap` would put the
+# idle time between batches into the same average as the hundreds of
+# milliseconds a step waits mid-load, and the second would vanish. Such a
+# gap is reported on its own line and closes the window, so the batch
+# that follows is measured from zero.
+LWD_IDLE_GAP_S = 5.0
 
 
 @dataclass(slots=True)
@@ -96,7 +133,13 @@ class LwdBatchShape:
 
 @dataclass(slots=True)
 class LwdStepTiming:
-    """One step's segments, in the order they run. Seconds, monotonic."""
+    """One step's segments, in the order they run. Seconds, monotonic.
+
+    The two waiting segments start as None and are set by whichever
+    future the step actually resolved. None means the running path never
+    awaited that call, and prints as a dash; a float means it was
+    awaited, even if it returned at once.
+    """
 
     pre_gap: float = 0.0
     dummy: float = 0.0
@@ -104,8 +147,8 @@ class LwdStepTiming:
     sched: float = 0.0
     submit: float = 0.0
     grammar: float = 0.0
-    exec_rpc: float = 0.0
-    sample_rpc: float = 0.0
+    exec_rpc: float | None = None
+    sample_rpc: float | None = None
     abort: float = 0.0
     update: float = 0.0
     c2e_send: float = 0.0
@@ -113,6 +156,12 @@ class LwdStepTiming:
     c2e_retries: int = 0
     down_seqno: int = -1
     shape: LwdBatchShape = field(default_factory=LwdBatchShape)
+
+    def add_wait(self, field_name: str, seconds: float) -> None:
+        """Charge a resolved future's wait, starting the segment at zero
+        the first time rather than leaving it unmeasured."""
+        current = getattr(self, field_name)
+        setattr(self, field_name, (current or 0.0) + seconds)
 
     def total(self) -> float:
         """Everything the step thread spent, waiting for work included."""
@@ -123,8 +172,8 @@ class LwdStepTiming:
             + self.sched
             + self.submit
             + self.grammar
-            + self.exec_rpc
-            + self.sample_rpc
+            + (self.exec_rpc or 0.0)
+            + (self.sample_rpc or 0.0)
             + self.abort
             + self.update
             + self.c2e_send
@@ -152,7 +201,15 @@ class LwdCloudExecMeter(LwdIntervalMeter):
 
     def __init__(self) -> None:
         self._last_step_end = 0.0
+        # Set by `note_path` at startup, before any step runs. Decides
+        # what the waiting segment is called, which changes what it means.
+        self._batch_queued = False
         super().__init__()
+
+    @property
+    def _wait_label(self) -> str:
+        """What the step blocked on, named for the path that ran."""
+        return "batch_wait" if self._batch_queued else "sample_rpc"
 
     def _reset(self) -> None:
         # `_last_step_end` is not cleared: the gap across a report
@@ -180,16 +237,21 @@ class LwdCloudExecMeter(LwdIntervalMeter):
         startup. `step_with_batch_queue` returns a batch scheduled some
         steps earlier, and that changes how every number here reads; the
         choice is derived from config, so printing it beats assuming."""
+        self._batch_queued = batch_queue_size > 1
         logger.info(
             "[lwd][cloud-exec] step path: batch_queue_size=%d "
-            "async_scheduling=%s step_fn=%s",
+            "async_scheduling=%s step_fn=%s wait_segment=%s",
             batch_queue_size,
             async_scheduling,
-            "step_with_batch_queue" if batch_queue_size > 1 else "step",
+            "step_with_batch_queue" if self._batch_queued else "step",
+            self._wait_label,
         )
 
     def note_step(self, timing: LwdStepTiming) -> None:
         """One trip through the engine's step."""
+        if timing.pre_gap >= LWD_IDLE_GAP_S:
+            self._note_idle(timing.pre_gap)
+            timing.pre_gap = 0.0
         self._steps += 1
         self._retries += timing.c2e_retries
         self._total.add(timing.in_step())
@@ -199,8 +261,12 @@ class LwdCloudExecMeter(LwdIntervalMeter):
         self._sched.add(timing.sched)
         self._submit.add(timing.submit)
         self._grammar.add(timing.grammar)
-        self._exec_rpc.add(timing.exec_rpc)
-        self._sample_rpc.add(timing.sample_rpc)
+        # Only if the step awaited it: a path that never resolves a
+        # future must report `-`, not an average pulled towards zero.
+        if timing.exec_rpc is not None:
+            self._exec_rpc.add(timing.exec_rpc)
+        if timing.sample_rpc is not None:
+            self._sample_rpc.add(timing.sample_rpc)
         self._abort.add(timing.abort)
         self._update.add(timing.update)
         self._c2e_send.add(timing.c2e_send)
@@ -209,6 +275,25 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             self._slow += 1
             self._report_slow(timing)
         self._roll()
+
+    def _note_idle(self, gap_s: float) -> None:
+        """An idle stretch: report the window that ended before it and
+        start the next one empty.
+
+        Without this the window straddling two benchmark batches carries
+        both the idle seconds and the steps on either side, and its
+        averages describe neither. The line names the gap so a long one
+        is still visible -- it is just not called a slow step.
+        """
+        if self._steps:
+            self._report()
+        self._reset()
+        self._last_report = time.monotonic()
+        logger.info(
+            "[lwd][cloud-exec] idle %.1fs, window restarted; ts=%.3f",
+            gap_s,
+            time.time(),
+        )
 
     def note_step_end(self) -> float:
         """Close the step and open the gap before the next one. Returns
@@ -222,11 +307,16 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             return 0.0
         return time.monotonic() - self._last_step_end
 
+    @staticmethod
+    def _ms(seconds: float | None) -> str:
+        """Whole ms, or a dash for a segment this path never measured."""
+        return "-" if seconds is None else f"{seconds * 1000:.0f}"
+
     def _report_slow(self, timing: LwdStepTiming) -> None:
         logger.info(
             "[lwd][cloud-slow-step] %.0fms: pre_gap=%.0f dummy=%.0f "
             "dp_sync=%.0f sched=%.0f "
-            "submit=%.0f grammar=%.0f exec_rpc=%.0f sample_rpc=%.0f "
+            "submit=%.0f grammar=%.0f exec_rpc=%s %s=%s "
             "abort=%.0f update=%.0f c2e_send=%.0f native_post=%.0f "
             "(ms); retries=%d down=%d; %s; ts=%.3f",
             timing.in_step() * 1000,
@@ -236,8 +326,9 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             timing.sched * 1000,
             timing.submit * 1000,
             timing.grammar * 1000,
-            timing.exec_rpc * 1000,
-            timing.sample_rpc * 1000,
+            self._ms(timing.exec_rpc),
+            self._wait_label,
+            self._ms(timing.sample_rpc),
             timing.abort * 1000,
             timing.update * 1000,
             timing.c2e_send * 1000,
@@ -256,7 +347,7 @@ class LwdCloudExecMeter(LwdIntervalMeter):
         logger.info(
             "[lwd][cloud-exec] %d steps (%d slow): step=%s pre_gap=%s; "
             "dummy=%s dp_sync=%s sched=%s submit=%s grammar=%s "
-            "exec_rpc=%s sample_rpc=%s "
+            "exec_rpc=%s %s=%s "
             "abort=%s update=%s c2e_send=%s native_post=%s (avg/max ms); "
             "c2e retries=%d",
             self._steps,
@@ -269,6 +360,7 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             self._submit,
             self._grammar,
             self._exec_rpc,
+            self._wait_label,
             self._sample_rpc,
             self._abort,
             self._update,
@@ -278,58 +370,133 @@ class LwdCloudExecMeter(LwdIntervalMeter):
         )
 
 
+# A harvest worth naming individually. An order of magnitude under the
+# step threshold: this thread is supposed to cost microseconds, and it
+# delays the next step by whatever it takes.
+LWD_SLOW_OUTPUT_S = 0.1
+
+
+@dataclass(slots=True)
+class LwdOutputRecord:
+    """One output crossing from a worker back to the engine.
+
+    `carrier_len` separates the cases the durations alone cannot. A DOWN
+    carrier arrives as a five-tuple and leaves as a four-tuple, so a four
+    here means this output already passed through -- its harvest belongs
+    to an earlier step and must not be reported as a harvest that cost
+    nothing. Zero means no carrier at all: a rank that does not own the
+    DOWN channel.
+    """
+
+    carrier_len: int
+    harvested: bool
+    harvest_s: float
+    output_get_s: float
+    enqueue_s: float
+    hidden_numel: int
+    seqno: int
+    output_type: str
+
+
 class LwdCloudOutputMeter(LwdIntervalMeter):
     """What the executor's output thread spends between a step finishing
     on the device and its result reaching the engine.
 
     This thread is off the step thread's critical path by design, so its
     cost appears nowhere in the step breakdown -- yet a step cannot be
-    collected until it has run, so a slow output thread shows up as
-    `exec_rpc` on the *next* step and reads as a slow forward pass.
+    collected until it has run, so a slow output thread shows up as the
+    *next* step's wait and reads as a slow forward pass.
 
       - meta_harvest: waiting for the per-step ready event and copying
-        the DOWN metadata off the device.
+        the DOWN metadata off the device. Only on outputs that carry a
+        five-tuple; `-/-` when none did.
       - output_get: resolving an async runner output.
       - enqueue: handing the result to the engine's response queue.
+
+    The carrier shapes seen in the window are on the line because the
+    durations are only readable once you know which outputs they came
+    from: a window of harvests that cost nothing and a window of outputs
+    that were never harvested print the same three numbers otherwise, and
+    the second says the measurement missed, not that the work was free.
 
     Called from the executor's output thread, which is the only thread
     that touches this meter.
     """
 
+    def __init__(self, rank: int) -> None:
+        self._rank = rank
+        super().__init__()
+        # Said once per worker, so an absent interval line later can be
+        # told from a meter that never reached the log.
+        logger.info("[lwd][cloud-output] meter up: rank%d", rank)
+
     def _reset(self) -> None:
         self._outputs = 0
+        self._harvests = 0
         self._rows = 0
         self._harvest = LwdSpan()
         self._output_get = LwdSpan()
         self._enqueue = LwdSpan()
         self._total = LwdSpan()
+        # How many outputs arrived with each carrier shape, and what the
+        # outputs themselves were.
+        self._carrier_lens: dict[int, int] = {}
+        self._types: dict[str, int] = {}
 
-    def note_output(
-        self,
-        harvest_s: float,
-        output_get_s: float,
-        enqueue_s: float,
-        hidden_numel: int,
-    ) -> None:
+    def note_output(self, record: LwdOutputRecord) -> None:
         """One output crossing back to the engine."""
         self._outputs += 1
-        self._rows += hidden_numel
-        self._harvest.add(harvest_s)
-        self._output_get.add(output_get_s)
-        self._enqueue.add(enqueue_s)
-        self._total.add(harvest_s + output_get_s + enqueue_s)
+        self._carrier_lens[record.carrier_len] = (
+            self._carrier_lens.get(record.carrier_len, 0) + 1
+        )
+        self._types[record.output_type] = self._types.get(record.output_type, 0) + 1
+        self._output_get.add(record.output_get_s)
+        self._enqueue.add(record.enqueue_s)
+        if record.harvested:
+            # Only a real harvest feeds the harvest span and the row
+            # count; an output that skipped it has no zero to contribute.
+            self._harvests += 1
+            self._rows += max(0, record.hidden_numel)
+            self._harvest.add(record.harvest_s)
+            self._total.add(
+                record.harvest_s + record.output_get_s + record.enqueue_s
+            )
+            if record.harvest_s >= LWD_SLOW_OUTPUT_S:
+                logger.info(
+                    "[lwd][cloud-output-slow] rank%d %.0fms harvest: "
+                    "output_get=%.0f enqueue=%.0f (ms); "
+                    "down=%d hidden=%d; ts=%.3f",
+                    self._rank,
+                    record.harvest_s * 1000,
+                    record.output_get_s * 1000,
+                    record.enqueue_s * 1000,
+                    record.seqno,
+                    record.hidden_numel,
+                    time.time(),
+                )
+        else:
+            self._total.add(record.output_get_s + record.enqueue_s)
         self._roll()
+
+    @staticmethod
+    def _histogram(counts: dict[Any, int]) -> str:
+        return ",".join(f"{key}:{n}" for key, n in sorted(counts.items(), key=str))
 
     def _report(self) -> None:
         if not self._outputs:
             return
         logger.info(
-            "[lwd][cloud-output] %d outputs: total=%s meta_harvest=%s "
-            "output_get=%s enqueue=%s (avg/max ms); hidden elems/output=%d",
+            "[lwd][cloud-output] rank%d %d outputs (%d harvested): total=%s "
+            "meta_harvest=%s output_get=%s enqueue=%s (avg/max ms); "
+            "hidden elems/harvest=%d; carrier_len=%s output=%s",
+            self._rank,
             self._outputs,
+            self._harvests,
             self._total,
             self._harvest,
             self._output_get,
             self._enqueue,
-            self._rows // self._outputs if self._outputs else 0,
+            self._rows // self._harvests if self._harvests else 0,
+            self._histogram(self._carrier_lens),
+            self._histogram(self._types),
         )

@@ -15,11 +15,24 @@ measure are only meaningful on a run whose per-step LWD logging is off
 measurement needs would have nothing to report. The native logger adds no
 prefix of its own, so the "[lwd]" tag is written into each format string
 to keep these few lines greppable among the native ones.
+
+All meters share one logger, declared here rather than per module. A
+meter named after its own module lands under `vllm_ascend.*` on the
+worker side, and vLLM's logging config only installs a console handler
+on `vllm`: those lines would go to the Ascend file handler while the
+engine's went to the console, and the two halves of one step would never
+appear in the same log. Reading these numbers means lining them up
+against each other, so they have to share a stream.
 """
 
 from __future__ import annotations
 
 import time
+
+from vllm.logger import init_logger
+
+# The one stream every meter reports on, in either repo.
+lwd_meter_logger = init_logger("vllm.lwd_meter")
 
 # One line per meter per interval. Long enough that a loaded second
 # cannot flood the log, short enough to see a phase change within a run.
@@ -59,6 +72,12 @@ class LwdSpan:
     own cure, and one average over all of them hides the one that moved.
     The mean alone would also hide a segment that is fast except when it
     is not, which is the shape every stall in this system has had.
+
+    A segment that was never sampled prints `-/-`, never `0/0`. The two
+    mean opposite things -- "this costs nothing" against "this was not
+    measured on the path that ran" -- and a zero that means the second
+    clears a suspect it never looked at. So `add` must not be called for
+    a step that did not take this path.
     """
 
     __slots__ = ("count", "_max_s", "_total_s")

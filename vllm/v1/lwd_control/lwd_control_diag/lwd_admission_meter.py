@@ -20,10 +20,12 @@ the interval gate and reporting conventions they share are in
 
 from __future__ import annotations
 
-from vllm.logger import init_logger
-from vllm.v1.lwd_control.lwd_control_diag.lwd_meter_base import LwdIntervalMeter
+from vllm.v1.lwd_control.lwd_control_diag.lwd_meter_base import (
+    LwdIntervalMeter,
+    lwd_meter_logger,
+)
 
-logger = init_logger(__name__)
+logger = lwd_meter_logger
 
 
 class LwdCloudAdmissionMeter(LwdIntervalMeter):

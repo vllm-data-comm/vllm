@@ -18,8 +18,14 @@ the batch it belongs to, so a step that waits on a batch scheduled three
 steps ago is read against that batch rather than against whatever was
 scheduled most recently.
 
-With a batch queue of one -- this deployment, since both sides run
-pp=1 -- the two are the same step and the distinction costs nothing.
+A future that is never resolved is never timed, and that is the point of
+the segments starting at None. On the batch-queue path the engine pops
+and waits on the sample future alone; the execute future is held only to
+re-raise its error if sampling returned None. So `exec_rpc` stays
+unmeasured there and prints as a dash -- which is the honest reading,
+because the execute call did take time, it was simply never awaited on
+its own. The one wait covers the whole worker trip and is reported as
+`batch_wait` rather than `sample_rpc`.
 
 Everything else passes straight through: this proxy adds no behaviour,
 only stamps.
@@ -68,12 +74,7 @@ class LwdTimedFuture:
         finally:
             timing = self._proxy.lwd_timing
             if timing is not None:
-                elapsed = time.monotonic() - started
-                setattr(
-                    timing,
-                    self._field,
-                    getattr(timing, self._field) + elapsed,
-                )
+                timing.add_wait(self._field, time.monotonic() - started)
                 # The batch this step waited on, which with a deeper
                 # queue is not the one it scheduled.
                 timing.shape = self._shape
@@ -123,7 +124,7 @@ class LwdCloudExecutorProxy:
         elapsed = time.monotonic() - started
         if not hasattr(out, "result"):
             # Blocking path: the call itself was the wait.
-            timing.sample_rpc += elapsed
+            timing.add_wait("sample_rpc", elapsed)
             return out
         timing.submit += elapsed
         return LwdTimedFuture(out, self, "sample_rpc", timing.shape)
