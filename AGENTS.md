@@ -31,6 +31,13 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
 - **迁移/替换要一次做到位**: 替换一个模块后, 全仓 grep 旧设计的名字与术语 (类名、函数名、注释里的旧概念, 如 publish/HELLO/接收线程/`wire_version`), 残留的转发层、没人覆写的空默认实现、只为旧结构存在的辅助函数、过时注释, 与替换放在同一个 commit 里清掉, 不留到以后. 例: 控制面替换后删掉了 `_lwd_shutdown_comm` (失败清理已由基类 `shutdown` 统一承担) 与转发层 `_lwd_on_message`.
 
+## LWD MRV2 模块地图（实现候选）
+
+- `vllm/v1/worker/gpu/lwd/`：新增公共 V2 runner/state、窗口注入、DOWN builder、MTP、penalties 与纯 torch 辅助组件。历史 V1 模块保持原位，未切换到这些新组件。
+- `control_scheduler/lwd_base_engine.py` 与 `lwd_comm/`：engine/worker runner_kind 一致性检查及边云握手版本校验；缺省按 V1 处理，V1/V2 不混用。
+- 云侧 W2 对非最终 prefill 额外要求 `start + rows + num_prefill_lookahead_tokens <= W1`，保证 MTP 使用真实下一行 embedding。
+- 当前状态：CPU UT 仅覆盖部分行为；910B/C 上的 eager/PIECEWISE/FULL、MTP、TP/EP、lmhead TP 与 prefix/abort 场景尚未完成验证。设计见 `docs/design/lwd_model_runner_v2.md`。进入 PR 前必须补 RFC issue，暂不宣称已支持 MRV2。
+
 ## LWD 命名约定 (团队规范 7.5 的细化)
 
 - **一个概念一个词, 跨类名/字段/方法/异常/日志/报错文案保持一致.** 例: 控制面里"对端完成握手、可以发送"统一叫 registered (`_registered_peers`, `LwdPeerNotRegisteredError`), 不混用 ready/connected/up; 只有成对的回调 `on_peer_up`/`on_peer_down` 例外.
