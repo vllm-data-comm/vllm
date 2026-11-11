@@ -69,6 +69,11 @@ def init_speculator(
 
         return MultiModuleMTPSpeculator(vllm_config, device)
     elif speculative_config.method == "mtp":
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if lwd_config is not None and lwd_config.role == "cloud":
+            from vllm.v1.worker.gpu.lwd.mtp_speculator import LwdCloudMTPSpeculator
+
+            return LwdCloudMTPSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
         return MTPSpeculator(vllm_config, device)

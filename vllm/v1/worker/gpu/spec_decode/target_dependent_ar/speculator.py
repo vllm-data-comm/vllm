@@ -416,26 +416,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             batch_descriptor=batch_descriptor,
             is_padding=is_padding,
         ):
-            inputs_embeds = None
-            if self.supports_mm_inputs:
-                assert self.inputs_embeds is not None
-                # Merge multimodal embeddings with input ids.
-                mm_embeds, is_mm_embed = mm_inputs or (None, None)
-                num_input_tokens = (
-                    is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
-                )
-                self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
-                    input_buffers.input_ids[:num_input_tokens],
-                    multimodal_embeddings=mm_embeds,
-                    is_multimodal=is_mm_embed,
-                )
-                inputs_embeds = self.inputs_embeds[:num_tokens]
-
-            model_inputs = dict(
-                input_ids=input_buffers.input_ids[:num_tokens],
-                positions=input_buffers.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
+            model_inputs = self._prepare_draft_model_inputs(
+                input_buffers, num_tokens, mm_inputs
             )
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
@@ -455,6 +437,32 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
+
+    def _prepare_draft_model_inputs(
+        self,
+        input_buffers: InputBatch | InputBuffers,
+        num_tokens: int,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> dict[str, torch.Tensor | None]:
+        inputs_embeds = None
+        if self.supports_mm_inputs:
+            assert self.inputs_embeds is not None
+            mm_embeds, is_mm_embed = mm_inputs or (None, None)
+            num_input_tokens = (
+                is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
+            )
+            self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
+                input_buffers.input_ids[:num_input_tokens],
+                multimodal_embeddings=mm_embeds,
+                is_multimodal=is_mm_embed,
+            )
+            inputs_embeds = self.inputs_embeds[:num_tokens]
+        return dict(
+            input_ids=input_buffers.input_ids[:num_tokens],
+            positions=input_buffers.positions[:num_tokens],
+            hidden_states=self.hidden_states[:num_tokens],
+            inputs_embeds=inputs_embeds,
+        )
 
     def _prefill(
         self,

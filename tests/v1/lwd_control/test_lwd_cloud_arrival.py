@@ -144,14 +144,42 @@ def test_fragment_waits_but_final_and_budget_limited_windows_run():
     assert [(w.start, w.num_rows) for w in final_window] == [(2, 8)]
 
 
+def test_nonfinal_window_requires_lookahead_arrival() -> None:
+    scheduler = _scheduler(_request())
+    scheduler._lwd_prefill_lookahead_tokens = 1
+    scheduler.lwd_recv_rows["p"] = 5
+
+    assert scheduler._lwd_collect_prefill_windows(room=3) == []
+
+    scheduler.lwd_recv_rows["p"] = 6
+    windows = scheduler._lwd_collect_prefill_windows(room=3)
+    assert [(window.start, window.num_rows) for window in windows] == [(2, 3)]
+    scheduler._lwd_verify_w2(
+        SimpleNamespace(num_scheduled_tokens={"p": 3}), windows, decode_exact=0
+    )
+
+
 def test_decode_exact_is_accounted_before_prefill_windows():
     scheduler = _scheduler(_request())
     scheduler.max_num_scheduled_tokens = 10
-    calls = []
+    calls: list[object] = []
     out = SchedulerOutput.make_empty()
-    scheduler._lwd_collect_decode_requests = lambda: calls.append("decode") or ["d"]
-    scheduler._lwd_compute_decode_consumption = lambda ids: calls.append(ids) or 3
-    scheduler._lwd_collect_prefill_windows = lambda room: calls.append(room) or []
+
+    def collect_decode_requests() -> list[str]:
+        calls.append("decode")
+        return ["d"]
+
+    def compute_decode_consumption(ids: list[str]) -> int:
+        calls.append(ids)
+        return 3
+
+    def collect_prefill_windows(room: int) -> list[_LwdPrefillWindow]:
+        calls.append(room)
+        return []
+
+    scheduler._lwd_collect_decode_requests = collect_decode_requests
+    scheduler._lwd_compute_decode_consumption = compute_decode_consumption
+    scheduler._lwd_collect_prefill_windows = collect_prefill_windows
     scheduler._lwd_schedule = lambda ids: out
 
     assert scheduler._lwd_schedule_step() is out
@@ -343,7 +371,7 @@ def test_range_notify_posts_only_extended_hint(monkeypatch):
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine({"a": 8, "b": 6})
-    posted = []
+    posted: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "make_recv_hint",
@@ -395,10 +423,15 @@ def test_done_arrivals_merge_by_max_and_keep_watermark_items(monkeypatch):
     engine._lwd_track_range(1, ["a"])
     engine._lwd_track_range(2, ["a", "b"])
     watermark = []
+
+    def record_completions(items):
+        watermark.extend(items)
+        return list(items)
+
     monkeypatch.setattr(
         lwd_pre_recv,
         "record_irecv_completions",
-        lambda items: watermark.extend(items) or list(items),
+        record_completions,
     )
 
     engine._lwd_drain_irecv_completions()
@@ -472,7 +505,7 @@ def test_abort_before_mixed_range_still_posts_complete_hint(monkeypatch):
     engine.input_queue = queue.Queue()
     engine._lwd_track_range(6, ["a"])
     engine._lwd_handle_abort_notify(LwdAbortNotify("a"))
-    posted = []
+    posted: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "make_recv_hint",
@@ -528,7 +561,7 @@ def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch) -> None
     _allow_request_add(engine)
     engine.aborts_queue = queue.Queue()
     engine._lwd_send_prefix_ready = Mock()
-    posted = []
+    posted: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
         lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
     )
@@ -578,7 +611,7 @@ def test_rejected_range_does_not_block_other_seqnos(monkeypatch) -> None:
     engine._lwd_retire_request("p", preserve_prompt=True)
     _allow_request_add(engine)
     engine._lwd_send_prefix_ready = Mock()
-    posted = []
+    posted: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(
         lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
     )
@@ -650,13 +683,13 @@ def test_worker_error_fails_engine_without_advancing_watermark(monkeypatch):
 
     engine = _engine()
     engine._lwd_done_mq = DoneMq()
-    failures = []
+    failures: list[str] = []
     engine._lwd_fail = failures.append
-    watermark = []
+    watermark: list[object] = []
     monkeypatch.setattr(
         lwd_pre_recv,
         "record_irecv_completions",
-        lambda items: watermark.extend(items),
+        watermark.extend,
     )
 
     engine._lwd_drain_irecv_completions()

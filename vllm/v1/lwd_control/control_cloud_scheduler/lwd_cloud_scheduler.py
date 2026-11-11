@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import torch
 
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
@@ -87,6 +88,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
+        self._lwd_prefill_lookahead_tokens = (
+            self.vllm_config.num_prefill_lookahead_tokens
+        )
         self.pending_c2e: list[LwdC2eNotify] = []
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
@@ -150,11 +154,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
         """Freeze a preempted request's arrival-clamped hit before admission."""
-        reservations = self.lwd_prefix_reservations
+        reservations = getattr(self, "lwd_prefix_reservations", None)
+        assert reservations is not None
         floor = getattr(request, "lwd_resume_cap_tokens", 0)
         max_cache_hit_length = request.get_max_cache_hit_length(
             max(0, request.num_prompt_tokens - 1)
         )
+        groups: tuple[list[KVCacheBlock], ...]
         if max_cache_hit_length <= 0:
             groups, h_prime = (), 0
         else:
@@ -228,7 +234,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending.pop(request_id)
         self._lwd_refill_gate.discard(request_id)
         if request is not None:
-            request.lwd_resume_cap_tokens = pending.hit_tokens
+            request.lwd_resume_cap_tokens = pending.hit_tokens  # type: ignore[attr-defined]
 
     def _lwd_collect_prefill_windows(self, room: int) -> list[_LwdPrefillWindow]:
         windows: list[_LwdPrefillWindow] = []
@@ -264,6 +270,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
             num_rows = min(arrived, room)
             if num_rows < room and recv_rows < request.num_prompt_tokens:
                 continue
+            lookahead = getattr(self, "_lwd_prefill_lookahead_tokens", 0)
+            if (
+                start + num_rows < request.num_prompt_tokens
+                and start + num_rows + lookahead > recv_rows
+            ):
+                continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows
         return windows
@@ -277,7 +289,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         total_windows = sum(window.num_rows for window in windows)
         request_ids = decode_ids + [window.request.request_id for window in windows]
         for window in windows:
-            window.request.lwd_window_cap = window.num_rows
+            window.request.lwd_window_cap = window.num_rows  # type: ignore[attr-defined]
         try:
             return self._lwd_schedule(
                 request_ids,
@@ -285,7 +297,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         finally:
             for window in windows:
-                window.request.lwd_window_cap = None
+                window.request.lwd_window_cap = None  # type: ignore[attr-defined]
 
     def _lwd_verify_w2(
         self,
@@ -299,12 +311,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
             if scheduled == 0:
                 continue
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
-            if scheduled > window.num_rows or window.start + scheduled > recv_rows:
+            lookahead = getattr(self, "_lwd_prefill_lookahead_tokens", 0)
+            needs_lookahead = (
+                window.start + scheduled < window.request.num_prompt_tokens
+                and window.start + scheduled + lookahead > recv_rows
+            )
+            if (
+                scheduled > window.num_rows
+                or window.start + scheduled > recv_rows
+                or needs_lookahead
+            ):
                 raise RuntimeError(
                     f"[LWD] W2 violation req={request_id}: scheduled rows "
                     f"[{window.start}, {window.start + scheduled}) with "
                     f"window={window.num_rows}, recv_rows={recv_rows}, "
-                    f"decode_exact={decode_exact}"
+                    f"lookahead={lookahead}, decode_exact={decode_exact}"
                 )
 
     @staticmethod
@@ -372,8 +393,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 seqno=-1,
                 batch_meta=LwdEmbedBatch(aborted_req_ids=list(pending)),
             )
-        elif (
-            batch.batch_type is LwdBatchType.LWD_EMBED and batch.batch_meta is not None
+        elif batch.batch_type is LwdBatchType.LWD_EMBED and isinstance(
+            batch.batch_meta, LwdEmbedBatch
         ):
             existing = list(batch.batch_meta.aborted_req_ids or ())
             batch.batch_meta.aborted_req_ids = existing + [
