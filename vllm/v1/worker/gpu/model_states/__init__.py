@@ -54,6 +54,12 @@ def resolve_model_state_cls(
 
         return MambaHybridModelState
 
+    lwd_config = getattr(vllm_config, "lwd_config", None)
+    if lwd_config is not None and lwd_config.role == "cloud":
+        from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelState
+
+        return LwdCloudModelState
+
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
     return DefaultModelState
