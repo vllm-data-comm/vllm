@@ -24,11 +24,12 @@ Example, an edge registering then sending a request:
 """
 
 import enum
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 import msgspec
 
 LWD_LINK_PROTOCOL_VERSION = 1
+LwdRunnerKind = Literal["v1", "v2"]
 
 
 class LwdFrameKind(enum.Enum):
@@ -69,6 +70,7 @@ class LwdLinkHello(msgspec.Struct, tag=True, gc=False):  # type: ignore[call-arg
     dp_size: int
     session_id: str
     """Unique per edge engine process; also part of its ZMQ identity."""
+    runner_kind: LwdRunnerKind = "v1"
 
 
 class LwdLinkAccept(msgspec.Struct, tag=True, gc=False):  # type: ignore[call-arg]
@@ -79,6 +81,7 @@ class LwdLinkAccept(msgspec.Struct, tag=True, gc=False):  # type: ignore[call-ar
     dp_rank: int
     dp_size: int
     session_id: str
+    runner_kind: LwdRunnerKind = "v1"
 
 
 class LwdLinkReject(msgspec.Struct, tag=True, gc=False):  # type: ignore[call-arg]

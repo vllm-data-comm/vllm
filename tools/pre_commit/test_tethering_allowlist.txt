@@ -206,3 +206,24 @@ tests/v1/fault_tolerance/test_fault_tolerance_e2e.py  # CI jobs disabled pending
 tests/v1/kv_connector/mooncake_integration/test_accuracy.py  # CI jobs disabled pending locked KV connectors installation
 tests/v1/kv_connector/mooncake_integration/test_mooncake_imports.py  # CI jobs disabled pending locked KV connectors installation
 tests/v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py  # CI jobs disabled pending locked KV connectors installation
+
+# Pre-existing LWD tests were not collected by an inherited Buildkite job.
+tests/distributed/test_lwd_parallel_groups.py  # pre-existing LWD suite not wired into CI
+tests/scripts/lwd/test_split_lwd_checkpoint.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_dp_account.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_cloud_prefix_engine.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_config.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_control_diag.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_control_plane_multi_link.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_executor_proxy.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_host_staging.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_picker.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_edge_prefix_control.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_eos_trace.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_logger.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_messages.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_prefix_cache.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_lwd_public_surface.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_meta_embeds_transport.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_prompt_embeds_seam.py  # pre-existing LWD suite not wired into CI
+tests/v1/lwd_control/test_worker_base_weave_guard.py  # pre-existing LWD suite not wired into CI

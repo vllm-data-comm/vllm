@@ -327,6 +327,39 @@ steps:
       depends_on:
       - image-build-amd
 
+- label: ":computer: (CPU) LWD Control"
+  key: lwd-control-cpu
+  depends_on:
+    - image-build-cpu
+  timeout_in_minutes: 35
+  source_file_dependencies:
+    - vllm/v1/lwd_control/control_scheduler/lwd_base_engine.py
+    - vllm/v1/lwd_control/lwd_comm/lwd_control_plane.py
+    - vllm/v1/lwd_control/lwd_comm/lwd_control_plane_factory.py
+    - vllm/v1/lwd_control/lwd_comm/lwd_handshake.py
+    - vllm/v1/lwd_control/lwd_comm/lwd_link_protocol.py
+    - vllm/v1/lwd_control/control_cloud_scheduler/lwd_cloud_scheduler.py
+    - vllm/v1/worker/gpu/async_utils.py
+    - vllm/v1/worker/gpu/lwd/
+    - vllm/v1/worker/gpu/model_states/__init__.py
+    - vllm/v1/worker/gpu/spec_decode/__init__.py
+    - vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+    - tests/v1/lwd_control/conftest.py
+    - tests/v1/lwd_control/test_lwd_handshake.py
+    - tests/v1/lwd_control/test_lwd_cloud_arrival.py
+    - tests/v1/worker/gpu/conftest.py
+    - tests/v1/worker/gpu/lwd/
+    - tests/v1/worker/gpu/test_async_utils.py
+  device: cpu-small
+  commands:
+    - pip install -v -e ../vllm-ascend --no-build-isolation --no-deps
+    - >-
+      pytest -v -s
+      v1/lwd_control/test_lwd_handshake.py
+      v1/lwd_control/test_lwd_cloud_arrival.py
+      v1/worker/gpu/lwd
+      v1/worker/gpu/test_async_utils.py
+
 - label: ":computer: (CPU) V1 Others"
   key: v1-others-cpu
   depends_on:

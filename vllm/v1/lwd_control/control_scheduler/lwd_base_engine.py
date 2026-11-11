@@ -22,7 +22,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane_factory import (
     lwd_create_control_plane,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer, LwdRunnerKind
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdMessage,
     lwd_encode_message,
@@ -111,8 +111,19 @@ class LwdBaseEngineCore(EngineCoreProc):
     def _lwd_start_control_plane(self) -> LwdControlPlane:
         """Start this DP rank's control plane; the calling (engine) thread
         owns its sender."""
+        runner_kind: LwdRunnerKind = (
+            "v2" if self.vllm_config.use_v2_model_runner else "v1"
+        )
+        worker_kinds = set(self.model_executor.collective_rpc("lwd_model_runner_kind"))
+        if worker_kinds != {runner_kind}:
+            raise RuntimeError(
+                f"[LWD] model runner mismatch: engine={runner_kind}, "
+                f"workers={sorted(worker_kinds)}"
+            )
         dp_rank = self.vllm_config.parallel_config.data_parallel_index
-        plane = lwd_create_control_plane(self.lwd_config, dp_rank, self._lwd_dp_size)
+        plane = lwd_create_control_plane(
+            self.lwd_config, dp_rank, self._lwd_dp_size, runner_kind=runner_kind
+        )
         self._lwd_control_plane = plane
         self._lwd_sender = plane.start(_LwdEngineListener(self))
         lwd_logger.info(

@@ -166,10 +166,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
                     num_sampled=self.num_sampled_tokens_np,
                     num_rejected=async_copy_to_np(sampler_output.num_rejected),
                 )
-            if check_ep_fault:
-                has_fault = get_ep_all2all_manager().query_fault()
-                self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
+
+    @property
+    def _model_runner_output(self) -> ModelRunnerOutput:
+        return self.model_runner_output
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()

@@ -15,6 +15,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import (
     LwdLinkMessage,
     LwdLinkReject,
     LwdPeer,
+    LwdRunnerKind,
     lwd_edge_identity,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LWD_MESSAGE_VERSION
@@ -25,9 +26,15 @@ class LwdHandshakeError(RuntimeError):
 
 
 class LwdEdgeHandshake:
-    def __init__(self, hello: LwdLinkHello, hello_retry_interval_s: float) -> None:
+    def __init__(
+        self,
+        hello: LwdLinkHello,
+        hello_retry_interval_s: float,
+        runner_kind: LwdRunnerKind = "v1",
+    ) -> None:
         self.hello = hello
         self._hello_retry_interval_s = hello_retry_interval_s
+        self._runner_kind = runner_kind
         self._last_hello_at: float | None = None
         self.cloud: LwdPeer | None = None
 
@@ -53,6 +60,7 @@ class LwdEdgeHandshake:
         Raises:
             LwdHandshakeError: Rejected, or an accept that does not answer
                 this hello.
+
         """
         if isinstance(msg, LwdLinkReject):
             raise LwdHandshakeError(f"cloud rejected the hello: {msg.reason}")
@@ -69,6 +77,10 @@ class LwdEdgeHandshake:
             raise LwdHandshakeError(
                 f"accept (link_version, dp_rank, dp_size, session) = {actual} "
                 f"does not answer hello {expected}"
+            )
+        if msg.runner_kind != self._runner_kind:
+            raise LwdHandshakeError(
+                f"accept runner_kind {msg.runner_kind} != edge {self._runner_kind}"
             )
         if self.cloud is None:
             self.cloud = LwdPeer(msg.instance_id, msg.dp_rank)
@@ -91,10 +103,17 @@ class _LwdEdgeSession:
 class LwdCloudHandshake:
     """Registers edges on one cloud DP rank and maps them to ZMQ identities."""
 
-    def __init__(self, instance_id: int, dp_rank: int, dp_size: int) -> None:
+    def __init__(
+        self,
+        instance_id: int,
+        dp_rank: int,
+        dp_size: int,
+        runner_kind: LwdRunnerKind = "v1",
+    ) -> None:
         self._instance_id = instance_id
         self._dp_rank = dp_rank
         self._dp_size = dp_size
+        self._runner_kind = runner_kind
         # TODO(lwd): turn the single slot into a session table to serve
         # several edges per cloud DP rank, issue #8.
         self._session: _LwdEdgeSession | None = None
@@ -144,6 +163,8 @@ class LwdCloudHandshake:
             )
         if hello.dp_size != self._dp_size:
             return f"edge dp_size {hello.dp_size} != cloud dp_size {self._dp_size}"
+        if hello.runner_kind != self._runner_kind:
+            return f"edge runner_kind {hello.runner_kind} != cloud {self._runner_kind}"
         expected = lwd_edge_identity(hello.instance_id, hello.dp_rank, hello.session_id)
         if identity != expected:
             return f"identity {identity!r} != expected {expected!r}"
@@ -180,4 +201,5 @@ class LwdCloudHandshake:
             dp_rank=self._dp_rank,
             dp_size=self._dp_size,
             session_id=hello.session_id,
+            runner_kind=self._runner_kind,
         )
