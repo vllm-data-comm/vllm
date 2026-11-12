@@ -36,6 +36,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_prefix_control import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
     LwdEdgeProbeManager,
     LwdProbeCompletion,
+    LwdProbeSubmission,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
@@ -279,7 +280,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if control is not None:
             control.add_request(request)
             return
-        if self._lwd_probe_manager.submit(request):
+        submission = self._lwd_probe_manager.submit(request)
+        if submission is not LwdProbeSubmission.UNAVAILABLE:
             return
         self._lwd_add_request_after_probe(request)
 

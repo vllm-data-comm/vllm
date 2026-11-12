@@ -77,6 +77,13 @@ def decode_digest(value: str) -> bytes:
     return digest
 
 
+def _parse_ascii_decimal(name: str, value: str) -> int:
+    """Parse a non-negative ASCII decimal header without int() extensions."""
+    if not isinstance(value, str) or not (value.isascii() and value.isdecimal()):
+        raise ValueError(f"{name} must be a non-negative ASCII decimal integer")
+    return int(value)
+
+
 def _encode_tokens(token_ids: Sequence[int]) -> bytes:
     encoded = bytearray()
     for token_id in token_ids:
@@ -162,7 +169,9 @@ class LwdPrefixManifest:
             raise ValueError(f"unsupported edge-cloud protocol {protocol!r}")
         request_id = required_header(HEADER_REQUEST_ID)
         try:
-            block_size = int(required_header(HEADER_BLOCK_SIZE))
+            block_size = _parse_ascii_decimal(
+                HEADER_BLOCK_SIZE, required_header(HEADER_BLOCK_SIZE)
+            )
         except ValueError as exc:
             raise ValueError("edge-cloud block size must be an integer") from exc
 
@@ -455,17 +464,23 @@ class LwdProbeResult:
         cloud_id = message.get("cloud_id")
         if cloud_id is not None and type(cloud_id) is not int:
             raise ValueError("probe cloud_id must be an integer or null")
-        # 旧版云不公告 engine_index:缺省 0(单引擎语义),向后兼容
+        # Older clouds do not advertise engine_index; default to zero (the
+        # single-engine meaning) for backward compatibility.
         engine_index = message.get("engine_index", 0)
         if type(engine_index) is not int or engine_index < 0:
             raise ValueError("probe engine_index must be a non-negative integer")
+        alignment_tokens = message.get("alignment_tokens", 0)
+        if type(alignment_tokens) is not int or alignment_tokens < 0:
+            raise ValueError(
+                "probe alignment_tokens must be a non-negative integer"
+            )
         return cls(
             request_id=message["request_id"],
             instance_id=message["instance_id"],
             block_size=message["block_size"],
             hit_blocks=message["hit_blocks"],
             hit_tokens=message["hit_tokens"],
-            alignment_tokens=int(message.get("alignment_tokens", 0)),
+            alignment_tokens=alignment_tokens,
             cloud_id=cloud_id,
             engine_index=engine_index,
         )
@@ -484,21 +499,32 @@ class LwdProbeResult:
             raise ValueError("unsupported edge-cloud protocol")
         try:
             cloud_id_raw = values.get(HEADER_CLOUD_ID.lower())
+            alignment_raw = values.get(HEADER_ALIGNMENT_TOKENS.lower(), "0")
+            engine_index_raw = values.get(HEADER_ENGINE_INDEX.lower(), "0")
             return cls(
                 request_id=required(HEADER_REQUEST_ID),
                 instance_id=required(HEADER_INSTANCE_ID),
-                block_size=int(required(HEADER_BLOCK_SIZE)),
-                hit_blocks=int(required(HEADER_HIT_BLOCKS)),
-                hit_tokens=int(required(HEADER_HIT_TOKENS)),
-                # 旧版云无此头:缺省 0(不公告、不重切),向后兼容
-                alignment_tokens=int(values.get(
-                    HEADER_ALIGNMENT_TOKENS.lower(), "0"
-                )),
-                cloud_id=int(cloud_id_raw) if cloud_id_raw else None,
-                # 旧版云无此头:缺省 0(单引擎语义),向后兼容
-                engine_index=int(values.get(
-                    HEADER_ENGINE_INDEX.lower(), "0"
-                )),
+                block_size=_parse_ascii_decimal(
+                    HEADER_BLOCK_SIZE, required(HEADER_BLOCK_SIZE)
+                ),
+                hit_blocks=_parse_ascii_decimal(
+                    HEADER_HIT_BLOCKS, required(HEADER_HIT_BLOCKS)
+                ),
+                hit_tokens=_parse_ascii_decimal(
+                    HEADER_HIT_TOKENS, required(HEADER_HIT_TOKENS)
+                ),
+                # Older clouds omit alignment; zero means no re-chunking.
+                alignment_tokens=_parse_ascii_decimal(
+                    HEADER_ALIGNMENT_TOKENS, alignment_raw
+                ),
+                cloud_id=(
+                    _parse_ascii_decimal(HEADER_CLOUD_ID, cloud_id_raw)
+                    if cloud_id_raw is not None else None
+                ),
+                # Older clouds omit engine placement; zero is single-engine.
+                engine_index=_parse_ascii_decimal(
+                    HEADER_ENGINE_INDEX, engine_index_raw
+                ),
             )
         except ValueError as exc:
             raise ValueError("cloud prefix result contains invalid integers") from exc

@@ -8,6 +8,7 @@ import hashlib
 import queue
 import threading
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 from vllm.logger import init_logger
@@ -28,6 +29,14 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdProbeResult
 logger = init_logger(__name__)
 
 _WATCHDOG_HEADROOM_S = 5.0
+
+
+class LwdProbeSubmission(Enum):
+    """Outcome of attempting to start an edge probe."""
+
+    SUBMITTED = "submitted"
+    ALREADY_INFLIGHT = "already_inflight"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -152,9 +161,11 @@ class LwdEdgeProbeManager:
             if feature.modality == "image"
         )
 
-    def submit(self, request: Any) -> bool:
-        if not self.enabled or request.request_id in self._inflight:
-            return False
+    def submit(self, request: Any) -> LwdProbeSubmission:
+        if request.request_id in self._inflight:
+            return LwdProbeSubmission.ALREADY_INFLIGHT
+        if not self.enabled:
+            return LwdProbeSubmission.UNAVAILABLE
         coordination = self._vllm_config.lwd_config.coordination
         target_cloud = self._health.next() if coordination.control_url_map else None
         if target_cloud is None:
@@ -164,7 +175,7 @@ class LwdEdgeProbeManager:
             url = coordination.control_url_map[target_cloud]
             cloud_id = target_cloud
         if url is None:
-            return False
+            return LwdProbeSubmission.UNAVAILABLE
         block_size = self._hash_sizes.get(
             cloud_id, self._vllm_config.cache_config.block_size
         )
@@ -205,7 +216,7 @@ class LwdEdgeProbeManager:
             logger.warning("[LWD] probe submission failed; using full prefill", exc_info=True)
             runtime.stop()
             self._runtime = None
-            return False
+            return LwdProbeSubmission.UNAVAILABLE
         self._nonce += 1
         nonce = self._nonce
         self._inflight[request_id] = _InflightProbe(request, nonce, media_items)
@@ -235,7 +246,7 @@ class LwdEdgeProbeManager:
 
         future.add_done_callback(done)
         timer.start()
-        return True
+        return LwdProbeSubmission.SUBMITTED
 
     def abort(self, request_id: str) -> None:
         self._inflight.pop(request_id, None)

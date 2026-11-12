@@ -232,91 +232,129 @@ class LwdCloudControlBridge:
     async def _probe_fanout(
         self, manifest: LwdPrefixManifest, timeout: float
     ) -> LwdProbeResult:
-        """云内 DP probe 扇出与放置(仅 dp>1 路径)。
+        """Fan out a cloud-local DP probe and select its placement (DP > 1).
 
-        两段式:① 只读求命中命令(reserve=False)广播到全部引擎的
-        Processor,逐引擎聚合命中;② 按 (命中长度降序, 并列轮转) 选定
-        赢家引擎,只向赢家发正式 probe(reserve=True)落预留——跨引擎
-        预留是虚假命中,预留必须与后续数据面同引擎。响应命中值取赢家
-        引擎的命中,engine_index=赢家。
+        First broadcast read-only hit queries (reserve=False) to every engine
+        processor. Then select the winner by descending hit length, rotating
+        ties, and send the formal probe (reserve=True) only to that engine.
+        Cross-engine reservations would be false hits: the reservation and the
+        subsequent data plane must use the same engine. Return the winner's hit
+        values and engine_index.
 
-        应答经共享 event_queue 上行,命令携带 engine_index/reply_key
-        由引擎侧原样回显(见 Processor.poll),Bridge 按 reply_key 分发
-        到本方法的收集队列;单引擎路径的队列协议(无新增字段)逐值不变。
+        Replies use the shared event queue. Commands carry engine_index and
+        reply_key, which Processor.poll echoes so the bridge can route them to
+        this method's collection queue. Fanout replies never settle the
+        single-engine probe futures.
         """
+        request_id = manifest.request_id
         n = len(self._command_queues)
-        probe_key = f"{manifest.request_id}#probe"
+        probe_key = f"{request_id}#probe"
         waiter: queue.Queue = queue.Queue(maxsize=n)
-        with self._lock:
-            self._fanout_waiters[probe_key] = waiter
-        for idx, cmd_queue in enumerate(self._command_queues):
-            cmd_queue.put({
-                "type": "probe",
-                "manifest": manifest,
-                "reserve": False,
-                "engine_index": idx,
-                "reply_key": probe_key,
-            })
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        self._loop = loop
+        with self._lock:
+            stale_probe = self._probe_futures.pop(request_id, None)
+            stale_usage = self._usage_futures.pop(request_id, None)
+            stale_waiter = self._fanout_waiters.get(probe_key)
+            usage_future: asyncio.Future = loop.create_future()
+            self._usage_futures[request_id] = usage_future
+            self._fanout_waiters[probe_key] = waiter
+        if stale_probe is not None or stale_usage is not None or (
+            stale_waiter is not None
+        ):
+            logger.warning(
+                "[LWD][ctrl] duplicate control request req=%s: superseding "
+                "the previous registration", request_id,
+            )
+            if stale_usage is not None and not stale_usage.done():
+                stale_usage.set_result(None)
+            if stale_probe is not None and not stale_probe.done():
+                stale_probe.set_exception(RuntimeError(
+                    f"control request {request_id} superseded by a newer probe"))
+            if stale_waiter is not None:
+                with contextlib.suppress(queue.Full):
+                    stale_waiter.put_nowait((False, -1, "superseded"))
         results: dict[int, LwdProbeResult] = {}
         try:
-            while len(results) < n:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                try:
-                    ok, eng_idx, payload = await asyncio.wait_for(
-                        loop.run_in_executor(None, waiter.get), remaining
-                    )
-                except asyncio.TimeoutError:
-                    break
-                if ok:
-                    results[eng_idx] = payload
-                else:
-                    logger.warning(
-                        "[Lwd][ctrl] fanout probe failed req=%s engine=%s: %s",
-                        manifest.request_id, eng_idx, payload,
-                    )
-        finally:
-            with self._lock:
-                self._fanout_waiters.pop(probe_key, None)
-            # 毒丸:超时退出后 run_in_executor 的线程仍阻塞在
-            # waiter.get;补一条让它返回释放(每超时一次否则漏一条
-            # executor 线程,死引擎场景下单调增长)
-            with contextlib.suppress(Exception):
-                waiter.put_nowait((False, -1, "poison"))
-        missing = [i for i in range(n) if i not in results]
-        if missing:
-            # 超时/失败引擎按 0 命中参与放置(不阻断其余引擎);
-            # 全灭时才整体超时失败
-            logger.warning(
-                "[Lwd][ctrl] fanout probe partial req=%s missing=%s "
-                "(treated as zero hit)",
-                manifest.request_id, missing,
+            for idx, cmd_queue in enumerate(self._command_queues):
+                cmd_queue.put({
+                    "type": "probe",
+                    "manifest": manifest,
+                    "reserve": False,
+                    "engine_index": idx,
+                    "reply_key": probe_key,
+                })
+            deadline = loop.time() + timeout
+            try:
+                while len(results) < n:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        ok, eng_idx, payload = await asyncio.wait_for(
+                            loop.run_in_executor(None, waiter.get), remaining
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    if eng_idx == -1 and payload == "superseded":
+                        raise RuntimeError(
+                            f"control request {request_id} superseded by a "
+                            "newer probe"
+                        )
+                    if ok:
+                        results[eng_idx] = payload
+                    else:
+                        logger.warning(
+                            "[LWD][ctrl] fanout probe failed req=%s engine=%s: %s",
+                            request_id, eng_idx, payload,
+                        )
+            finally:
+                with self._lock:
+                    if self._fanout_waiters.get(probe_key) is waiter:
+                        self._fanout_waiters.pop(probe_key, None)
+                # A timed-out executor thread cannot be cancelled while blocked
+                # in waiter.get. Poison it so every attempt releases its thread.
+                with contextlib.suppress(Exception):
+                    waiter.put_nowait((False, -1, "poison"))
+            missing = [i for i in range(n) if i not in results]
+            if missing:
+                # Slow or failed engines count as zero-hit for observability but
+                # are never placement candidates. Fail only if none answered.
+                logger.warning(
+                    "[LWD][ctrl] fanout probe partial req=%s missing=%s "
+                    "(treated as zero hit)", request_id, missing,
+                )
+                if not results:
+                    raise TimeoutError(
+                        f"prefix probe fanout timed out after {timeout}s")
+            # Select argmax(hit_tokens), rotating among tied live engines.
+            hits = [
+                results[i].hit_tokens if i in results else 0 for i in range(n)
+            ]
+            top = max(hits[i] for i in results) if results else 0
+            candidates = [i for i in results if hits[i] == top]
+            if len(candidates) > 1:
+                winner = candidates[self._rr_counter % len(candidates)]
+                self._rr_counter += 1
+            else:
+                winner = candidates[0]
+            logger.info(
+                "[LWD][ctrl] fanout placement req=%s hits=%s winner=%d",
+                request_id, hits, winner,
             )
-            if not results:
-                raise TimeoutError(
-                    f"prefix probe fanout timed out after {timeout}s")
-        # 放置:argmax(命中 token),并列按进程内单调计数器轮转。
-        # 候选只含已应答引擎:missing(死/慢)引擎按 0 命中参与 hits
-        # 展示,但绝不入候选——冷缓存全场 0 命中时若把它们算进并列,
-        # 轮转会把请求钉到死引擎上(UP 通道楔死)。
-        hits = [
-            results[i].hit_tokens if i in results else 0 for i in range(n)
-        ]
-        top = max(hits[i] for i in results) if results else 0
-        candidates = [i for i in results if hits[i] == top]
-        if len(candidates) > 1:
-            winner = candidates[self._rr_counter % len(candidates)]
-            self._rr_counter += 1
-        else:
-            winner = candidates[0]
-        logger.info(
-            "[Lwd][ctrl] fanout placement req=%s hits=%s winner=%d",
-            manifest.request_id, hits, winner,
-        )
-        return dataclass_replace(results[winner], engine_index=winner)
+            with self._lock:
+                if self._usage_futures.get(request_id) is not usage_future:
+                    raise RuntimeError(
+                        f"control request {request_id} superseded by a newer probe"
+                    )
+            return dataclass_replace(results[winner], engine_index=winner)
+        except BaseException:
+            # No handler will wait for usage after a failed probe. Remove only
+            # this generation so a concurrent retry's registration survives.
+            with self._lock:
+                if self._usage_futures.get(request_id) is usage_future:
+                    self._usage_futures.pop(request_id, None)
+            raise
 
     async def wait_usage(
         self, request_id: str, timeout: float = _USAGE_WAIT_TIMEOUT

@@ -12,6 +12,9 @@ from vllm.lwd_logger import lwd_logger
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
+    LwdProbeSubmission,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdPrefixReadyNotify
 
 if TYPE_CHECKING:
@@ -88,7 +91,12 @@ class LwdEdgePrefixControl:
         timer.daemon = True
         self._pending[request.request_id] = (request, timer)
         try:
-            if not engine._lwd_probe_manager.submit(request):
+            submission = engine._lwd_probe_manager.submit(request)
+            if submission is LwdProbeSubmission.ALREADY_INFLIGHT:
+                self._pending.pop(request.request_id, None)
+                timer.cancel()
+                return
+            if submission is LwdProbeSubmission.UNAVAILABLE:
                 engine._lwd_add_request_after_probe(request)
         except Exception:
             self._pending.pop(request.request_id, None)
