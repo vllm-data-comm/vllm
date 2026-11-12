@@ -92,8 +92,8 @@ sequenceDiagram
 
 - The edge DEALER sets `IMMEDIATE`, so a hello sent while the cloud is unreachable fails at once and is retried on the next tick. The start order of edge and cloud does not matter.
 - The cloud answers a retried hello of the registered session with another accept.
-- A cloud DP rank currently serves one edge. A hello from another edge instance is rejected and the registered edge keeps working.
-- A hello from the registered edge instance with a new session id comes from another process with the same configuration: a duplicate edge, or a restarted one. Peer loss is not detected yet, so the cloud cannot tell them apart; it rejects the new session, names the registered session, and asks to fix the deployment or restart the cloud.
+- A cloud DP rank can serve multiple edge instances. Each instance and DP rank has its own registered identity and ROUTER session.
+- A hello from an already registered edge instance and DP rank with a new session id comes from another process with the same configuration: a duplicate edge, or a restarted one. Peer loss is not detected yet, so the cloud cannot tell them apart; it rejects the new session, names the registered session, and asks to fix the deployment or restart the cloud.
 
 ## Interface
 
@@ -118,7 +118,8 @@ plane.shutdown()
 
 - The cloud binds every interface rather than its topology address, which may not be a local interface behind NAT or in a container.
 - On the cloud, `dp_size` must equal the DP count of the instance in the topology, and `dp_rank` must be in range; otherwise `ValueError`. The edge runs one engine with vLLM data parallel size 1; a larger size is rejected fail-fast.
-- A `single_instance` edge instance has one DP connection per cloud DP rank; several connections to the same cloud DP rank (multi-edge scenes) raise `NotImplementedError`.
+- A `single_instance` edge instance has one DP connection per cloud DP rank. Multiple edge instances may register with the same cloud DP rank; each has an independent DEALER session and the cloud routes replies by that connection's identity.
+- In `edge_share`, one API frontend per edge attaches to the primary frontend's shared native engine group. Its two-step attachment handshake, pre-handshake startup barrier, and native `request.client_index` output routing are described in [LWD Frontend Attachment](lwd_frontend_attach.md).
 - Listener callbacks run on the IO thread and must not block. The caller decides how to hand payloads to the engine thread.
 - `send()` may only be called on the thread that called `start()`.
 

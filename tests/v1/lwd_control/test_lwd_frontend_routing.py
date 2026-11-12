@@ -6,12 +6,11 @@ output grouping).
 
 Covers the behavioral seams of the frontend-attach plan:
 
-* A - scene validation decoupling (``LwdAPIConfig.validate_topology``):
-  legacy ``edge_share`` keeps the one-to-one primary/non-primary pairing
-  and only that scene accepted attach metadata before; the decoupled
-  ``cloud_share``/``lwd_cluster`` scenes legalize attach metadata while
-  ``client_index`` stays a frontend grouping key (the attach frontend's
-  non-primary edge instance id), never a topology identity;
+* A - scene validation (``LwdAPIConfig.validate_topology``):
+  ``edge_share`` keeps the one-to-one primary/non-primary pairing and is
+  the only scene that accepts attach metadata; ``client_index`` stays a
+  frontend grouping key (the attach frontend's non-primary edge instance
+  id), never a topology identity;
 * B - the edge scheduler's ``_lwd_req_id_to_client`` pin table and the
   per-client output grouping in ``update_from_output`` (added with the
   grouping commit).
@@ -28,6 +27,7 @@ import ast
 from collections import defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import Any
 
 import pytest
 
@@ -60,7 +60,8 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
 
     edge_share instances share one edge allocation (one physical engine
     group); every other scene gives each instance its own rank. Cloud DPs
-    always carry a ctrl_port; edge_share clouds reuse it per DP index.
+    always carry a ctrl_port; distinct cloud DPs on one address use
+    different ports.
     """
     scene, edges, clouds = shape
     shared_edge = scene == "edge_share"
@@ -86,7 +87,7 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
                     "dp_idx": 0,
                     "addr": "127.0.0.1",
                     "ranks": [cloud_base + cloud_id],
-                    "ctrl_port": 5550 if shared_edge else 5550 + cloud_id,
+                    "ctrl_port": 5550 + cloud_id,
                 }
             ],
         }
@@ -135,41 +136,42 @@ class TestAttachSceneValidation:
     ATTACH = "10.0.0.1:9700"
     RPC = "10.0.0.1:9701"
 
-    def test_edge_share_attach_requires_non_primary_edge(self):
+    def test_edge_share_attach_requires_non_primary_edge(self) -> None:
         # Legacy one-to-one pairing: frontend i is edge instance i's
         # frontend; instance 0's frontend belongs to the main command.
         _lwd(EDGE_SHARE, "edge", 1, api_server_attach=self.ATTACH)
         with pytest.raises(ValueError, match="non-primary"):
             _lwd(EDGE_SHARE, "edge", 0, api_server_attach=self.ATTACH)
 
-    def test_edge_share_rpc_port_requires_primary_edge(self):
+    def test_edge_share_rpc_port_requires_primary_edge(self) -> None:
         _lwd(EDGE_SHARE, "edge", 0, api_server_rpc_port=self.RPC)
         with pytest.raises(ValueError, match="instance_id=0"):
             _lwd(EDGE_SHARE, "edge", 1, api_server_rpc_port=self.RPC)
 
-    def test_decoupled_scenes_legalize_attach(self):
-        # cloud_share/lwd_cluster: attach metadata accepted for a
-        # non-primary edge; the instance id doubles as the client_index
-        # (frontend grouping key), not a topology pairing.
-        _lwd(CLOUD_SHARE, "edge", 1, api_server_attach=self.ATTACH)
-        _lwd(LWD_CLUSTER, "edge", 1, api_server_attach=self.ATTACH)
+    def test_decoupled_scenes_reject_attach(self) -> None:
+        # Attachment remains an edge_share feature; cloud_share and
+        # lwd_cluster do not acquire frontend pairing semantics.
+        for shape in (CLOUD_SHARE, LWD_CLUSTER):
+            with pytest.raises(ValueError, match="scene=edge_share"):
+                _lwd(shape, "edge", 1, api_server_attach=self.ATTACH)
 
-    def test_decoupled_scenes_keep_primary_rules(self):
+    def test_decoupled_scenes_keep_primary_rules(self) -> None:
         with pytest.raises(ValueError, match="non-primary"):
             _lwd(CLOUD_SHARE, "edge", 0, api_server_attach=self.ATTACH)
-        _lwd(CLOUD_SHARE, "edge", 0, api_server_rpc_port=self.RPC)
+        with pytest.raises(ValueError, match="scene=edge_share"):
+            _lwd(CLOUD_SHARE, "edge", 0, api_server_rpc_port=self.RPC)
         with pytest.raises(ValueError, match="instance_id=0"):
             _lwd(LWD_CLUSTER, "edge", 1, api_server_rpc_port=self.RPC)
 
-    def test_single_instance_scene_rejects_attach(self):
+    def test_single_instance_scene_rejects_attach(self) -> None:
         with pytest.raises(ValueError, match="scene=edge_share"):
             _lwd(SINGLE_INSTANCE, "edge", 0, api_server_attach=self.ATTACH)
 
-    def test_cloud_role_rejects_attach(self):
+    def test_cloud_role_rejects_attach(self) -> None:
         with pytest.raises(ValueError, match="edge instances only"):
             _lwd(EDGE_SHARE, "cloud", 0, api_server_attach=self.ATTACH)
 
-    def test_rpc_port_and_attach_are_mutually_exclusive(self):
+    def test_rpc_port_and_attach_are_mutually_exclusive(self) -> None:
         with pytest.raises(ValueError, match="mutually exclusive"):
             _lwd(
                 EDGE_SHARE,
@@ -179,79 +181,100 @@ class TestAttachSceneValidation:
                 api_server_attach=self.ATTACH,
             )
 
-    def test_unrequested_api_config_accepts_any_identity(self):
+    def test_unrequested_api_config_accepts_any_identity(self) -> None:
         # No API options: validation is inert (single-instance identity
         # without attach flags must construct cleanly).
         _lwd(SINGLE_INSTANCE, "edge", 0)
 
 
-def _load_attach_fn(fn_name: str):
+def _load_attach_fn(fn_name: str, **dependencies: Any) -> Any:
     """Extract one top-level function from the attach module and compile
     it with stubbed heavy dependencies (the module import chain pulls in
-    zmq/vllm; the function under test only needs the LWD identity stub)."""
+    zmq/vllm; the functions under test only need lightweight stand-ins)."""
     tree = ast.parse(ATTACH_PATH.read_text(encoding="utf-8"))
     node = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == fn_name
     )
     module = ast.Module(body=[node], type_ignores=[])
-    scope: dict = {
-        "_resolve_lwd_identity": _stub_lwd_identity,
-    }
-    exec(compile(module, str(ATTACH_PATH), "exec"), scope)
-    return scope[fn_name]
+    exec(compile(module, str(ATTACH_PATH), "exec"), dependencies)
+    return dependencies[fn_name]
 
 
 _LWD_IDENTITIES: dict[int, NS] = {}
 
 
-def _stub_lwd_identity(args):
-    """Identity stub keyed by the attach endpoint: a resolved LWD config
-    stand-in exposing the scene and edge count the count resolution
-    reads."""
-    return _LWD_IDENTITIES[id(args)]
+def _stub_lwd_identity(
+    additional_config: dict[str, Any], *, api: LwdAPIConfig
+) -> NS:
+    """Identity stub keyed by the additional-config mapping."""
+    return _LWD_IDENTITIES[id(additional_config)]
 
 
 class TestFrontendCountDecoupling:
-    """A: frontend count K resolution (main command).
+    """Frontend count resolution through the current attach entrypoints."""
 
-    legacy edge_share: K is the edge instance count (one frontend per
-    instance, explicit count must equal it). Decoupled scenes: K is
-    declared freely - no longer tied to the cloud or instance count."""
+    RPC = "10.0.0.1:9701"
 
-    def _resolve(self, scene: str, edges: int, count: int | None) -> int:
-        args = NS(api_server_count=count, marker=object())
-        _LWD_IDENTITIES[id(args)] = NS(
+    def _args(self, edges: int, count: int | None) -> NS:
+        additional_config = {"marker": object()}
+        args = NS(
+            api_server_count=count,
+            api_server_rpc_port=self.RPC,
+            api_server_attach=None,
+            additional_config=additional_config,
+        )
+        _LWD_IDENTITIES[id(additional_config)] = NS(
+            instance_id=0,
             topology=NS(
-                deployment=NS(scene=scene),
+                digest="topology-digest",
                 edges=[None] * edges,
-            )
+            ),
+        )
+        return args
+
+    def _resolve(self, edges: int, count: int | None) -> int:
+        args = self._args(edges, count)
+        resolve = _load_attach_fn(
+            "resolve_attach_plan",
+            LwdAPIConfig=LwdAPIConfig,
+            envs=NS(VLLM_USE_RUST_FRONTEND=False),
+            resolve_lwd_config=_stub_lwd_identity,
+            _additional_config_dict=lambda value: value.additional_config,
+            FrontendAttachPlan=NS,
         )
         try:
-            return _load_attach_fn("_default_frontend_count")(args)
+            return resolve(args).client_count
         finally:
-            _LWD_IDENTITIES.pop(id(args), None)
+            _LWD_IDENTITIES.pop(id(args.additional_config), None)
 
-    def test_edge_share_count_defaults_to_edge_instances(self):
-        assert self._resolve("edge_share", 3, None) == 3
-        assert self._resolve("edge_share", 2, 2) == 2
+    def test_count_defaults_to_edge_instances(self) -> None:
+        assert self._resolve(3, None) == 3
+        assert self._resolve(2, 2) == 2
 
-    def test_edge_share_explicit_count_must_pair_one_to_one(self):
+    def test_explicit_count_must_pair_one_to_one(self) -> None:
         with pytest.raises(ValueError, match="edge_share"):
-            self._resolve("edge_share", 3, 2)
+            self._resolve(3, 2)
 
-    def test_decoupled_count_is_free_of_instance_count(self):
-        # A single-edge decoupled group may declare any K: the frontend
-        # count is a grouping concern, not a topology pairing.
-        assert self._resolve("lwd_cluster", 1, 4) == 4
-        assert self._resolve("cloud_share", 2, 5) == 5
-        assert self._resolve("cloud_share", 2, None) == 1
+    def test_prepare_attach_mode_uses_resolved_count(self) -> None:
+        args = self._args(3, 3)
+        registration_server = object()
+        prepare = _load_attach_fn(
+            "prepare_attach_mode",
+            create_frontend_registration_server=lambda actual_args, count: (
+                registration_server
+            ),
+        )
+        try:
+            assert prepare(args, 3, False) == (True, 1, registration_server)
+        finally:
+            _LWD_IDENTITIES.pop(id(args.additional_config), None)
 
-    def test_decoupled_count_must_be_positive(self):
-        with pytest.raises(ValueError, match=">= 1"):
-            self._resolve("cloud_share", 2, 0)
+    def test_explicit_zero_count_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="api-server-count"):
+            self._resolve(2, 0)
 
 
-def test_serve_wires_frontend_attach_dispatch():
+def test_serve_wires_frontend_attach_dispatch() -> None:
     """Source-scan guard: the serve entrypoint dispatches attach commands
     before the generic frontend-count defaulting and runs the count-to-K
     barrier inside the engine-launch scope."""
@@ -263,14 +286,18 @@ def test_serve_wires_frontend_attach_dispatch():
     assert "lwd_control" not in serve
 
 
-def test_attach_module_homes_the_registration_protocol():
+def test_attach_module_homes_the_registration_protocol() -> None:
     """Source-scan guard: the protocol frame types and both entrypoints
     live in the entrypoints module, platform-agnostic (no engine-side
     rendezvous concepts)."""
     attach = ATTACH_PATH.read_text(encoding="utf-8")
-    for frame in ('_MSG_REGISTER = "REGISTER"', '_MSG_GRANT = "GRANT"',
-                  '_MSG_ADDRESSES = "ADDRESSES"', '_MSG_ACK = "ACK"',
-                  '_MSG_ERROR = "ERROR"'):
+    for frame in (
+        '_MSG_ATTACH = "LWD_FRONTEND_ATTACH"',
+        '_MSG_ACCEPT = "LWD_FRONTEND_ACCEPT"',
+        '_MSG_ENDPOINTS = "LWD_FRONTEND_ENDPOINTS"',
+        '_MSG_BARRIER = "LWD_FRONTEND_BARRIER"',
+        '_MSG_ERROR = "LWD_FRONTEND_ERROR"',
+    ):
         assert frame in attach
     assert "def run_attach_api_server(" in attach
     assert "def create_frontend_registration_server(" in attach
@@ -290,10 +317,10 @@ class _StubLogger:
     (unavailable on light hosts); the methods under test only use
     warning/info."""
 
-    def warning(self, *a, **k):
+    def warning(self, *a: Any, **k: Any) -> None:
         pass
 
-    def info(self, *a, **k):
+    def info(self, *a: Any, **k: Any) -> None:
         pass
 
 
@@ -301,11 +328,11 @@ class _StubDiag:
     """LwdControlDiag stand-in: token traces only."""
 
     @staticmethod
-    def edge_tokens_delivered(*a, **k):
+    def edge_tokens_delivered(*a: Any, **k: Any) -> None:
         pass
 
     @staticmethod
-    def trace_edge_kill_row(*a, **k):
+    def trace_edge_kill_row(*a: Any, **k: Any) -> None:
         pass
 
 
@@ -318,7 +345,7 @@ class _FinishReason:
     ABORT = "abort"
     ERROR = "error"
 
-    def __init__(self, code):
+    def __init__(self, code: str) -> None:
         self.code = code
 
 
@@ -329,14 +356,23 @@ class _RequestStatus:
 
 
 class _EngineCoreOutput:
-    def __init__(self, request_id, new_token_ids, finish_reason=None):
+    def __init__(
+        self,
+        request_id: str,
+        new_token_ids: list[int],
+        finish_reason: object = None,
+    ) -> None:
         self.request_id = request_id
         self.new_token_ids = new_token_ids
         self.finish_reason = finish_reason
 
 
 class _EngineCoreOutputs:
-    def __init__(self, outputs=None, finished_requests=None):
+    def __init__(
+        self,
+        outputs: list[_EngineCoreOutput] | None = None,
+        finished_requests: set[str] | None = None,
+    ) -> None:
         self.outputs = outputs
         self.finished_requests = finished_requests
 
@@ -357,20 +393,20 @@ class _Account:
     """Cloud-DP account bookkeeping stand-in: only the fields the settle
     path touches."""
 
-    def __init__(self, connection_id):
+    def __init__(self, connection_id: tuple[str, int, int]) -> None:
         self.connection_id = connection_id
         self.pending_batches = {}
         self.prefill_requests = set()
         self.dropped = []
 
-    def drop_request(self, request_id):
+    def drop_request(self, request_id: str) -> None:
         self.prefill_requests.discard(request_id)
         self.dropped.append(request_id)
 
-    def note_request_settled(self, request_id, was_awaiting):
+    def note_request_settled(self, request_id: str, was_awaiting: bool) -> None:
         pass
 
-    def note_prefill_done(self, request_id):
+    def note_prefill_done(self, request_id: str) -> None:
         pass
 
 
@@ -381,7 +417,7 @@ class _SchedBase:
     """Attribute/method stubs for everything the extracted scheduler
     methods reference but do not need real logic for."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.requests = {}
         self.vllm_config = None
         self._lwd_route = {}
@@ -392,30 +428,34 @@ class _SchedBase:
         self._lwd_aborted_req_ids = {_CONNECTION: []}
         self._lwd_announced_refills = set()
 
-    def _lwd_validate_request(self, request):
+    def _lwd_validate_request(self, request: NS) -> None:
         pass
 
-    def _lwd_compute_mrope_positions(self, request):
+    def _lwd_compute_mrope_positions(self, request: NS) -> None:
         pass
 
-    def _lwd_route_request(self, request_id):
+    def _lwd_route_request(self, request_id: str) -> tuple[str, int, int]:
         self._lwd_route[request_id] = _CONNECTION
         return _CONNECTION
 
-    def _lwd_dp_of_settling(self, request_id):
+    def _lwd_dp_of_settling(
+        self, request_id: str
+    ) -> tuple[str, int, int] | None:
         return self._lwd_route.get(request_id)
 
-    def _lwd_account_of(self, request_id):
+    def _lwd_account_of(self, request_id: str) -> _Account | None:
         connection_id = self._lwd_dp_of_settling(request_id)
         return None if connection_id is None else self._lwd_accounts[connection_id]
 
-    def _lwd_watermark_connection(self, key):
+    def _lwd_watermark_connection(self, key: Any) -> Any:
         return key
 
-    def _lwd_purge_mrope_positions(self):
+    def _lwd_purge_mrope_positions(self) -> None:
         pass
 
-    def finish_requests(self, request_ids, status=None):
+    def finish_requests(
+        self, request_ids: list[str], status: object = None
+    ) -> None:
         for rid in request_ids:
             request = self.requests.get(rid)
             if request is not None:
@@ -436,7 +476,7 @@ _PIN_METHODS = (
 )
 
 
-def _make_sched():
+def _make_sched() -> Any:
     """Compile the pin/grouping methods out of the scheduler source into a
     class block inheriting the stub base (super() needs the class body's
     __class__ cell), with the module-level dependencies stubbed."""
@@ -477,7 +517,9 @@ def _make_sched():
     return scope["LwdEdgeSchedulerUnderTest"]()
 
 
-def _request(rid: str, client_index=None, finished=False):
+def _request(
+    rid: str, client_index: int | None = None, finished: bool = False
+) -> NS:
     """Request stand-in; ``client_index`` left unset mimics legacy
     single-frontend callers (pin defaults to 0)."""
     request = NS(
@@ -492,7 +534,9 @@ def _request(rid: str, client_index=None, finished=False):
     return request
 
 
-def _notify(req_ids, finish_reasons=None):
+def _notify(
+    req_ids: list[str], finish_reasons: list[object] | None = None
+) -> NS:
     return NS(
         req_ids=list(req_ids),
         finish_reasons=list(finish_reasons or [_LWD_NOT_FINISHED] * len(req_ids)),
@@ -502,7 +546,9 @@ def _notify(req_ids, finish_reasons=None):
     )
 
 
-def _unembed_step(sched, notify, sampled: dict):
+def _unembed_step(
+    sched: Any, notify: NS, sampled: dict[str, list[int]]
+) -> dict[int, Any]:
     """Drive update_from_output with one UNEMBED batch."""
     scheduler_output = NS(
         lwd_batch=NS(batch_type=_LwdBatchType.LWD_UNEMBED),
@@ -518,21 +564,21 @@ def _unembed_step(sched, notify, sampled: dict):
 class TestPinTableLifecycle:
     """B: req -> client_index pin write and cleanup (output grouping key)."""
 
-    def test_admit_registers_pin(self):
+    def test_admit_registers_pin(self) -> None:
         sched = _make_sched()
         sched.lwd_admit_request(_request("r1", client_index=2))
         assert sched._lwd_req_id_to_client["r1"] == 2
         sched.lwd_admit_request(_request("r2"))
         assert sched._lwd_req_id_to_client["r2"] == 0
 
-    def test_abort_pops_pin(self):
+    def test_abort_pops_pin(self) -> None:
         sched = _make_sched()
         sched.lwd_admit_request(_request("r1", client_index=1))
         sched.lwd_edge_abort(["r1"])
         assert "r1" not in sched._lwd_req_id_to_client
         assert "r1" not in sched._lwd_route
 
-    def test_abort_immediate_lifecycle_pops_pin(self):
+    def test_abort_immediate_lifecycle_pops_pin(self) -> None:
         # The engine path for abort_immediately: admission (pin written,
         # cloud announced) then the native add_request aborts right away,
         # which routes through the same lwd_edge_abort cleanup.
@@ -541,7 +587,7 @@ class TestPinTableLifecycle:
         sched.lwd_edge_abort(["r1"])
         assert "r1" not in sched._lwd_req_id_to_client
 
-    def test_cancel_admission_pops_pin(self):
+    def test_cancel_admission_pops_pin(self) -> None:
         # The engine's announcement-failure path: the request leaves the
         # books before any output can exist.
         sched = _make_sched()
@@ -549,7 +595,7 @@ class TestPinTableLifecycle:
         sched.lwd_edge_cancel_admission("r1")
         assert "r1" not in sched._lwd_req_id_to_client
 
-    def test_finish_pops_pin(self):
+    def test_finish_pops_pin(self) -> None:
         sched = _make_sched()
         request = _request("r1", client_index=2)
         sched.requests["r1"] = request
@@ -567,7 +613,7 @@ class TestOutputGrouping:
     """B: outputs group per client_index into per-client
     EngineCoreOutputs; late outputs neither drop nor cross-group."""
 
-    def test_multi_client_grouping(self):
+    def test_multi_client_grouping(self) -> None:
         sched = _make_sched()
         for rid, client in (("a", 0), ("b", 1), ("c", 2)):
             request = _request(rid, client_index=client)
@@ -583,7 +629,7 @@ class TestOutputGrouping:
         assert [out.request_id for out in results[2].outputs] == ["c"]
         assert results[0].finished_requests is None
 
-    def test_finished_requests_group_per_client(self):
+    def test_finished_requests_group_per_client(self) -> None:
         sched = _make_sched()
         for rid, client in (("a", 1), ("b", 2)):
             request = _request(rid, client_index=client)
@@ -597,7 +643,7 @@ class TestOutputGrouping:
         assert set(results[1].finished_requests) == {"a"}
         assert set(results[2].finished_requests) == {"b"}
 
-    def test_single_frontend_path_unchanged(self):
+    def test_single_frontend_path_unchanged(self) -> None:
         # K=1 regression: unpinned requests group under 0 exactly like the
         # pre-attach hardcoded {0: EngineCoreOutputs(...)}.
         sched = _make_sched()
@@ -614,7 +660,7 @@ class TestOutputGrouping:
         assert [out.request_id for out in results[0].outputs] == ["a", "b"]
         assert set(results[0].finished_requests) == {"a"}
 
-    def test_late_row_for_finished_request_is_dropped(self):
+    def test_late_row_for_finished_request_is_dropped(self) -> None:
         # Late cloud payload after the terminal settle: the request is
         # gone, the row is idempotently dropped -- nothing lands in any
         # group (in particular not the 0 group).
@@ -631,7 +677,7 @@ class TestOutputGrouping:
         )
         assert late == {}
 
-    def test_late_row_for_inflight_request_keeps_pin(self):
+    def test_late_row_for_inflight_request_keeps_pin(self) -> None:
         # The attach window: a request already streaming (first token
         # delivered, not finished) keeps its pin, so a late row still
         # reaches the originating frontend's group.
@@ -646,7 +692,7 @@ class TestOutputGrouping:
         assert set(late) == {2}
         assert [out.new_token_ids for out in late[2].outputs] == [[2]]
 
-    def test_terminal_output_reaches_pinned_client(self):
+    def test_terminal_output_reaches_pinned_client(self) -> None:
         # The grouping key is fixed at row entry, before the finished
         # branch settles the request and pops the pin: the terminal token
         # and finish signal of an attached frontend (client_index > 0)

@@ -18,9 +18,9 @@ import msgspec
 
 T = TypeVar("T")
 
-# 4: LwdRequestNotify gained `structured_outputs`. An old cloud would drop
-# the constraint silently (msgspec skips unknown fields on decode), so mixed
-# versions fail the handshake instead of serving unstructured output.
+# Version 5: LwdRequestNotify carries `structured_outputs`. An old cloud would
+# drop the constraint silently (msgspec skips unknown fields on decode), so
+# mixed versions fail the handshake instead of serving unstructured output.
 LWD_MESSAGE_VERSION = 5
 
 LWD_NOT_FINISHED = -1

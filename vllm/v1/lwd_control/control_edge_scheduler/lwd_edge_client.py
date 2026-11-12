@@ -1,19 +1,25 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""边侧前缀协商客户端(SSE 网关形态)。
+"""Edge prefix-negotiation client for an SSE gateway.
 
-从参考分支 ``edge_cloud/edge_client.py`` 演化:HMAC manifest 影子体 POST +
-SSE 解析 Probe 控制消息 + 后台排空 usage 流。原始 messages/采样参数不过网。
+Derived from ``edge_cloud/edge_client.py`` on the reference branch: POST an
+HMAC manifest shadow body, parse the Probe control message from SSE, and drain
+the usage stream in the background. Raw messages and sampling parameters never
+cross the network.
 
-协议形态(OpenAI 兼容,经网关透明转发):
-  请求: POST control_url, body 为 manifest 影子体, headers 带
-        X-Edge-Cloud-* + 可选 Authorization Bearer。图片请求协议声明
-        ``edge-cloud-prefix-v2`` 并附 ``X-Edge-Cloud-MM-ABI`` 指纹。
-  响应: SSE 流——首 chunk 的 delta.content 内嵌 edge_cloud_probe JSON
-        控制消息;随后空 delta 帧;心跳 comment;末 chunk 为标准 OpenAI
-        usage + [DONE]。网关(delta.content 不丢)可据此计费。
+OpenAI-compatible protocol, forwarded transparently by the gateway:
+  Request: POST control_url with a manifest shadow body, X-Edge-Cloud-*
+           headers, and an optional Authorization Bearer header. Image
+           requests declare ``edge-cloud-prefix-v2`` and include the
+           ``X-Edge-Cloud-MM-ABI`` fingerprint.
+  Response: an SSE stream whose first chunk embeds the edge_cloud_probe JSON
+            control message in delta.content, followed by empty delta frames
+            and heartbeat comments. The final chunk carries standard OpenAI
+            usage and [DONE]. A gateway that preserves delta.content can use
+            this stream for billing.
 
-usage 消费口径:后台排空 SSE 排 usage 做边侧日志留痕(与数据面
-``LwdC2eNotify.usages`` 双通道,后者供记账/前端)。
+Usage handling: drain the SSE stream in the background and record usage in
+edge logs. This complements ``LwdC2eNotify.usages`` on the data plane, which
+supplies accounting and frontend usage.
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
 
 logger = init_logger(__name__)
 
-# SSE 控制消息 JSON 尺寸上限(防恶意/异常响应撑爆内存)
+# Maximum SSE control-message JSON size, guarding against malicious responses.
 _MAX_CONTROL_MESSAGE_CHARS = 16 * 1024
 
 
@@ -70,7 +76,7 @@ async def _iter_sse_data(
 
 
 class LwdEdgePrefixClient:
-    """边侧准入客户端:HMAC manifest 影子体 + SSE Probe 解析。"""
+    """Edge admission client: HMAC manifest shadow body and SSE Probe parsing."""
 
     def __init__(
         self,
@@ -91,7 +97,8 @@ class LwdEdgePrefixClient:
         self._hasher = LwdPrefixHasher(
             tenant_key, block_size, processor_fingerprint
         )
-        # 图片请求的 MM-ABI 头值(由本地处理器指纹渲染);无指纹则 v2 无法发声
+        # MM-ABI header for image requests, rendered from the local processor
+        # fingerprint; without one, the client cannot issue a v2 request.
         self._mm_abi_header: str | None = (
             mm_abi_header_value(processor_fingerprint)
             if processor_fingerprint is not None
@@ -100,13 +107,16 @@ class LwdEdgePrefixClient:
         self._edge_id = edge_id
         self._consumer_id = consumer_id
         self._connect_timeout = connect_timeout
-        # 整段探针(建连+等首帧)的端到端上限;云侧上限是它减余量,
-        # 所以正常情况下云先作答。值来自 lwd_coordination.probe_timeout。
+        # End-to-end bound for the whole probe (connect plus first frame). The
+        # cloud bound is shorter, so normally the cloud responds first. The
+        # value comes from lwd_coordination.probe_timeout.
         self._probe_timeout = probe_timeout
-        # 探针流后台排空 task(asyncio 只持弱引用,这里必须持强引用;
-        # set 而非按 req_id 索引 —— 见 _start_drain)
+        # Background probe-stream drain tasks. asyncio holds only weak
+        # references, so this set must retain strong references; see
+        # _start_drain for why tasks are not indexed by req_id.
         self._drain_tasks: set[Any] = set()
-        # 网关 Bearer 令牌(敏感,不入日志):env 读取,缺省 None = 不发
+        # Sensitive gateway Bearer token, read from the environment and never
+        # logged. None means no Authorization header.
         api_key = envs.VLLM_LWD_CLOUD_API_KEY
         if api_key is not None:
             if (
@@ -131,7 +141,7 @@ class LwdEdgePrefixClient:
         prompt_token_ids: list[int],
         media_items: Sequence[Any] = (),
     ) -> LwdPrefixManifest:
-        """租户密钥链式 HMAC 产 manifest(原始 prompt 不出边)。"""
+        """Build an HMAC-chained manifest without exposing the raw prompt."""
         return self._hasher.build_manifest(
             request_id, prompt_token_ids, media_items=media_items
         )
@@ -143,14 +153,16 @@ class LwdEdgePrefixClient:
         *,
         multimodal: bool = False,
     ) -> tuple[dict[str, str], dict[str, Any]]:
-        """白名单影子体:仅 manifest/stream,采样参数不过网。
+        """Build a whitelisted shadow body; sampling parameters stay local.
 
-        必需控制头(含 ``X-Edge-Cloud-Prompt-Tokens``)由
-        ``LwdPrefixManifest.to_headers()`` 一次给全,这里只补边侧身份与网关
-        相关的头;model 可选透传(网关按它选渠道)。
-        ``multimodal`` 由调用方按建链时的 media_items 决定:媒体覆盖块走
-        0x04/0x05 域,协议必须同步声明 v2 并带 MM-ABI 指纹,否则云侧无从
-        判定这套链的口径。"""
+        ``LwdPrefixManifest.to_headers()`` supplies all required control
+        headers, including ``X-Edge-Cloud-Prompt-Tokens``. Add only edge
+        identity and gateway headers here; optionally pass ``model`` through
+        for gateway channel selection. The caller sets ``multimodal`` based on
+        the ``media_items`` used to build the chain. Media-covered blocks use
+        hash domains 0x04/0x05, so the request must declare v2 and carry the
+        MM-ABI fingerprint for the cloud to interpret the chain correctly.
+        """
         headers = manifest.to_headers()
         if multimodal:
             if self._mm_abi_header is None:
@@ -184,22 +196,26 @@ class LwdEdgePrefixClient:
         media_items: Sequence[Any] = (),
         model: str | None = None,
     ) -> LwdProbeResult:
-        """POST 探测并从 SSE delta.content 解析 Probe;失败即抛(fail-closed)。
+        """POST a probe and parse Probe from SSE delta.content; fail closed.
 
-        命中结果由调用方消费(命中时推进 request.num_computed_tokens,
-        使边侧只 embed/发尾巴)。manifest 可传入调用方已建好的链复用
-        (避免一次探测两次 O(N) 建链);缺省现建(media_items 须与
-        调用方建链口径一致,防缺省路径漏掺多模态身份)。
+        The caller consumes the hit and advances request.num_computed_tokens
+        so the edge embeds and sends only the suffix. An existing ``manifest``
+        can be reused to avoid building the O(N) chain twice per probe;
+        otherwise one is built now, and ``media_items`` must match the caller's
+        chain inputs so multimodal identity is not omitted.
 
-        整段(建连 + 等首帧)由 ``probe_timeout`` 钳住。云侧 handler 的上限是
-        ``probe_timeout - 5``,所以正常慢法是**云先作答**(200 或 503),这条
-        超时只在云/网关真没答时兜底——不再是边侧抢先放弃、把仍在等 usage 的
-        流掐掉。放弃时计费流的归属见 ``_post_and_read_probe``。"""
+        ``probe_timeout`` bounds connection and first-frame receipt. The cloud
+        handler uses ``probe_timeout - 5``, so a slow cloud normally responds
+        first with 200 or 503. This timeout is only a fallback when the cloud
+        or gateway does not respond; it must not abandon a stream that is still
+        awaiting usage. See ``_post_and_read_probe`` for ownership on abort.
+        """
         if manifest is None:
             manifest = self.build_manifest(
                 request_id, prompt_token_ids, media_items
             )
-        # 媒体身份非空 ⇔ 建链掺了 0x04/0x05 域 ⇔ 必须以 v2 发声
+        # A nonempty media identity means domains 0x04/0x05 were mixed into
+        # the chain, so this request must use protocol v2.
         multimodal = bool(media_items)
         headers, body = self.build_control_request(
             manifest, model=model, multimodal=multimodal
@@ -219,13 +235,16 @@ class LwdEdgePrefixClient:
                 f"prefix probe timed out after {self._probe_timeout}s "
                 f"url={self._control_url}"
             ) from exc
-        # probe 到手即返回,但**不能**在这里关流:云侧 handler 要等推理完结
-        # 才发 usage 末 chunk(最长 600s),真实 token 用量在这一帧落地。
+        # Return as soon as the probe arrives, but do not close the stream:
+        # the cloud handler waits for inference to finish before sending the
+        # final usage chunk (up to 600s), which carries actual token usage.
         self._start_drain(request_id, response, sse_data)
 
         logger.info(
-            "[Lwd][edge-client] negotiate req=%s hit_tokens=%d cloud_id=%s",
-            request_id, probe.hit_tokens, probe.cloud_id,
+            "[LWD][edge-client] negotiate req=%s hit_tokens=%d cloud_id=%s",
+            request_id,
+            probe.hit_tokens,
+            probe.cloud_id,
         )
         return probe
 
@@ -239,11 +258,13 @@ class LwdEdgePrefixClient:
         prompt_token_ids: list[int],
         multimodal: bool,
     ) -> tuple[Any, AsyncIterator[str], LwdProbeResult]:
-        """发影子体、读 Probe;放弃时决定"交排空还是关闭"。
+        """Send the shadow body and read Probe; drain or close on abort.
 
-        200 已到手 = 云侧 handler 已经挂在这笔的 usage 上。此后无论放弃原因
-        是超时、被取消还是回显校验不过,都**不能** close:边侧提前断开会让
-        网关记成 client_gone/context canceled,这笔真实用量永久丢失。"""
+        Receiving HTTP 200 means the cloud handler is already awaiting usage
+        for this request. After that, never close on timeout, cancellation, or
+        echo-validation failure: an early disconnect makes the gateway record
+        client_gone/context canceled and permanently loses actual usage.
+        """
         import aiohttp
 
         timeout = aiohttp.ClientTimeout(
@@ -252,7 +273,8 @@ class LwdEdgePrefixClient:
         response = await session.post(
             self._control_url, json=body, headers=headers, timeout=timeout
         )
-        # 非 None ⇔ 200 已到手且拿到了流迭代器(放弃时据此决定排空还是关闭)
+        # Non-None means HTTP 200 was received and the stream iterator exists;
+        # on abort this determines whether to drain or close.
         sse_data: AsyncIterator[str] | None = None
         try:
             if response.status != 200:
@@ -261,16 +283,18 @@ class LwdEdgePrefixClient:
                     f"prefix negotiation HTTP {response.status} "
                     f"url={self._control_url} body={detail}"
                 )
-            # 与排空 task 共用同一迭代器:probe 帧之后的剩余帧由 task 续读
+            # Share this iterator with the drain task, which continues reading
+            # frames after the probe frame.
             sse_data = _iter_sse_data(response.content)
             probe = await self._read_probe_from_sse(
                 sse_data, multimodal=multimodal
             )
             if probe.request_id != request_id:
                 raise RuntimeError("cloud returned a different request ID")
-            # 块粒度不强求一致:混合模型(如 Mamba/SWA)下云 hash 粒度可
-            # 小于边 KV 块粒度,由调用方按 probe.block_size 学习重建链
-            # (见 _lwd_hash_bs_by_cloud)。
+            # Block granularity need not match: for hybrid models such as
+            # Mamba/SWA, the cloud hash granularity may be smaller than the
+            # edge KV block size. The caller learns probe.block_size and
+            # rebuilds the chain (see _lwd_hash_bs_by_cloud).
             if probe.hit_tokens > len(prompt_token_ids):
                 raise RuntimeError("cloud prefix hit exceeds the prompt length")
         except BaseException:
@@ -279,7 +303,7 @@ class LwdEdgePrefixClient:
             else:
                 response.close()
             raise
-        assert sse_data is not None  # 成功路径必已建流
+        assert sse_data is not None  # The success path always creates a stream.
         return response, sse_data, probe
 
     def _start_drain(
@@ -288,13 +312,16 @@ class LwdEdgePrefixClient:
         response: Any,
         sse_data: AsyncIterator[str],
     ) -> Any:
-        """把 probe 帧之后的剩余帧交后台 task 排空(同条 loop,不占 _job 返回路径)。
+        """Drain frames after Probe in a background task on the same event loop.
 
-        登记必须是 **set** 而不是按 req_id 索引的 dict:asyncio 只持弱引用,
-        而挂在网络读上的协程没有待执行回调,这份登记就是它唯一的强引用。同
-        req_id 重发(re-add/重试)时按 id 覆盖会丢掉**上一条**流的唯一强引用,
-        那条流可能在读完 usage 之前被 GC 掉——网关记 client_gone、这笔用量丢。
-        返回 task 只为测试可断言登记归属。"""
+        Registration must use a set, not a dict indexed by req_id: asyncio
+        holds only weak references, and a coroutine blocked on a network read
+        has no pending callback, so this set is its only strong reference.
+        Overwriting an earlier task with the same req_id on re-add/retry would
+        drop that stream's only strong reference; it could be garbage
+        collected before usage arrives, causing gateway client_gone and lost
+        usage. Return the task only so tests can assert its registration.
+        """
         task = asyncio.create_task(
             self._drain_stream(request_id, response, sse_data)
         )
@@ -308,13 +335,16 @@ class LwdEdgePrefixClient:
         response: Any,
         sse_data: AsyncIterator[str],
     ) -> None:
-        """排空探针流至 usage 末 chunk:供网关计费的收流路径。
+        """Drain the probe stream through its final usage chunk for billing.
 
-        本侧只留痕不消费(记账以云侧 C2e 回边的 ``[Lwd][edge] usage`` 为准),
-        但必须读完:读完才让云侧 handler 正常走到末 chunk + [DONE]。
-        云侧 usage 等待有 600s 上限,超时也照样以 [DONE] 收流(只是不带
-        usage 帧),故 task 数有界(= 在飞请求数),无需额外超时钳制。
-        usage 缺席按 warning 留痕——这一笔网关侧无上游用量可计。"""
+        The edge only logs usage; accounting uses the cloud-to-edge C2e
+        ``[LWD][edge] usage`` record. The stream must still be consumed so the
+        cloud handler reaches its final chunk and [DONE]. The cloud waits at
+        most 600s for usage and then sends [DONE] without a usage frame, so
+        task count is bounded by in-flight requests and needs no extra timeout.
+        Missing usage is logged as a warning because the gateway cannot bill
+        upstream usage for that request.
+        """
         usage: dict | None = None
         try:
             async for payload in sse_data:
@@ -328,13 +358,13 @@ class LwdEdgePrefixClient:
                     usage = chunk["usage"]
             if usage is None:
                 logger.warning(
-                    "[Lwd][edge-client] usage missing in probe stream req=%s",
+                    "[LWD][edge-client] usage missing in probe stream req=%s",
                     request_id,
                 )
                 return
             details = usage.get("prompt_tokens_details") or {}
             logger.info(
-                "[Lwd][edge-client] usage req=%s prompt=%s completion=%s "
+                "[LWD][edge-client] usage req=%s prompt=%s completion=%s "
                 "total=%s cached=%s",
                 request_id,
                 usage.get("prompt_tokens"),
@@ -344,25 +374,25 @@ class LwdEdgePrefixClient:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001  排空失败只丢这笔网关账,不影响推理
+        except Exception:  # noqa: BLE001  Only this gateway bill is lost.
             logger.warning(
-                "[Lwd][edge-client] probe stream drain failed req=%s",
+                "[LWD][edge-client] probe stream drain failed req=%s",
                 request_id,
                 exc_info=True,
             )
         finally:
             try:
                 response.close()
-            except Exception:  # noqa: BLE001  关闭失败无需上抛
+            except Exception:  # noqa: BLE001  Do not propagate close failures.
                 logger.debug(
-                    "[Lwd][edge-client] probe stream close failed req=%s",
+                    "[LWD][edge-client] probe stream close failed req=%s",
                     request_id,
                     exc_info=True,
                 )
 
     @staticmethod
     async def _read_error_body(response: Any, limit: int = 512) -> str:
-        """非 200 时读错误体(截断 + 折叠空白:网关常回整页 HTML)。"""
+        """Read a non-200 error body, truncated and whitespace-normalized."""
         try:
             # aiohttp's ClientResponse.read() takes no size argument; the
             # capped read lives on the content stream. Passing the limit to
@@ -370,19 +400,22 @@ class LwdEdgePrefixClient:
             # the cloud's own error text) behind "<unreadable: TypeError>".
             raw = await response.content.read(limit)
             return " ".join(raw.decode("utf-8", "replace").split())
-        except Exception as exc:  # noqa: BLE001  诊断路径不再抛
+        except Exception as exc:  # noqa: BLE001  Diagnostics must not raise.
             return f"<unreadable: {type(exc).__name__}>"
 
     async def _read_probe_from_sse(
         self, sse_data: AsyncIterator[str], *, multimodal: bool
     ) -> LwdProbeResult:
-        """从 SSE 流解析首个 edge_cloud_probe 控制消息(delta.content 累积)。
+        """Parse the first edge_cloud_probe message from SSE delta.content.
 
-        回显必校验(fail-closed):云侧 ack 的 protocol 必须是本端发声的那一套
-        ——v2 图片被静默降回 v1 意味着媒体覆盖块按文本口径入账,命中会错位;
-        v2 还须回带与本端一致的 MM-ABI 指纹,纯文本则不得出现该字段。probe
-        之前出现 usage/error 帧说明流序不对,同样抛错而不是当残缺握手用。
-        content 被网关分片送达时逐帧拼接,故只在拼出完整对象后判定。"""
+        Validate every echoed field and fail closed: the cloud protocol must
+        match the request. Silently downgrading a v2 image request to v1 would
+        account for media-covered blocks as text and misalign cache hits. V2
+        must echo the local MM-ABI fingerprint, while text-only replies must
+        omit it. A usage/error frame before Probe indicates invalid stream
+        ordering and is an error. Gateway-fragmented content is accumulated,
+        so validate only after a complete JSON object has been assembled.
+        """
         expected_protocol = (
             PROTOCOL_VERSION_MM if multimodal else PROTOCOL_VERSION
         )
@@ -407,11 +440,11 @@ class LwdEdgePrefixClient:
             try:
                 message = json.loads(content_buf)
             except json.JSONDecodeError:
-                continue  # 分片未拼全,续读
+                continue  # Fragmented JSON is incomplete; keep reading.
             if not isinstance(message, dict):
                 raise ValueError("cloud probe must contain a JSON object")
             if "protocol" not in message:
-                continue  # 恰好切在首个键之后:再拼一帧
+                continue  # Split after the first key; read one more frame.
             if message["protocol"] != expected_protocol:
                 raise RuntimeError(
                     f"cloud did not acknowledge {expected_protocol} "

@@ -6,8 +6,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
+    LwdCloudScheduler,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     LwdPrefixReservations,
     LwdProbeQueryAdapter,
@@ -20,7 +24,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
 )
 
 
-def _request(*, skip=False, computed=0, floor=None):
+def _request(
+    *, skip: bool = False, computed: int = 0, floor: int | None = None
+) -> SimpleNamespace:
     request = SimpleNamespace(
         request_id="r",
         num_prompt_tokens=64,
@@ -34,7 +40,9 @@ def _request(*, skip=False, computed=0, floor=None):
     return request
 
 
-def _manager(groups=(), hit=0, uncached=0):
+def _manager(
+    groups: tuple[object, ...] = (), hit: int = 0, uncached: int = 0
+) -> SimpleNamespace:
     manager = SimpleNamespace(
         coordinator=Mock(),
         block_pool=Mock(),
@@ -49,7 +57,7 @@ def _manager(groups=(), hit=0, uncached=0):
     return manager
 
 
-def test_reserve_pins_real_blocks_and_freezes_snapshot():
+def test_reserve_pins_real_blocks_and_freezes_snapshot() -> None:
     block = SimpleNamespace(is_null=False)
     null_block = SimpleNamespace(is_null=True)
     manager = _manager(([block, null_block],), hit=16)
@@ -66,7 +74,7 @@ def test_reserve_pins_real_blocks_and_freezes_snapshot():
     manager.block_pool.free_blocks.assert_called_once_with([block])
 
 
-def test_reserve_miss_snapshot_does_not_change_with_cache_growth():
+def test_reserve_miss_snapshot_does_not_change_with_cache_growth() -> None:
     block = SimpleNamespace(is_null=False)
     manager = _manager()
     reservations = LwdPrefixReservations(manager)
@@ -78,7 +86,7 @@ def test_reserve_miss_snapshot_does_not_change_with_cache_growth():
     assert manager.coordinator.find_longest_cache_hit.call_count == 1
 
 
-def test_skip_reading_reserves_zero_without_lookup():
+def test_skip_reading_reserves_zero_without_lookup() -> None:
     manager = _manager(([SimpleNamespace(is_null=False)],), hit=16)
     reservations = LwdPrefixReservations(manager)
     request = _request(skip=True)
@@ -89,13 +97,13 @@ def test_skip_reading_reserves_zero_without_lookup():
     manager.block_pool.touch.assert_not_called()
 
 
-def test_missing_negotiated_snapshot_fails_closed():
+def test_missing_negotiated_snapshot_fails_closed() -> None:
     reservations = LwdPrefixReservations(_manager())
     with pytest.raises(RuntimeError, match="reserved prefix"):
         reservations.snapshot(_request(floor=16))
 
 
-def test_reserve_hit_preserves_floor_and_truncate_preserves_layout():
+def test_reserve_hit_preserves_floor_and_truncate_preserves_layout() -> None:
     blocks = [SimpleNamespace(is_null=False) for _ in range(3)]
     reservations = LwdPrefixReservations(_manager())
     request = _request(floor=48)
@@ -109,14 +117,14 @@ def test_reserve_hit_preserves_floor_and_truncate_preserves_layout():
     assert prefix_start(request, reservations) == 32
 
 
-def test_prefix_start_uses_native_watermark_after_allocation():
+def test_prefix_start_uses_native_watermark_after_allocation() -> None:
     request = _request(computed=24, floor=16)
     assert prefix_start(request) == 24
     assert prefix_start(_request(floor=16)) == 16
     assert prefix_start(_request()) == 0
 
 
-def _lwd_kv_manager(reservations):
+def _lwd_kv_manager(reservations: LwdPrefixReservations) -> KVCacheManager:
     manager = KVCacheManager.__new__(KVCacheManager)
     manager.enable_caching = True
     manager.lwd_prefix_caching = True
@@ -128,7 +136,7 @@ def _lwd_kv_manager(reservations):
     return manager
 
 
-def test_lwd_kv_and_connector_apis_return_frozen_triple():
+def test_lwd_kv_and_connector_apis_return_frozen_triple() -> None:
     block = SimpleNamespace(is_null=False)
     reservations = LwdPrefixReservations(_manager(([block],), hit=16, uncached=16))
     request = _request()
@@ -143,7 +151,7 @@ def test_lwd_kv_and_connector_apis_return_frozen_triple():
     assert connector_result == (blocks, 16, 0, False)
 
 
-def test_lwd_connector_missing_snapshot_fails_closed():
+def test_lwd_connector_missing_snapshot_fails_closed() -> None:
     reservations = LwdPrefixReservations(_manager())
     manager = _lwd_kv_manager(reservations)
     request = _request(floor=16)
@@ -152,7 +160,9 @@ def test_lwd_connector_missing_snapshot_fails_closed():
         manager.get_computed_blocks_for_connector(request)
 
 
-def test_init_builds_reservations_and_alignment(monkeypatch):
+def test_init_builds_reservations_and_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _manager()
     manager.enable_caching = True
     manager.coordinator.scheduler_block_size = 16
@@ -188,7 +198,7 @@ def _manifest(block_size: int = 16, prompt_tokens: int = 64) -> LwdPrefixManifes
     )
 
 
-def test_probe_query_without_prefix_caching_skips_block_size_contract():
+def test_probe_query_without_prefix_caching_skips_block_size_contract() -> None:
     """Placement-only clouds answer zero hits at the manifest granularity.
 
     The edge cannot know this cloud's hash block size when prefix caching is
@@ -211,7 +221,7 @@ def test_probe_query_without_prefix_caching_skips_block_size_contract():
     manager.coordinator.find_longest_cache_hit.assert_not_called()
 
 
-def test_probe_query_with_prefix_caching_enforces_block_size():
+def test_probe_query_with_prefix_caching_enforces_block_size() -> None:
     adapter = LwdProbeQueryAdapter(
         _manager(),
         hash_block_size=128,
@@ -224,7 +234,7 @@ def test_probe_query_with_prefix_caching_enforces_block_size():
         adapter.probe(_manifest(block_size=16))
 
 
-def test_probe_query_with_prefix_caching_reports_cloud_hit():
+def test_probe_query_with_prefix_caching_reports_cloud_hit() -> None:
     manager = _manager(hit=32)
     adapter = LwdProbeQueryAdapter(
         manager,
@@ -239,7 +249,9 @@ def test_probe_query_with_prefix_caching_reports_cloud_hit():
     assert (result.block_size, result.hit_tokens, result.cloud_id) == (16, 32, 1)
 
 
-def test_init_alignment_follows_coordinator_hit_alignment(monkeypatch):
+def test_init_alignment_follows_coordinator_hit_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The coordinator's hit alignment wins over the scheduler LCM: fine
     hits land on compressed-state boundaries (e.g. 128), and the edge rounds
     the probe hit down to this value."""
@@ -267,24 +279,18 @@ def test_init_alignment_follows_coordinator_hit_alignment(monkeypatch):
     assert state.alignment_tokens == 128
 
 
-def test_cache_hit_alignment_property_prefers_coordinator_refinement():
-    from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
-
+def test_cache_hit_alignment_property_prefers_coordinator_refinement() -> None:
     fake = SimpleNamespace(scheduler_block_size=16384)
     assert KVCacheCoordinator.cache_hit_alignment_tokens.fget(fake) == 16384
     fake._cache_hit_alignment_tokens = 128
     assert KVCacheCoordinator.cache_hit_alignment_tokens.fget(fake) == 128
 
 
-def test_readmission_clamp_uses_fine_grained_alignment():
+def test_readmission_clamp_uses_fine_grained_alignment() -> None:
     """Preemption re-admission must clamp recv_rows at the coordinator's hit
     alignment (e.g. 128), not the scheduler LCM block: with the coarse clamp
     a fine hit like 6656 is discarded whenever recv_rows < 16384, silently
     turning a resume into a full recompute or a full-prefill refill."""
-    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
-        LwdCloudScheduler,
-    )
-
     groups = ([SimpleNamespace(is_null=False) for _ in range(500)],)
     reservations = LwdPrefixReservations(_manager())
     coordinator = SimpleNamespace(

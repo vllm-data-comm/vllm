@@ -81,7 +81,9 @@ def test_single_instance_groups_each_side_and_pairs_the_first_ranks() -> None:
     # groups equal the TP groups, as before multi-DP.
     assert spec.dp_groups == spec.singleton_groups
     assert spec.ep_groups == spec.tp_groups
-    assert spec.channel_endpoints == (LwdChannelEndpoints(LwdConnectionId(0, 0, 0), 0, 2),)
+    assert spec.channel_endpoints == (
+        LwdChannelEndpoints(LwdConnectionId(0, 0, 0), 0, 2),
+    )
     assert spec.tp_group_of(4) == (2, 3, 4, 5)
     assert spec.channel_endpoints_of(2) == (
         LwdChannelEndpoints(LwdConnectionId(0, 0, 0), 0, 2),

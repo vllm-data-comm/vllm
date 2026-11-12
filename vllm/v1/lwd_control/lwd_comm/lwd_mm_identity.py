@@ -1,18 +1,19 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""处理器指纹与 MM-ABI 标识:边云两侧多模态建链口径的同源性判定。
+"""Processor fingerprints and MM-ABI identities for multimodal hash chaining.
 
-指纹既是媒体覆盖块(0x04/0x05 哈希域)的 HMAC 材料,也以
-``X-Edge-Cloud-MM-ABI: mm1:<base64url(指纹)>`` 随 v2 请求上线,供云侧仲裁。
-边侧建链与云侧比对必须逐位同源,故两处实现合在本模块一处(摘要的线上编码
-口径仍由协议层 ``lwd_prefix`` 单点提供)。
+The fingerprint contributes HMAC material to media-covered blocks (hash domains
+0x04/0x05) and travels with v2 requests as
+``X-Edge-Cloud-MM-ABI: mm1:<base64url(fingerprint)>`` for cloud validation.
+Edge hashing and cloud validation must use identical inputs, so both share this
+module. Wire encoding remains centralized in ``lwd_prefix``.
 
-**指纹材料刻意不含模型/tokenizer 的本地路径字符串**:同一份 artifact 在边云
-常挂在不同路径下,路径掺进指纹会让"同一次部署"算出两个指纹,
-``enforce_mm_abi_match`` 一开就把正常图片流量全打成 400。稳定身份由
-revision / code_revision / config hash 承载(参考分支
-``edge_cloud/mm_identity.py`` 同款判断,那边已过真机验收)。
+**Fingerprint inputs deliberately exclude local model/tokenizer paths**: the
+same artifact is often mounted at different paths on the edge and cloud.
+Including paths would make one deployment produce different fingerprints and
+reject valid image requests when ``enforce_mm_abi_match`` is enabled. Stable
+identity comes from revision, code_revision, and config hashes.
 
-纯文本请求不受影响:指纹只进媒体覆盖块,文本链逐位不变。
+Text-only requests are unaffected: fingerprints apply only to media blocks.
 """
 
 from __future__ import annotations
@@ -33,14 +34,14 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
 MM_ABI_VERSION = "mm1"
 
 _FILE_HASH_CHUNK_SIZE = 1024 * 1024
-# 决定"媒体怎样变成占位 token 与内容摘要"的预处理包版本。
+# Versions of packages that determine media placeholders and content digests.
 _PROCESSOR_SOFTWARE_PACKAGES = (
     "vllm",
     "vllm-ascend",
     "transformers",
     "pillow",
 )
-# MultiModalConfig 里会影响媒体预处理/占位排布/内容摘要的字段。
+# MultiModalConfig fields affecting preprocessing, placeholders, and digests.
 _MM_CONFIG_FIELDS = (
     "mm_processor_kwargs",
     "media_io_kwargs",
@@ -48,7 +49,7 @@ _MM_CONFIG_FIELDS = (
     "interleave_mm_strings",
     "video_pruning_rate",
 )
-# 这些字段是节点本地资源位置,不参与部署身份。
+# Node-local resource locations do not contribute to deployment identity.
 _ARTIFACT_LOCATION_PLACEHOLDER = "<model-artifact>"
 
 
@@ -67,7 +68,7 @@ def validate_mm_abi_header(value: str | None) -> str:
             f"{HEADER_MM_ABI} must be "
             f"'{MM_ABI_VERSION}:<base64url fingerprint>'"
         )
-    # decode_digest 顺带校验 32 字节长度
+    # decode_digest also validates the 32-byte length.
     decode_digest(encoded)
     return value
 
@@ -75,10 +76,11 @@ def validate_mm_abi_header(value: str | None) -> str:
 def compute_processor_fingerprint(model_config: Any) -> bytes:
     """Return a 32-byte digest identifying the multimodal deployment ABI.
 
-    覆盖:已解析的模型/处理器配置 + 预处理包版本 + 媒体摘要算法。它能发现
-    常规部署漂移(换模型版本、改 processor/media io 配置、升级 transformers),
-    但不证明两份媒体输入执行等价(沿用上游 mm_hash 的既有风险)。
-    全部字段经 ``getattr`` 读取:缺项按 None 参与摘要,两侧口径一致即可。"""
+    The digest covers parsed model/processor configuration, preprocessing
+    package versions, and the media digest algorithm. It detects common
+    deployment drift but does not prove equivalent media execution, matching
+    the existing limitation of upstream ``mm_hash``. Missing attributes are
+    represented as None so both sides hash the same schema."""
     mm_config = getattr(model_config, "multimodal_config", None)
     hf_config = getattr(model_config, "hf_config", None)
     hf_text_config = getattr(model_config, "hf_text_config", None)
@@ -89,8 +91,8 @@ def compute_processor_fingerprint(model_config: Any) -> bytes:
         "hf_config_commit": getattr(hf_config, "_commit_hash", None),
         "model_type": getattr(hf_text_config, "model_type", None),
         "architecture": getattr(model_config, "_architecture", None),
-        # vLLM 自身的 config hash 覆盖那些手工列举字段容易漏掉的图选择
-        # (dtype/量化、MM encoder attention backend/TP/FP8 等)。
+        # vLLM's config hash covers graph choices that are easy to omit from
+        # a manual field list (dtype, quantization, MM attention, TP, FP8).
         "model_config_hash": _config_hash(
             model_config,
             neutralized_fields={
@@ -103,7 +105,7 @@ def compute_processor_fingerprint(model_config: Any) -> bytes:
         "multimodal_config_hash": _config_hash(
             mm_config,
             neutralized_fields={
-                # 权重标定文件按内容而非本地路径参与身份
+                # Identify calibration weights by content, not local path.
                 "mm_encoder_fp8_scale_path": _file_content_identity(
                     getattr(mm_config, "mm_encoder_fp8_scale_path", None)
                 )
@@ -123,8 +125,9 @@ def compute_processor_fingerprint(model_config: Any) -> bytes:
     for field in _MM_CONFIG_FIELDS:
         value = getattr(mm_config, field, None)
         if value is None:
-            # mm_processor_kwargs / media_io_kwargs 是 InitVar,可能只落在
-            # ModelConfig 上;缺 MultiModalConfig 时回退,保证两侧口径一致。
+            # mm_processor_kwargs / media_io_kwargs are InitVars and may be
+            # stored only on ModelConfig. Fall back when MultiModalConfig is
+            # absent so both sides hash the same values.
             value = getattr(model_config, field, None)
         payload[field] = value
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -145,7 +148,7 @@ def _config_hash(
     neutralized_fields: dict[str, Any] | None = None,
     scrub_hf_locations: bool = False,
 ) -> str | None:
-    """按"抹掉节点本地资源位置"后的配置求 hash(无 compute_hash 则返回 None)。"""
+    """Hash config after neutralizing node-local resource locations."""
     if config is None:
         return None
     stable_config = copy.copy(config)
@@ -167,7 +170,7 @@ def _config_hash(
 
 
 def _scrub_name_or_path(value: Any, seen: set[int]) -> None:
-    """递归把 HF 配置里的 ``_name_or_path`` 换成占位常量(去掉本地路径)。"""
+    """Recursively replace HF ``_name_or_path`` values with a placeholder."""
     if value is None or isinstance(
         value, (bool, int, float, str, bytes)
     ):
@@ -196,7 +199,7 @@ def _scrub_name_or_path(value: Any, seen: set[int]) -> None:
 
 
 def _file_content_identity(path: Any) -> str | None:
-    """按字节而非本地路径标识一个图输入(空路径返回 None)。"""
+    """Identify a graph input by bytes rather than local path."""
     if path is None:
         return None
     digest = hashlib.sha256()

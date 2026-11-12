@@ -15,6 +15,10 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
+        LwdPrefixManifest,
+        LwdProbeResult,
+    )
     from vllm.v1.request import Request
 
 
@@ -252,7 +256,7 @@ class LwdProbeQueryAdapter:
         self._cloud_id = cloud_id
         self._prefix_caching = prefix_caching
 
-    def _query(self, manifest) -> Any:
+    def _query(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdProbeResult
 
         if not self._prefix_caching:
@@ -293,8 +297,8 @@ class LwdProbeQueryAdapter:
             cloud_id=self._cloud_id,
         )
 
-    def peek(self, manifest) -> Any:
+    def peek(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         return self._query(manifest)
 
-    def probe(self, manifest) -> Any:
+    def probe(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         return self._query(manifest)

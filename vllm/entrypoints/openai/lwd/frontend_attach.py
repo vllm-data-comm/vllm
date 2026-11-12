@@ -24,6 +24,7 @@ import os
 import signal
 import socket
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -284,7 +285,7 @@ class FrontendAttachServer:
         config_payload: dict[str, Any],
         main_listen: tuple[str, int],
         frontend_args: dict[str, Any] | None = None,
-    ):
+    ) -> None:
         host, port = parse_endpoint(endpoint, "--api-server-rpc-port")
         self.endpoint = get_tcp_uri(host, port)
         self.client_count = client_count
@@ -310,7 +311,7 @@ class FrontendAttachServer:
         timeout = envs.VLLM_ENGINE_READY_TIMEOUT_S if timeout is None else timeout
         deadline = time.monotonic() + timeout
         logger.info(
-            "LWD frontend attach: waiting for %d frontend(s) at %s",
+            "[LWD][frontend-attach] waiting for %d frontend(s) at %s",
             self.expected_attaches,
             self.endpoint,
         )
@@ -335,7 +336,7 @@ class FrontendAttachServer:
                     "LWD attach frontends"
                 )
         logger.info(
-            "All LWD attach frontends supplied endpoints: %s",
+            "[LWD][frontend-attach] all frontends supplied endpoints: %s",
             {index: self._reported[index] for index in sorted(self._reported)},
         )
         return dict(self._reported)
@@ -361,11 +362,15 @@ class FrontendAttachServer:
                     }
                 )
         except Exception as exc:  # Keep the authority alive for other frontends.
-            logger.error("Invalid LWD frontend attach message: %s", exc)
+            logger.error("[LWD][frontend-attach] invalid message: %s", exc)
             with contextlib.suppress(zmq.ZMQError):
                 reply({"type": _MSG_ERROR, "reason": str(exc)})
 
-    def _handle_attach(self, message: dict[str, Any], reply: Any) -> None:
+    def _handle_attach(
+        self,
+        message: dict[str, Any],
+        reply: Callable[[dict[str, Any]], None],
+    ) -> None:
         index = message.get("client_index")
         if not isinstance(index, int) or isinstance(index, bool) or not (
             1 <= index < self.client_count
@@ -392,7 +397,9 @@ class FrontendAttachServer:
         differences = diff_config_payloads(self.config_payload, remote_payload)
         if differences:
             reason = "common configuration mismatch: " + "; ".join(differences)
-            logger.error("LWD attach frontend %d rejected: %s", index, reason)
+            logger.error(
+                "[LWD][frontend-attach] frontend %d rejected: %s", index, reason
+            )
             reply({"type": _MSG_ERROR, "reason": reason})
             return
         listen_host = message.get("listen_host")
@@ -416,7 +423,9 @@ class FrontendAttachServer:
         self._listen_addresses[index] = (listen_host, listen_port)
         self._accepted.add(index)
         logger.info(
-            "Accepted LWD attach frontend %d (pid %s)", index, message.get("pid")
+            "[LWD][frontend-attach] accepted frontend %d (pid %s)",
+            index,
+            message.get("pid"),
         )
         reply(
             {
@@ -427,7 +436,11 @@ class FrontendAttachServer:
             }
         )
 
-    def _handle_endpoints(self, message: dict[str, Any], reply: Any) -> None:
+    def _handle_endpoints(
+        self,
+        message: dict[str, Any],
+        reply: Callable[[dict[str, Any]], None],
+    ) -> None:
         index = message.get("client_index")
         if index not in self._accepted:
             reply({"type": _MSG_ERROR, "reason": "frontend has not attached"})
@@ -464,7 +477,7 @@ class FrontendAttachServer:
 class FrontendAttachClient:
     """Non-primary frontend's half of the native endpoint barrier."""
 
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str) -> None:
         host, port = parse_endpoint(endpoint, "--api-server-attach")
         self.main_address = get_tcp_uri(host, port)
         self._ctx = zmq.Context()
@@ -574,7 +587,7 @@ def run_attach_api_server(args: Any) -> None:
         inherited = apply_inherited_frontend_args(args, accepted.get("frontend_args"))
         if inherited:
             logger.info(
-                "Inherited serving args from LWD primary: %s",
+                "[LWD][frontend-attach] inherited serving args: %s",
                 ", ".join(sorted(inherited)),
             )
 

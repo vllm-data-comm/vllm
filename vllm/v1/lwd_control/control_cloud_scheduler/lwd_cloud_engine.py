@@ -79,7 +79,7 @@ def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None
     reduced to lengths to bound log volume)."""
     if isinstance(message, LwdC2eNotify):
         lwd_logger.info(
-            "[cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
+            "[LWD][cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
             "req_ids=%s accepted=%s finish=%s nonces=%s top_tree_lens=%s "
             "token_lens=%s",
             peer,
@@ -95,7 +95,7 @@ def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None
         )
     else:
         lwd_logger.info(
-            "[cloud] %s sent to edge %s: %s",
+            "[LWD][cloud] %s sent to edge %s: %s",
             type(message).__name__,
             peer,
             message,
@@ -162,7 +162,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 handles[0], 0
             )
         lwd_logger.info(
-            "[pre-recv] %d hint MQ(s) created, done MQs attached via RPC",
+            "[LWD][pre-recv] %d hint MQ(s) created, done MQs attached via RPC",
             len(self._lwd_hint_mqs),
         )
 
@@ -285,7 +285,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # reservation, routing and coordinator state therefore have one owner:
         # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
-        lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+        lwd_logger.info(
+            "[LWD][cloud] engine assembled: control plane on %s", plane.endpoint
+        )
 
     def _lwd_dp_coordinator_addr(self) -> str:
         """Routable coordinator stats endpoint, or empty without one."""
@@ -308,7 +310,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_edges.add(peer)
         self._lwd_send_until_queued(peer, self._lwd_cloud_params)
         lwd_logger.info(
-            "[cloud] edge %s registered; scheduling limits sent: %s",
+            "[LWD][cloud] edge %s registered; scheduling limits sent: %s",
             peer,
             self._lwd_cloud_params,
         )
@@ -322,7 +324,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         while not self._lwd_send(peer, message):
             if self.shutdown_state != EngineShutdownState.RUNNING:
                 lwd_logger.error(
-                    "[cloud] %s to edge %s dropped: shutting down with the "
+                    "[LWD][cloud] %s to edge %s dropped: shutting down with the "
                     "outbound queue full",
                     type(message).__name__,
                     peer,
@@ -344,7 +346,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ),
         )
         lwd_logger.info(
-            "[prefix] READY req=%s hit=%d nonce=%d error=%r",
+            "[LWD][prefix] READY req=%s hit=%d nonce=%d error=%r",
             request_id,
             hit_tokens,
             nonce,
@@ -364,7 +366,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ),
         )
         lwd_logger.info(
-            "[prefix] REFILL req=%s rows=[%d, %d) nonce=%d",
+            "[LWD][prefix] REFILL req=%s rows=[%d, %d) nonce=%d",
             request_id,
             start_row,
             end_row,
@@ -376,7 +378,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if not nonce:
             if self._lwd_prefix_enabled:
                 lwd_logger.error(
-                    "[prefix] reject req=%s: missing prefix nonce",
+                    "[LWD][prefix] reject req=%s: missing prefix nonce",
                     request.request_id,
                 )
                 return
@@ -406,7 +408,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         try:
             hit_tokens = reservations.reserve(request)
         except Exception as exc:
-            lwd_logger.exception("[prefix] reserve failed req=%s", request_id)
+            lwd_logger.exception("[LWD][prefix] reserve failed req=%s", request_id)
             self._lwd_send_prefix_ready(request_id, 0, nonce, error=str(exc))
             return
         try:
@@ -441,7 +443,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     lambda hint, mq=hint_mq: mq.enqueue(hint), connection
                 )
             lwd_logger.info(
-                "[pre-recv] hint senders registered for %d connection(s)",
+                "[LWD][pre-recv] hint senders registered for %d connection(s)",
                 len(self._lwd_hint_mqs),
             )
         else:
@@ -449,7 +451,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             # hints never go out and the gate never opens; this must be
             # explicitly visible
             lwd_logger.warning(
-                "[pre-recv] hint MQ missing: pre-recv gate will never open"
+                "[LWD][pre-recv] hint MQ missing: pre-recv gate will never open"
             )
 
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
@@ -480,7 +482,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 self._lwd_handle_edge_message(peer, msg)
             except Exception as exc:
                 lwd_logger.exception(
-                    "[cloud] ingest of %s failed", type(msg).__name__
+                    "[LWD][cloud] ingest of %s failed", type(msg).__name__
                 )
                 self._lwd_fail(f"ingest of {type(msg).__name__}: {exc!r}")
             return
@@ -490,7 +492,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self, peer: LwdPeer, msg: LwdEdgeToCloudMessage
     ) -> None:
         lwd_logger.info(
-            "[cloud] ingest msg=%s seqno=%s",
+            "[LWD][cloud] ingest msg=%s seqno=%s",
             type(msg).__name__,
             getattr(msg, "seqno", "-"),
         )
@@ -554,12 +556,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             and current_nonces[item.request_id] != item.prefix_nonce
             for item in notify.items
         ):
-            lwd_logger.warning("[cloud] ignore stale RangeNotify seqno=%d", notify.seqno)
+            lwd_logger.warning(
+                "[LWD][cloud] ignore stale RangeNotify seqno=%d", notify.seqno
+            )
             return
         latest = self._lwd_latest_seqnos.get(connection_id, -1)
         if notify.seqno <= latest:
             lwd_logger.info(
-                "[cloud] ignore duplicate RangeNotify seqno=%d", notify.seqno
+                "[LWD][cloud] ignore duplicate RangeNotify seqno=%d", notify.seqno
             )
             return
         items = notify.items
@@ -583,7 +587,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
         num_tokens = sum(item.num_tokens for item in items)
         lwd_logger.info(
-            "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
+            "[LWD][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
             notify.seqno,
             num_tokens,
             time.monotonic(),
@@ -656,7 +660,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 return
             raise RuntimeError(
-                f"[LWD] request_id {request_id} reused before previous generation drained"
+                f"[LWD] request_id {request_id} reused before previous "
+                "generation drained"
             )
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         if notify.prefix_nonce:
@@ -670,7 +675,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.structured_output_manager.grammar_init(request)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
-            "[cloud] request added req=%s tokens=%d nonce=%d",
+            "[LWD][cloud] request added req=%s tokens=%d nonce=%d",
             request_id,
             notify.num_prompt_tokens,
             notify.prefix_nonce,
@@ -682,7 +687,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if not self.engines_running and not native_dp_wake:
             self.engines_running = True
             lwd_logger.info(
-                "[cloud] first request wakes a paused wave (local fallback)"
+                "[LWD][cloud] first request wakes a paused wave (local fallback)"
             )
 
     def _lwd_handle_abort_notify(self, notify: LwdAbortNotify) -> None:
@@ -698,7 +703,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             return
         if current is not None and current != notify.prefix_nonce:
             lwd_logger.warning(
-                "[cloud] ignore stale abort req=%s nonce=%d current=%d",
+                "[LWD][cloud] ignore stale abort req=%s nonce=%d current=%d",
                 request_id,
                 notify.prefix_nonce,
                 current,
@@ -708,7 +713,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             return
         if current is None and retired is None and notify.prefix_nonce != 0:
             lwd_logger.warning(
-                "[cloud] ignore abort for unknown generation req=%s nonce=%d",
+                "[LWD][cloud] ignore abort for unknown generation req=%s nonce=%d",
                 request_id,
                 notify.prefix_nonce,
             )
@@ -720,7 +725,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             reservations.release(request_id)
         self._lwd_retire_request(request_id, preserve_prompt=True)
         lwd_logger.info(
-            "[cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
+            "[LWD][cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
         )
         self.aborts_queue.put_nowait([request_id])
         self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
@@ -943,7 +948,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     break
                 except Exception:
                     lwd_logger.exception(
-                        "[pre-recv] done MQ drain failed for %s", connection
+                        "[LWD][pre-recv] done MQ drain failed for %s", connection
                     )
                     break
                 if (
@@ -993,7 +998,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         for connection, _, seqno in advanced:
             self._lwd_complete_seqno(connection, seqno)
         lwd_logger.info(
-            "[Lwd][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
+            "[LWD][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
             len(watermark_items),
             advanced,
             time.monotonic(),
@@ -1007,7 +1012,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             return
         self._lwd_failed_connections.add(connection)
         lwd_logger.error(
-            "[pre-recv] connection %s failed at seqno=%s: %s",
+            "[LWD][pre-recv] connection %s failed at seqno=%s: %s",
             connection,
             seqno,
             error,
@@ -1050,7 +1055,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 self.scheduler.lwd_recv_rows[request_id] = rows
                 touched.append((request_id, previous, rows))
         if touched:
-            lwd_logger.info("[cloud] arrival high watermarks updated: %s", touched)
+            lwd_logger.info("[LWD][cloud] arrival high watermarks updated: %s", touched)
 
     def _lwd_log_cloud_concurrency(self) -> None:
         """Debug-level snapshot of this engine's concurrency: how many
@@ -1063,7 +1068,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         scheduler = self.scheduler
         block_pool = scheduler.kv_cache_manager.block_pool
         lwd_logger.debug(
-            "[Lwd][dbg] cloud concurrency cloud_id=%d engine=%d running=%d "
+            "[LWD][dbg] cloud concurrency cloud_id=%d engine=%d running=%d "
             "waiting=%d skipped=%d total=%d step=%d | kv_cache usage=%.1f%% "
             "free=%d total=%d",
             self.lwd_config.instance_id,
@@ -1100,7 +1105,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 assert peer is not None
                 restored = msgspec.structs.replace(
                     notify,
-                    req_ids=[unwrap_req_id(request_id) for request_id in notify.req_ids],
+                    req_ids=[
+                        unwrap_req_id(request_id) for request_id in notify.req_ids
+                    ],
                 )
                 self._lwd_send_until_queued(peer, restored)
                 # Finished routes stay pinned until every pending C2E has

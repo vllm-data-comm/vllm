@@ -59,6 +59,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
+    LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
     LwdRangeItem,
     LwdRangeNotify,
@@ -170,7 +171,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     # ------------------------------------------------------------- routing
 
-    def lwd_update_cloud_params(self, connection_id: LwdConnectionId, params) -> None:
+    def lwd_update_cloud_params(
+        self, connection_id: LwdConnectionId, params: LwdCloudParamsNotify
+    ) -> None:
         """Apply one cloud's HELLO parameters without mutating global config."""
         account = self._lwd_accounts[connection_id]
         account.num_speculative_tokens = max(0, params.num_speculative_tokens)

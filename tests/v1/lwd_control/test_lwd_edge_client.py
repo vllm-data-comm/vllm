@@ -30,7 +30,7 @@ class _Response:
         )
 
 
-def test_error_body_reads_the_content_stream():
+def test_error_body_reads_the_content_stream() -> None:
     response = _Response(b'{"error":"boom"}\n')
 
     body = asyncio.run(LwdEdgePrefixClient._read_error_body(response))

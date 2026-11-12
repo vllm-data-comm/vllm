@@ -23,7 +23,7 @@ from typing import Any
 
 from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
     LwdCoordClient,
 )
@@ -387,11 +387,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         for completion in self._lwd_probe_manager.drain():
             self._lwd_add_request_after_probe(completion.request, completion)
 
-    def step(self):
+    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         self._lwd_drain_probe_completions()
         return super().step()
 
-    def step_with_batch_queue(self):
+    def step_with_batch_queue(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
         self._lwd_drain_probe_completions()
         return super().step_with_batch_queue()
 

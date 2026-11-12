@@ -36,7 +36,8 @@ HEADER_ALIGNMENT_TOKENS = "X-Edge-Cloud-Alignment-Tokens"
 HEADER_MM_ABI = "X-Edge-Cloud-MM-ABI"
 HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
 HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
-# 云内 DP:probe 放置结果(选中引擎的云内 dp_rank);缺省 0 向后兼容
+# Cloud-local DP placement (the selected engine's dp_rank); zero preserves
+# compatibility with clouds that do not advertise this field.
 HEADER_ENGINE_INDEX = "X-Edge-Cloud-Engine-Index"
 
 _FULL_BLOCK_DOMAIN = b"\x01"
@@ -45,12 +46,13 @@ _MEDIA_BLOCK_DOMAIN = b"\x04"
 _MEDIA_TAIL_BLOCK_DOMAIN = b"\x05"
 _UINT32 = struct.Struct(">I")
 
-# 多模态 ABI 预留:image=1,audio/video 后续。不可在运行时改写。
+# Multimodal ABI modality IDs: image=1; audio/video are reserved for later.
+# This mapping must not change at runtime.
 _MODALITY_IDS = MappingProxyType({"image": 1})
 
 
 class _MediaItem(Protocol):
-    """Duck-typed media identity description (协议层保持纯 stdlib)。"""
+    """Duck-typed media identity; the protocol layer stays stdlib-only."""
 
     modality: str
     digest: bytes
@@ -59,7 +61,7 @@ class _MediaItem(Protocol):
 
 
 def encode_digest(digest: bytes) -> str:
-    """base64url(去填充)——摘要上线的唯一编码口径。"""
+    """Encode a digest as unpadded base64url for the wire protocol."""
     if len(digest) != DIGEST_SIZE:
         raise ValueError(f"digest must contain {DIGEST_SIZE} bytes")
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -140,11 +142,11 @@ class LwdPrefixManifest:
         return messages
 
     def to_headers(self) -> dict[str, str]:
-        """请求侧必需头(文档「Edge 向平台发送请求」表格口径)。
+        """Return headers required by the edge-to-cloud request protocol.
 
-        ``prompt_tokens`` 只走头:真实输入长度不在 body 里(网关 DTO 转换会
-        剥非标准字段),缺它云侧直接 400——所以它是 manifest 自带的一部分,
-        不靠调用方外挂。"""
+        ``prompt_tokens`` travels only in headers because gateway DTO
+        conversion strips non-standard body fields. It is therefore part of
+        the manifest rather than caller-supplied metadata."""
         return {
             HEADER_PROTOCOL: PROTOCOL_VERSION,
             HEADER_REQUEST_ID: self.request_id,
@@ -197,11 +199,10 @@ class LwdPrefixManifest:
             else:
                 raise ValueError("message content is not an edge-cloud hash")
 
-        # prompt_tokens 只从 header 取(与参考分支一致):NewAPI 等网关
-        # DTO 转换会剥掉 body 非标准字段。
-        # 严格十进制:不用 int() —— 它会收下 "+1024"/" 1024"/"1_0"/全角数字,
-        # 而这些"看着能解析"的值一旦落到 manifest 上,长度与摘要条数就不再
-        # 自证一致,错配只会表现为命中异常而不是 400。
+        # Read prompt_tokens only from headers because gateways may strip
+        # non-standard body fields. Require strict ASCII decimal digits:
+        # int() also accepts signs, whitespace, underscores, and non-ASCII
+        # digits, which would weaken manifest length/hash consistency checks.
         prompt_tokens_raw = normalized_headers.get(HEADER_PROMPT_TOKENS.lower())
         if prompt_tokens_raw is None:
             raise ValueError(f"missing required header {HEADER_PROMPT_TOKENS}")
@@ -292,16 +293,19 @@ class LwdPrefixHasher:
         prev_chain: Sequence[bytes],
         token_ids: Sequence[int],
     ) -> list[bytes]:
-        """增量续链(append-only):只对新增满块算 HMAC,消除逐步全量重建。
+        """Incrementally extend an append-only chain with newly full blocks.
 
-        prev_chain 为已建满块链(末元素即链式 parent,空链用种子);
-        token_ids 为全量序列(prompt+生成)。只对
-        [len(prev_chain)*block_size, N) 内的新满块哈希,返回新增摘要
-        (不含 prev_chain)。与 build_manifest 的全量块循环逐字节同源
-        (同域分隔符/同 parent 链式),产出链与全量重建逐位相等。
+        ``prev_chain`` contains existing full-block hashes (its last element is
+        the chained parent; an empty chain uses the seed). ``token_ids`` is the
+        complete prompt-plus-generation sequence. Only newly completed blocks
+        in [len(prev_chain) * block_size, N) are hashed, and only their new
+        digests are returned. This uses exactly the same domain separators and
+        parent chaining as ``build_manifest``, so incremental and full rebuilds
+        produce identical chains.
 
-        仅支持纯文本路径(无 media_items):生成段链场景不含多模态
-        覆盖项;带 media 的调用方须走 build_manifest 全量重建。"""
+        Only the text path is supported (no ``media_items``): generated-segment
+        chains have no multimodal coverage items. Callers with media must use
+        ``build_manifest`` for a full rebuild."""
         full_total = len(token_ids) // self.block_size
         done = len(prev_chain)
         if full_total <= done:
@@ -387,14 +391,18 @@ class LwdProbeResult:
     block_size: int
     hit_blocks: int
     hit_tokens: int
-    # 云侧命中对齐(coordinator.cache_hit_alignment_tokens:细粒度部署为压缩
-    # state 边界,如 128;否则 scheduler LCM):边侧按它对 probe 命中取整、
-    # 对 chunk 做 mamba 对齐重切。0 = 未公告(旧版云/降级),边侧不重切
+    # Cloud-side hit alignment (coordinator.cache_hit_alignment_tokens): a
+    # compressed-state boundary such as 128 for fine-grained deployments, or
+    # the scheduler LCM otherwise. The edge rounds probe hits down to it and
+    # re-chunks for mamba alignment. Zero means unadvertised (legacy cloud or
+    # degraded mode), so the edge does not re-chunk.
     alignment_tokens: int = 0
-    # 路由回执的云 id:多云选路时由中央调度器/网关填;None=单云或未启用选路
+    # Cloud ID in the routing reply: filled by the central scheduler/gateway
+    # for multi-cloud routing; None means one cloud or routing disabled.
     cloud_id: int | None = None
-    # 云内 DP 放置结果:命中/预留落在的云内引擎序号(dp_rank);0=单引擎或
-    # 旧版云(未公告),边侧路由登记按 0 处理,向后兼容
+    # Cloud-local DP placement: the engine index (dp_rank) holding the hit and
+    # reservation. Zero means single-engine or an older cloud that does not
+    # advertise placement; edge routing treats it as zero for compatibility.
     engine_index: int = 0
 
     def __post_init__(self) -> None:
@@ -430,8 +438,9 @@ class LwdProbeResult:
     ) -> dict[str, Any]:
         """Build the JSON object carried inside an OpenAI delta.content.
 
-        SSE 形态下 Probe 结果走 delta.content 而非响应头——网关 DTO
-        转换不会丢失消息体,响应头可能被吃掉。"""
+        In SSE mode, probe results use delta.content rather than response
+        headers because gateway DTO conversion preserves the message body but
+        may drop response headers."""
         message: dict[str, Any] = {
             "type": "edge_cloud_probe",
             "protocol": protocol,
