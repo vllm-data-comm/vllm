@@ -100,7 +100,7 @@ class LwdParallelGroupsSpec:
                     connection.connection_id,
                     connection.edge.ranks[0],
                     connection.cloud.ranks[
-                        connection.edge_id % len(connection.cloud.ranks)
+                        connection.connection_id.edge_id % len(connection.cloud.ranks)
                     ],
                 )
                 for connection in connections

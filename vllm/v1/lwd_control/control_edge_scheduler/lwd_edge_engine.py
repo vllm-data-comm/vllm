@@ -198,7 +198,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return next(
             connection
             for connection in self.lwd_config.connections
-            if (connection.cloud_id, connection.dp_idx)
+            if (connection.connection_id.cloud_id, connection.connection_id.dp_idx)
             == (peer.instance_id, peer.dp_rank)
         ).connection_id
 

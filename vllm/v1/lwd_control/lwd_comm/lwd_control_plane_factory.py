@@ -83,7 +83,9 @@ def _lwd_cloud_spec(
         config=lwd_config.topology.control_plane,
         expected_edge_ids=tuple(
             sorted(
-                c.edge_id for c in lwd_config.connections if c.dp_idx == dp_rank
+                c.connection_id.edge_id
+                for c in lwd_config.connections
+                if c.connection_id.dp_idx == dp_rank
             )
         ),
     )
@@ -111,6 +113,8 @@ def _lwd_edge_spec(
             if c.cloud.ctrl_port is not None
         ),
         connection_ids=tuple(c.connection_id for c in connections),
-        cloud_dp_sizes=tuple(cloud_dp_sizes[c.cloud_id] for c in connections),
+        cloud_dp_sizes=tuple(
+            cloud_dp_sizes[c.connection_id.cloud_id] for c in connections
+        ),
         config=lwd_config.topology.control_plane,
     )

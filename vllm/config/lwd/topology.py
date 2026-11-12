@@ -255,15 +255,9 @@ class LwdConnectionId:
 class LwdDPConnection:
     """One explicit instance link expanded at matching DP indices."""
 
-    edge_id: int
-    cloud_id: int
-    dp_idx: int
+    connection_id: LwdConnectionId
     edge: LwdDP
     cloud: LwdDP
-
-    @property
-    def connection_id(self) -> LwdConnectionId:
-        return LwdConnectionId(self.edge_id, self.cloud_id, self.dp_idx)
 
     @property
     def cloud_leader_rank(self) -> int:
@@ -305,6 +299,10 @@ class LwdTopology:
         # Exclude the derived digest field itself from the canonical payload.
         canonical = asdict(topology)
         canonical.pop("digest", None)
+        canonical["instance_links"] = sorted(
+            canonical["instance_links"],
+            key=lambda link: (link["edge"], link["cloud"]),
+        )
         encoded = json.dumps(
             canonical,
             sort_keys=True,
@@ -528,9 +526,7 @@ class LwdTopology:
             ):
                 result.append(
                     LwdDPConnection(
-                        link.edge,
-                        link.cloud,
-                        edge_dp.dp_idx,
+                        LwdConnectionId(link.edge, link.cloud, edge_dp.dp_idx),
                         edge_dp,
                         cloud_dp,
                     )

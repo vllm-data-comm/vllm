@@ -144,7 +144,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         connections = tuple(
             connection.connection_id
             for connection in vllm_config.lwd_config.connections
-            if connection.dp_idx == dp_idx
+            if connection.connection_id.dp_idx == dp_idx
         ) or (LwdConnectionId(0, vllm_config.lwd_config.instance_id, dp_idx),)
         self._lwd_hint_mqs = {
             connection: create_hint_mq(connection) for connection in connections
