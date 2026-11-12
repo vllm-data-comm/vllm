@@ -17,7 +17,6 @@ publishing) unchanged.
 
 from __future__ import annotations
 
-import json
 import queue
 import threading
 import time
@@ -71,18 +70,6 @@ _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_RETIRED_ROUTE_CAP = 4096
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
-
-
-def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
-    """Rebuild the frontend-validated structured-output parameters."""
-    if not payload:
-        return None
-    data = json.loads(payload)
-    backend = data.pop("_backend", None)
-    data.pop("_backend_was_auto", None)
-    params = StructuredOutputsParams(**data)
-    params._backend = backend
-    return params
 
 
 def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
@@ -149,7 +136,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_hint_mqs = {
             connection: create_hint_mq(connection) for connection in connections
         }
-        self._lwd_hint_mq = self._lwd_hint_mqs[connections[0]]
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
         # The cloud endpoint worker created its done-report MQ during
         # init_device; now that the executor is up, fetch its handle over
@@ -175,7 +161,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_done_mqs[connection] = MessageQueue.create_from_handle(
                 handles[0], 0
             )
-        self._lwd_done_mq = next(iter(self._lwd_done_mqs.values()))
         lwd_logger.info(
             "[pre-recv] %d hint MQ(s) created, done MQs attached via RPC",
             len(self._lwd_hint_mqs),
@@ -199,6 +184,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self.lwd_config.validate_prefix_caching(
             self.vllm_config.cache_config.enable_prefix_caching
         )
+        if self.vllm_config.model_config.skip_tokenizer_init:
+            # StructuredOutputManager builds its tokenizer and compile
+            # executor only with a tokenizer; without one the first
+            # constrained request would crash at grammar_init. Fail fast at
+            # startup instead (the cloud slice ships the tokenizer per F2
+            # metadata rules).
+            raise ValueError(
+                "[LWD] the cloud engine requires its tokenizer "
+                "(skip_tokenizer_init=True is not supported): grammar "
+                "compilation and the sampling bitmask happen on the cloud"
+            )
         self._lwd_init_prefix_cache()
         self._lwd_edges: set[LwdPeer] = set()
         self._lwd_prompt_lens: dict[str, int] = {}
@@ -668,7 +664,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         request = self._lwd_build_request(notify)
         if request.use_structured_output:
             # This path constructs Request directly and therefore bypasses
-            # EngineCore.preprocess_add_request, the native grammar-init hook.
+            # EngineCore.preprocess_add_request, the native grammar-init hook;
+            # without this explicit init the request would sit in
+            # WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR forever with no error.
             self.structured_output_manager.grammar_init(request)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
@@ -830,9 +828,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         sampling_params = SamplingParams(
             **values,
             skip_reading_prefix_cache=req_notify.skip_reading_prefix_cache,
-            structured_outputs=_lwd_decode_structured_outputs(
-                req_notify.structured_outputs
-            ),
         )
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         if req_notify.structured_outputs:
@@ -935,17 +930,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_drain_irecv_completions(self) -> None:
         """Merge every connection's done MQ into independent watermarks."""
-        done_mqs = getattr(self, "_lwd_done_mqs", None)
-        if not done_mqs:
-            return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             record_irecv_completions,
         )
 
         watermark_items: list[Any] = []
-        for connection, done_mq in done_mqs.items():
-            if done_mq is None:
-                continue
+        for connection, done_mq in self._lwd_done_mqs.items():
             while True:
                 try:
                     item = done_mq.dequeue(timeout=0)
@@ -958,27 +948,22 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     break
                 if (
                     isinstance(item, tuple)
-                    and item
+                    and len(item) == 3
                     and item[0] == "refill_done"
                 ):
-                    if len(item) == 2:
-                        self.scheduler.lwd_refill_done(str(item[1]))
-                    elif len(item) == 3:
-                        self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
+                    self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
                     continue
                 if (
                     isinstance(item, tuple)
                     and len(item) == 4
                     and item[1] == "error"
                 ):
+                    if item[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv error on "
+                            f"{connection}: {item!r}"
+                        )
                     self._lwd_fail_connection(connection, item[2], item[3])
-                    continue
-                if (
-                    isinstance(item, tuple)
-                    and len(item) == 3
-                    and item[0] == "error"
-                ):
-                    self._lwd_fail_connection(connection, item[1], item[2])
                     continue
                 if (
                     isinstance(item, tuple)
@@ -986,17 +971,27 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     and isinstance(item[0], tuple)
                 ):
                     key, arrived = item
+                    if len(key) != 3:
+                        raise ValueError(
+                            "[LWD] early-recv completion key must be "
+                            f"(connection, channel, seqno), got {key!r}"
+                        )
+                    if key[0] != connection:
+                        raise ValueError(
+                            f"[LWD] cross-connection early-recv completion on "
+                            f"{connection}: {item!r}"
+                        )
                     watermark_items.append(key)
-                    if len(key) == 3:
-                        self._lwd_note_arrived(key[0], key[2], arrived)
-                else:
-                    watermark_items.append(item)
+                    self._lwd_note_arrived(key[0], key[2], arrived)
+                    continue
+                raise ValueError(
+                    f"[LWD] unsupported early-recv completion item: {item!r}"
+                )
         if not watermark_items:
             return
         advanced = record_irecv_completions(watermark_items)
-        for item in advanced:
-            if len(item) == 3:
-                self._lwd_complete_seqno(item[0], item[2])
+        for connection, _, seqno in advanced:
+            self._lwd_complete_seqno(connection, seqno)
         lwd_logger.info(
             "[Lwd][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
             len(watermark_items),
