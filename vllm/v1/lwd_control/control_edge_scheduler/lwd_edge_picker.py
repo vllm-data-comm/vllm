@@ -62,7 +62,7 @@ def lwd_pick_prefill_batch(
 
     running holds resume candidates (in running order: finish in-flight
     requests before starting new ones); waiting holds new-start candidates
-    (the caller pre-joins skipped-first + the FCFS order of waiting).
+    (the caller joins KV-holding requests before the FCFS order of waiting).
     chunk_unit is the chunk unit C; each piece self-limits to
     c = min(remaining, C). cap < 1 returns an empty batch; the number of
     new requests is clamped by free_seq; tail truncation: the last entry

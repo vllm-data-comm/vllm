@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
@@ -13,17 +14,19 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     init_lwd_prefix_cache,
     prefix_start,
 )
+from vllm.v1.request import Request
 
 
-def _request(*, skip=False, computed=0, floor=None):
-    request = SimpleNamespace(
+def _request(
+    *, skip: bool = False, computed: int = 0, floor: int | None = None
+) -> Request:
+    request = Request(
         request_id="r",
-        num_prompt_tokens=64,
-        num_tokens=64,
-        num_computed_tokens=computed,
-        block_hashes=["a", "b"],
-        skip_reading_prefix_cache=skip,
+        prompt_token_ids=list(range(64)),
+        sampling_params=SamplingParams(skip_reading_prefix_cache=skip),
+        pooling_params=None,
     )
+    request.num_computed_tokens = computed
     if floor is not None:
         request.lwd_resume_cap_tokens = floor
     return request

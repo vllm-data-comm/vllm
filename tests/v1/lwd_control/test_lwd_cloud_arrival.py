@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import LwdBatch, LwdBatchType, SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
@@ -33,11 +34,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRequestNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
-
-class _Request(SimpleNamespace):
-    __hash__ = object.__hash__
+_RecvHint = tuple[tuple[int, ...], dict[str, object]]
 
 
 def _request(
@@ -48,26 +47,26 @@ def _request(
     preemptions: int = 0,
     skip: bool = False,
     floor: int = 0,
-):
-    return _Request(
+) -> Request:
+    request = Request(
         request_id=request_id,
-        num_prompt_tokens=prompt,
-        num_tokens=prompt,
-        num_computed_tokens=computed,
-        num_preemptions=preemptions,
-        block_hashes=[],
-        skip_reading_prefix_cache=skip,
-        lwd_resume_cap_tokens=floor,
-        is_finished=lambda: False,
-        lwd_window_cap=None,
+        prompt_token_ids=list(range(prompt)),
+        sampling_params=SamplingParams(skip_reading_prefix_cache=skip),
+        pooling_params=None,
     )
+    request.num_computed_tokens = computed
+    request.num_preemptions = preemptions
+    request.lwd_resume_cap_tokens = floor
+    request.lwd_window_cap = None
+    return request
 
 
 def _visible_set_scheduler(running, waiting) -> LwdBaseScheduler:
     scheduler = LwdBaseScheduler.__new__(LwdBaseScheduler)
     scheduler.running = running
     scheduler.waiting = FCFSRequestQueue(waiting)
-    scheduler.skipped_waiting = FCFSRequestQueue()
+    scheduler.kv_holding_waiting = FCFSRequestQueue()
+    scheduler.deferred_waiting = set()
     scheduler.requests = {r.request_id: r for r in running + waiting}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.max_num_running_reqs = len(running)
@@ -80,7 +79,8 @@ def _scheduler(request) -> LwdCloudScheduler:
     scheduler = LwdCloudScheduler.__new__(LwdCloudScheduler)
     scheduler.running = [request]
     scheduler.waiting = []
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     scheduler.requests = {request.request_id: request}
     scheduler.lwd_recv_rows = {}
     scheduler._lwd_dropped = set()
@@ -149,11 +149,24 @@ def test_fragment_waits_but_final_and_budget_limited_windows_run():
 def test_decode_exact_is_accounted_before_prefill_windows():
     scheduler = _scheduler(_request())
     scheduler.max_num_scheduled_tokens = 10
-    calls = []
+    calls: list[str | list[str] | int] = []
     out = SchedulerOutput.make_empty()
-    scheduler._lwd_collect_decode_requests = lambda: calls.append("decode") or ["d"]
-    scheduler._lwd_compute_decode_consumption = lambda ids: calls.append(ids) or 3
-    scheduler._lwd_collect_prefill_windows = lambda room: calls.append(room) or []
+
+    def collect_decode() -> list[str]:
+        calls.append("decode")
+        return ["d"]
+
+    def compute_decode(ids: list[str]) -> int:
+        calls.append(ids)
+        return 3
+
+    def collect_prefill(room: int) -> list[_LwdPrefillWindow]:
+        calls.append(room)
+        return []
+
+    scheduler._lwd_collect_decode_requests = collect_decode
+    scheduler._lwd_compute_decode_consumption = compute_decode
+    scheduler._lwd_collect_prefill_windows = collect_prefill
     scheduler._lwd_schedule = lambda ids: out
 
     assert scheduler._lwd_schedule_step() is out
@@ -341,17 +354,10 @@ def test_request_build_records_full_prompt_mrope():
     assert request.lwd_mrope_positions == b"positions"
 
 
-def test_range_notify_posts_only_extended_hint(monkeypatch):
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
+def test_range_notify_posts_only_extended_hint(lwd_pre_recv: SimpleNamespace) -> None:
     engine = _engine({"a": 8, "b": 6})
-    posted = []
-    monkeypatch.setattr(
-        lwd_pre_recv,
-        "make_recv_hint",
-        lambda *args, **kwargs: (args, kwargs),
-    )
-    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
+    posted: list[_RecvHint] = []
+    lwd_pre_recv.post_irecv_hint = posted.append
     notify = LwdRangeNotify(
         7,
         [
@@ -380,9 +386,9 @@ def test_range_notify_without_prompt_length_fails_fast():
         engine._lwd_handle_range_notify(notify)
 
 
-def test_done_arrivals_merge_by_max_and_keep_watermark_items(monkeypatch):
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
+def test_done_arrivals_merge_by_max_and_keep_watermark_items(
+    lwd_pre_recv: SimpleNamespace,
+) -> None:
     class DoneMq:
         def __init__(self):
             self.items = [("UP", 1), (("UP", 2), [("a", 4), ("b", 3)])]
@@ -396,12 +402,13 @@ def test_done_arrivals_merge_by_max_and_keep_watermark_items(monkeypatch):
     engine._lwd_done_mq = DoneMq()
     engine._lwd_track_range(1, ["a"])
     engine._lwd_track_range(2, ["a", "b"])
-    watermark = []
-    monkeypatch.setattr(
-        lwd_pre_recv,
-        "record_irecv_completions",
-        lambda items: watermark.extend(items) or list(items),
-    )
+    watermark: list[tuple[str, int]] = []
+
+    def record_completions(items: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        watermark.extend(items)
+        return list(items)
+
+    lwd_pre_recv.record_irecv_completions = record_completions
 
     engine._lwd_drain_irecv_completions()
     engine._lwd_track_range(3, ["b"])
@@ -466,21 +473,16 @@ def test_normal_finish_retires_from_outputs_and_cleans_after_drain():
     assert engine._lwd_request_seqnos == {}
 
 
-def test_abort_before_mixed_range_still_posts_complete_hint(monkeypatch):
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
+def test_abort_before_mixed_range_still_posts_complete_hint(
+    lwd_pre_recv: SimpleNamespace,
+) -> None:
     engine = _engine({"a": 8, "b": 6})
     engine.aborts_queue = queue.Queue()
     engine.input_queue = queue.Queue()
     engine._lwd_track_range(6, ["a"])
     engine._lwd_handle_abort_notify(LwdAbortNotify("a"))
-    posted = []
-    monkeypatch.setattr(
-        lwd_pre_recv,
-        "make_recv_hint",
-        lambda *args, **kwargs: (args, kwargs),
-    )
-    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
+    posted: list[_RecvHint] = []
+    lwd_pre_recv.post_irecv_hint = posted.append
     notify = LwdRangeNotify(
         7,
         [LwdRangeItem("a", 2, 3), LwdRangeItem("b", 1, 2)],
@@ -520,9 +522,9 @@ def test_drained_retirement_allows_same_id_reuse(retire_kind):
     assert engine.scheduler.lwd_recv_rows == {"p": 4}
 
 
-def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch) -> None:
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
+def test_early_reuse_error_ready_late_messages_and_resubmit(
+    lwd_pre_recv: SimpleNamespace,
+) -> None:
     engine = _engine({"p": 4})
     engine._lwd_request_nonces["p"] = 1
     engine._lwd_track_range(1, ["p"])
@@ -530,11 +532,8 @@ def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch) -> None
     _allow_request_add(engine)
     engine.aborts_queue = queue.Queue()
     engine._lwd_send_prefix_ready = Mock()
-    posted = []
-    monkeypatch.setattr(
-        lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
-    )
-    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
+    posted: list[_RecvHint] = []
+    lwd_pre_recv.post_irecv_hint = posted.append
 
     engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
 
@@ -571,20 +570,17 @@ def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch) -> None
     assert engine._lwd_pending_seqnos == {2: {"p"}}
 
 
-def test_rejected_range_does_not_block_other_seqnos(monkeypatch) -> None:
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
+def test_rejected_range_does_not_block_other_seqnos(
+    lwd_pre_recv: SimpleNamespace,
+) -> None:
     engine = _engine({"p": 4, "q": 6})
     engine._lwd_request_nonces.update({"p": 1, "q": 1})
     engine._lwd_track_range(1, ["p"])
     engine._lwd_retire_request("p", preserve_prompt=True)
     _allow_request_add(engine)
     engine._lwd_send_prefix_ready = Mock()
-    posted = []
-    monkeypatch.setattr(
-        lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
-    )
-    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
+    posted: list[_RecvHint] = []
+    lwd_pre_recv.post_irecv_hint = posted.append
     engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
     engine._lwd_handle_range_notify(
         LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
@@ -638,9 +634,9 @@ def test_finish_without_pending_clears_retired_state_immediately():
     assert engine._lwd_prompt_lens == {}
 
 
-def test_worker_error_fails_engine_without_advancing_watermark(monkeypatch):
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
+def test_worker_error_fails_engine_without_advancing_watermark(
+    lwd_pre_recv: SimpleNamespace,
+) -> None:
     class DoneMq:
         def __init__(self):
             self.items = [("error", 9, "boom"), ("UP", 10)]
@@ -652,14 +648,10 @@ def test_worker_error_fails_engine_without_advancing_watermark(monkeypatch):
 
     engine = _engine()
     engine._lwd_done_mq = DoneMq()
-    failures = []
+    failures: list[str] = []
     engine._lwd_fail = failures.append
-    watermark = []
-    monkeypatch.setattr(
-        lwd_pre_recv,
-        "record_irecv_completions",
-        lambda items: watermark.extend(items),
-    )
+    watermark: list[tuple[str, int]] = []
+    lwd_pre_recv.record_irecv_completions = watermark.extend
 
     engine._lwd_drain_irecv_completions()
     assert len(failures) == 1

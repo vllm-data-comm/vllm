@@ -147,7 +147,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # _get_mrope_input_positions (cache the method itself rather than
         # the model class so the semantics stay direct; validated on first
         # use, unsupported families fail fast).
-        self._lwd_mrope_positions_fn = None
+        self._lwd_mrope_positions_fn: Callable[..., tuple[torch.Tensor, int]] | None = (
+            None
+        )
         # Chunk unit C = min(remaining, C): taken from the local
         # long_prefill_token_threshold (native truncation boundary,
         # naturally reproduced on both sides); when unset (<=0), falls back
@@ -461,7 +463,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
-            if finished_now:
+            if finish_reason is not None:
                 # The ground truth of the cloud's stop decision lands here:
                 # native finish settles the account (KV/cache release and
                 # the finished_req_ids handover all go through the native
@@ -521,7 +523,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             LwdPrefillCandidate(
                 r.request_id, r.num_prompt_tokens, r.num_computed_tokens
             )
-            for r in [*self.skipped_waiting, *self.waiting]
+            for r in [*self.kv_holding_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
             and lwd_grammar_ready(
                 r, RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
@@ -537,12 +539,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return req_ids, expected, cap
 
     def _lwd_schedule_batch(self, dp_idx: int) -> SchedulerOutput:
-        """Chunk batch assembly: the picker selects the batch of one engine,
-        scheduled via the base-class visible-set mechanism (budget clamped
-        to that engine's cap; the chunk split is guaranteed by the clamping
-        parameters to be reproduced natively)."""
-        req_ids, _expected, cap = self._lwd_pick_prefill_batch(dp_idx)
-        return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        """Schedule one engine's picked batch within its per-request chunk caps."""
+        req_ids, expected, cap = self._lwd_pick_prefill_batch(dp_idx)
+        windows = [(self.requests[req_id], expected[req_id]) for req_id in req_ids]
+        # Native single-request/adaptive thresholds must not enlarge picker chunks.
+        for request, num_rows in windows:
+            request.lwd_window_cap = num_rows
+        try:
+            return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        finally:
+            for request, _ in windows:
+                request.lwd_window_cap = None
 
     def _try_schedule_encoder_inputs(
         self,
@@ -551,11 +558,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_new_tokens: int,
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
-    ) -> tuple[list[int], int, int, list[int]]:
+    ) -> tuple[list[int], int, int, list[int], list[int]]:
         """Edge-side passthrough: encoder execution and caching are managed
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
-        return [], num_new_tokens, encoder_compute_budget, []
+        return [], num_new_tokens, encoder_compute_budget, [], []
 
     def _lwd_has_prefill_chunk_inflight(self, dp_idx: int) -> bool:
         """Whether dp_idx has an embed request not fully sent; same
@@ -571,7 +578,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_request_active(self, request_id: str) -> bool:
         if request_id in self._lwd_route or request_id in self.requests:
             return True
-        announced = getattr(self, "_lwd_announced_refills", set())
+        announced: set[tuple[int, int]] = getattr(self, "_lwd_announced_refills", set())
         return any(
             (account.dp_idx, seqno) in announced and request_id in request_ids
             for account in self._lwd_accounts
@@ -626,7 +633,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         if not self._lwd_request_has_mm(request):
             return
-        if self._lwd_mrope_positions_fn is None:
+        fn = self._lwd_mrope_positions_fn
+        if fn is None:
             from vllm.model_executor.models import ModelRegistry
 
             model_cls, _ = ModelRegistry.resolve_model_cls(
@@ -646,8 +654,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
+        if TYPE_CHECKING:
+            assert request.prompt_token_ids is not None
         _t_mrope = time.monotonic()
-        positions, _delta = self._lwd_mrope_positions_fn(
+        positions, _delta = fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
             config=self.vllm_config.model_config.hf_config,
@@ -803,7 +813,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             return SchedulerOutput.make_empty()
 
-        start = meta.prompt_offsets[0]
+        # Refill outputs are queued as EMBED batches.
+        start = meta.prompt_offsets[0]  # type: ignore[union-attr]
         item = LwdRangeItem(
             request_id=request_id,
             offset=start,
@@ -869,8 +880,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
             )
             req_ids.append(request_id)
+            # Edge admission rejects client-provided prompt embeddings.
             token_slices.append(
-                list(request.prompt_token_ids[offset : offset + num_tokens])
+                list(request.prompt_token_ids[offset : offset + num_tokens])  # type: ignore[index]
             )
             prompt_offsets.append(offset)
             has_mrope.append(req_has_mrope)
@@ -968,6 +980,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params
+        if TYPE_CHECKING:
+            assert sp is not None
         unsupported = [
             name
             for name, value in (
@@ -1007,6 +1021,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id})"
             )
         mm_config = self.vllm_config.model_config.multimodal_config
+        if TYPE_CHECKING:
+            assert mm_config is not None
         if mm_config.is_multimodal_pruning_enabled():
             raise ValueError(
                 "[LWD] prefill-only mode does not support multimodal "

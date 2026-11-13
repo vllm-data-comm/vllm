@@ -9,6 +9,9 @@ root 传播(避免与 vllm.logger 双发)。完整链需 vllm.envs(Python>=3.10)
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -34,7 +37,7 @@ def test_prefix_filter_prepends_lwd_tag():
     """_LwdPrefixFilter 契约:消息前缀 "[lwd] ",% 参数就地消费。"""
     record = lwd_logger_mod.lwd_logger.makeRecord(
         "vllm.lwd", logging.INFO, __file__, 1,
-        "hello %s", ("world", None), None,
+        "hello %s", ("world",), None,
     )
     for handler in lwd_logger_mod.lwd_logger.handlers:
         for flt in handler.filters:
@@ -50,3 +53,42 @@ def test_level_table_disable_above_critical():
     levels = lwd_logger_mod._LWD_LOG_LEVELS
     assert levels["DISABLE"] == logging.CRITICAL + 1
     assert levels["INFO"] == logging.INFO
+
+
+@pytest.mark.parametrize("lwd_level", [None, "DEBUG"])
+def test_native_reconfiguration_preserves_independent_lwd_output(
+    lwd_level: str | None,
+) -> None:
+    env = os.environ.copy()
+    env.update(
+        VLLM_CONFIGURE_LOGGING="1",
+        VLLM_LOGGING_LEVEL="ERROR",
+        VLLM_LOGGING_STREAM="ext://sys.stdout",
+        VLLM_LOGGING_COLOR="0",
+        VLLM_LOGGING_PREFIX="",
+        NO_COLOR="1",
+    )
+    env.pop("VLLM_LWD_LOG_LEVEL", None)
+    env.pop("VLLM_LOGGING_CONFIG_PATH", None)
+    if lwd_level is not None:
+        env["VLLM_LWD_LOG_LEVEL"] = lwd_level
+    script = """
+import vllm.logger as native
+import vllm.lwd_logger as lwd
+
+names = ('vllm.lwd', 'vllm.v1.lwd_control.reconfiguration_probe')
+loggers = [lwd.init_lwd_logger(name) for name in names]
+for iteration in range(2):
+    native._configure_vllm_root_logger()
+    for index, logger in enumerate(loggers):
+        logger.debug('debug-probe-%d-%d', iteration, index)
+        logger.critical('critical-probe-%d-%d', iteration, index)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected_count = 4 if lwd_level == "DEBUG" else 0
+    for marker in ("debug-probe-", "critical-probe-"):
+        assert result.stdout.count(marker) == expected_count
+        assert result.stdout.count("[lwd] " + marker) == expected_count

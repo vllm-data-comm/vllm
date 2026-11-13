@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """lwd_control 单测装载垫片。
 
 真实环境(Python >=3.10 且 torch 在)一切原生 import;无 torch 的
@@ -14,6 +17,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VLLM_PKG_DIR = REPO_ROOT / "vllm"
 
@@ -21,3 +26,15 @@ if importlib.util.find_spec("torch") is None and "vllm" not in sys.modules:
     stub = types.ModuleType("vllm")
     stub.__path__ = [str(VLLM_PKG_DIR)]
     sys.modules["vllm"] = stub
+
+
+@pytest.fixture
+def lwd_pre_recv(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
+    """Substitute the Ascend receive module so CPU tests can exercise the engine."""
+    module = types.SimpleNamespace(
+        make_recv_hint=lambda *args, **kwargs: (args, kwargs)
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv", module
+    )
+    return module

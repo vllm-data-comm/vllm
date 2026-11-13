@@ -137,7 +137,7 @@ def test_prefill_cap_does_not_reserve_inflight_spec_tokens() -> None:
     scheduler._lwd_accounts[0].prefill_load = 12
     scheduler._lwd_chunk_unit = 128
     scheduler.running = []
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
     scheduler.waiting = []
     scheduler.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="test"))
