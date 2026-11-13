@@ -8,15 +8,33 @@ from lwd_config_under_test import LwdTopology
 from sample_topologies import PAYLOADS, topology_payload
 
 
+def with_required_coordination(raw: dict) -> dict:
+    if raw["deployment"]["scene"] not in ("cloud_share", "lwd_cluster"):
+        return raw
+    control_url = {
+        cloud["id"]: f"http://{cloud['dp'][0]['addr']}:8100/v1/chat/completions"
+        for cloud in raw["clouds"]
+    }
+    for edge in raw["edges"]:
+        edge["coordination"] = {
+            "enabled": True,
+            "control_url": control_url,
+            "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
+        }
+    for cloud in raw["clouds"]:
+        cloud["coordination"] = {"enabled": True}
+    return raw
+
+
 def cloud_reuse(dp: int = 2) -> dict:
-    return topology_payload(f"s3_cloud_share_{dp}dp.yaml")
+    return with_required_coordination(topology_payload(f"s3_cloud_share_{dp}dp.yaml"))
 
 
 @pytest.mark.parametrize("name", sorted(PAYLOADS))
-def test_original_eight_layouts_keep_rank_and_link_contract(
-    name: str, lwd_yaml_dir: Path
-) -> None:
-    topology = LwdTopology.from_file(str(lwd_yaml_dir / name))
+def test_original_eight_layouts_keep_rank_and_link_contract(name: str) -> None:
+    topology = LwdTopology.from_dict(
+        with_required_coordination(topology_payload(name))
+    )
     expected = {
         "single_instance": (9, 1),
         "edge_share": (17, 2),
@@ -245,7 +263,7 @@ def host_payload(name: str = "s2_edge_share_2dp.yaml") -> dict:
         for dp in cloud["dp"]:
             dp["data_port"] = port
             port += 1
-    return raw
+    return with_required_coordination(raw)
 
 
 @pytest.mark.parametrize("name", HOST_SAMPLES)
