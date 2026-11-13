@@ -100,9 +100,7 @@ def _lwd_edge_spec(
     connects to the cloud DP rank of DP index i.
     """
     connections = sorted(lwd_config.connections, key=lambda c: c.connection_id)
-    cloud_dp_sizes = {
-        cloud.id: len(cloud.dp) for cloud in lwd_config.topology.clouds
-    }
+    cloud_dp_sizes = {cloud.id: len(cloud.dp) for cloud in lwd_config.topology.clouds}
     return LwdEdgeControlPlaneSpec(
         instance_id=lwd_config.instance_id,
         dp_rank=dp_rank,

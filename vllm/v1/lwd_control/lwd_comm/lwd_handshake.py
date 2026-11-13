@@ -7,8 +7,8 @@ The edge registers with `LwdLinkHello` until the cloud answers with
 sessions for its declared edges.
 """
 
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import (
     LWD_LINK_PROTOCOL_VERSION,

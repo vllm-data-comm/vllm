@@ -81,9 +81,12 @@ class LwdAPIConfig:
                 "[LWD] API attachment cannot be combined with "
                 "--data-parallel-multi-port-external-lb"
             )
-        if requested and (count := getattr(args, "api_server_count", None)) is not None:
-            if count < 1:
-                raise ValueError("[LWD] --api-server-count must be positive")
+        if (
+            requested
+            and (count := getattr(args, "api_server_count", None)) is not None
+            and count < 1
+        ):
+            raise ValueError("[LWD] --api-server-count must be positive")
 
     @classmethod
     def from_namespace(cls, args: Any, *, headless: bool = False) -> "LwdAPIConfig":

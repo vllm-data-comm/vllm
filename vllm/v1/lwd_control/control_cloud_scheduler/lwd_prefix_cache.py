@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from math import lcm
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

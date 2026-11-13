@@ -2576,9 +2576,7 @@ def test_full_attention_partial_hit_with_alignment_multiple_of_hash_unit():
     coordinator.enable_partial_hash_hits = True
     monkeypatch_ok = type(coordinator)._cache_hit_alignment_tokens
     try:
-        type(coordinator)._cache_hit_alignment_tokens = property(
-            lambda self: alignment
-        )
+        type(coordinator)._cache_hit_alignment_tokens = property(lambda self: alignment)
         for mgr in coordinator.single_type_managers:
             mgr.cache_hit_alignment_tokens = alignment
 
@@ -2650,6 +2648,4 @@ def test_full_attention_partial_hit_with_alignment_multiple_of_hash_unit():
     finally:
         type(coordinator)._cache_hit_alignment_tokens = monkeypatch_ok
         for mgr in coordinator.single_type_managers:
-            mgr.cache_hit_alignment_tokens = (
-                coordinator.scheduler_block_size or 1
-            )
+            mgr.cache_hit_alignment_tokens = coordinator.scheduler_block_size or 1

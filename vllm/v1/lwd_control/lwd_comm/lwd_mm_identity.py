@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Processor fingerprints and MM-ABI identities for multimodal hash chaining.
 
@@ -65,8 +68,7 @@ def validate_mm_abi_header(value: str | None) -> str:
     declared, separator, encoded = value.partition(":")
     if not separator or declared != MM_ABI_VERSION or not encoded:
         raise ValueError(
-            f"{HEADER_MM_ABI} must be "
-            f"'{MM_ABI_VERSION}:<base64url fingerprint>'"
+            f"{HEADER_MM_ABI} must be '{MM_ABI_VERSION}:<base64url fingerprint>'"
         )
     # decode_digest also validates the 32-byte length.
     decode_digest(encoded)
@@ -114,9 +116,7 @@ def compute_processor_fingerprint(model_config: Any) -> bytes:
         "hf_image_processor_config": getattr(
             model_config, "hf_image_processor_config", None
         ),
-        "mm_hasher_algorithm": getattr(
-            envs, "VLLM_MM_HASHER_ALGORITHM", None
-        ),
+        "mm_hasher_algorithm": getattr(envs, "VLLM_MM_HASHER_ALGORITHM", None),
         "software_versions": {
             package: _package_version(package)
             for package in _PROCESSOR_SOFTWARE_PACKAGES
@@ -130,8 +130,7 @@ def compute_processor_fingerprint(model_config: Any) -> bytes:
             # absent so both sides hash the same values.
             value = getattr(model_config, field, None)
         payload[field] = value
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                           default=repr)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
     return hashlib.sha256(canonical.encode("utf-8")).digest()
 
 
@@ -171,9 +170,7 @@ def _config_hash(
 
 def _scrub_name_or_path(value: Any, seen: set[int]) -> None:
     """Recursively replace HF ``_name_or_path`` values with a placeholder."""
-    if value is None or isinstance(
-        value, (bool, int, float, str, bytes)
-    ):
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return
     identity = id(value)
     if identity in seen:

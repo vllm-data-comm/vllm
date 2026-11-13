@@ -146,7 +146,9 @@ class LwdEdgeControlPlaneSpec(LwdControlPlaneSpec):
             )
         if not self.cloud_dp_sizes:
             object.__setattr__(
-                self, "cloud_dp_sizes", (len(self.cloud_endpoints),) * len(self.cloud_endpoints)
+                self,
+                "cloud_dp_sizes",
+                (len(self.cloud_endpoints),) * len(self.cloud_endpoints),
             )
         if not (
             len(self.cloud_endpoints)
@@ -515,12 +517,15 @@ class LwdControlPlane(ABC):
 
     def _on_peer_unreachable(self, peer: LwdPeer) -> None:
         """Role hook for immediate ROUTER disconnect notification."""
+        return None
 
     def _unregister_peer(self, peer: LwdPeer, reason: str) -> None:
         self._registered_peers.discard(peer)
         self._held.pop(peer, None)
         self._held_since.pop(peer, None)
-        logger.warning("[LWD][control-plane] %s: peer %s down: %s", self._label, peer, reason)
+        logger.warning(
+            "[LWD][control-plane] %s: peer %s down: %s", self._label, peer, reason
+        )
         callback = getattr(self._listener, "on_peer_down", None)
         if callback is not None:
             callback(peer)
@@ -713,7 +718,9 @@ class LwdEdgeControlPlane(LwdControlPlane):
             self._register_peer(cloud)
 
     def _fail_handshake(self, reason: str) -> None:
-        logger.error("[LWD][control-plane] %s: handshake failed: %s", self._label, reason)
+        logger.error(
+            "[LWD][control-plane] %s: handshake failed: %s", self._label, reason
+        )
         self._handshake_error = reason
         self._settled.set()
         self._stop.set()
@@ -756,9 +763,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
                 continue
             hello = lwd_encode_link_message(handshake.hello)
             link_index = self._link_indices[connection_id]
-            if not transport.send(
-                LwdFrameKind.LINK, hello, str(link_index).encode()
-            ):
+            if not transport.send(LwdFrameKind.LINK, hello, str(link_index).encode()):
                 continue  # Cloud not connected yet; retried on the next tick.
             handshake.on_hello_sent(now)
             self._num_hellos_sent += 1

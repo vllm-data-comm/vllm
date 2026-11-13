@@ -179,9 +179,7 @@ def compute_attach_config_payload(
 
     plan = plan or resolve_attach_plan(args)
     assert plan is not None
-    payload = jsonify_non_default_args(
-        args, exclude=set(_ATTACH_CONFIG_EXCLUDE_KEYS)
-    )
+    payload = jsonify_non_default_args(args, exclude=set(_ATTACH_CONFIG_EXCLUDE_KEYS))
     payload["lwd_topology_digest"] = plan.topology_digest
     payload["lwd_additional_config"] = _canonical_additional_config(plan)
     return payload
@@ -318,9 +316,7 @@ class FrontendAttachServer:
         while len(self._reported) < self.expected_attaches:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                missing = sorted(
-                    set(range(1, self.client_count)) - set(self._reported)
-                )
+                missing = sorted(set(range(1, self.client_count)) - set(self._reported))
                 raise RuntimeError(
                     f"Timed out waiting for LWD attach frontends; missing "
                     f"client indices: {missing}"
@@ -372,8 +368,10 @@ class FrontendAttachServer:
         reply: Callable[[dict[str, Any]], None],
     ) -> None:
         index = message.get("client_index")
-        if not isinstance(index, int) or isinstance(index, bool) or not (
-            1 <= index < self.client_count
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not (1 <= index < self.client_count)
         ):
             reply(
                 {
@@ -404,8 +402,10 @@ class FrontendAttachServer:
             return
         listen_host = message.get("listen_host")
         listen_port = message.get("listen_port")
-        if not isinstance(listen_host, str) or not listen_host or not isinstance(
-            listen_port, int
+        if (
+            not isinstance(listen_host, str)
+            or not listen_host
+            or not isinstance(listen_port, int)
         ):
             reply({"type": _MSG_ERROR, "reason": "invalid API listen address"})
             return

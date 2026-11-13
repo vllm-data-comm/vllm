@@ -70,9 +70,7 @@ class LwdParallelGroupsSpec:
         # edge_share has several logical frontend IDs but exactly one edge
         # engine/allocation. Only that engine joins the shared world; its
         # attach-only API processes do not create parallel groups.
-        edge_instances = (
-            topology.edges[:1] if scene == "edge_share" else topology.edges
-        )
+        edge_instances = topology.edges[:1] if scene == "edge_share" else topology.edges
         edge_allocations = [edge.dp[0].ranks for edge in edge_instances]
         cloud_allocations = [dp.ranks for cloud in topology.clouds for dp in cloud.dp]
         seen: set[int] = set()

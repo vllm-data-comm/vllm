@@ -120,12 +120,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_instance_id = lwd_config.instance_id
-        self._lwd_edge_share = (
-            lwd_config.topology.deployment.scene == "edge_share"
-        )
-        connections = tuple(
-            sorted(c.connection_id for c in lwd_config.connections)
-        )
+        self._lwd_edge_share = lwd_config.topology.deployment.scene == "edge_share"
+        connections = tuple(sorted(c.connection_id for c in lwd_config.connections))
         self._lwd_connections = connections
         self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
             connection_id: LwdCloudDpAccount(connection_id)
@@ -146,9 +142,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # c2e notify queue: appended by the control-plane IO thread with the
         # delivering link's dp_idx, consumed within a scheduling step to
         # produce an UNEMBED batch
-        self.unembed_notify_queue: deque[
-            tuple[LwdConnectionId, LwdC2eNotify]
-        ] = deque()
+        self.unembed_notify_queue: deque[tuple[LwdConnectionId, LwdC2eNotify]] = deque()
         # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
         # tensor, computed once at admission and sent in RequestNotify);
         # removed on embedding completion/abort. Key present = has_mrope is

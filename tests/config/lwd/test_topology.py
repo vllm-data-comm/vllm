@@ -32,9 +32,7 @@ def cloud_reuse(dp: int = 2) -> dict:
 
 @pytest.mark.parametrize("name", sorted(PAYLOADS))
 def test_original_eight_layouts_keep_rank_and_link_contract(name: str) -> None:
-    topology = LwdTopology.from_dict(
-        with_required_coordination(topology_payload(name))
-    )
+    topology = LwdTopology.from_dict(with_required_coordination(topology_payload(name)))
     expected = {
         "single_instance": (9, 1),
         "edge_share": (17, 2),

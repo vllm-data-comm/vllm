@@ -160,8 +160,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         lwd_logger.info(
             "[Lwd][conc] total=%d running=%d waiting=%d decode_ready=%d "
             "prefill_inflight=%d avail_rows=%d ledger=%d budget=%d",
-            total, running, waiting, decode_ready,
-            prefill_inflight, avail_rows, len(ledger),
+            total,
+            running,
+            waiting,
+            decode_ready,
+            prefill_inflight,
+            avail_rows,
+            len(ledger),
             self.max_num_scheduled_tokens,
         )
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
@@ -293,8 +298,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         pending = self._lwd_refill_pending.get(request_id)
         request = self.requests.get(request_id)
         current_nonce = getattr(request, "lwd_prefix_nonce", 0) if request else 0
-        if pending is None or prefix_nonce != pending.prefix_nonce or (
-            request is not None and current_nonce != pending.prefix_nonce
+        if (
+            pending is None
+            or prefix_nonce != pending.prefix_nonce
+            or (request is not None and current_nonce != pending.prefix_nonce)
         ):
             lwd_logger.warning(
                 "[cloud-sched] stale refill_done req=%s nonce=%d ignored",
@@ -324,7 +331,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
             start = self._lwd_prefill_group_cursor % len(edge_ids)
             self._lwd_prefill_group_cursor = start + 1
             edge_ids = edge_ids[start:] + edge_ids[:start]
-        ordered = itertools.chain.from_iterable(grouped[edge_id] for edge_id in edge_ids)
+        ordered = itertools.chain.from_iterable(
+            grouped[edge_id] for edge_id in edge_ids
+        )
         for request in ordered:
             if room <= 0:
                 break
@@ -436,9 +445,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             request.num_output_placeholders -= len(new_token_ids)
             assert request.num_output_placeholders >= 0
         if status_before_update == RequestStatus.RUNNING:
-            self.kv_cache_manager.cache_blocks(
-                request, self._lwd_cache_tokens(request)
-            )
+            self.kv_cache_manager.cache_blocks(request, self._lwd_cache_tokens(request))
         return new_token_ids, stopped
 
     def finish_requests(
@@ -525,7 +532,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         else:
             carrier = getattr(model_runner_output, "lwd_down_carrier", None)
             if carrier is not None:
-                self._lwd_append_carrier_c2e(carrier, engine_core_outputs, nonce_snapshot)
+                self._lwd_append_carrier_c2e(
+                    carrier, engine_core_outputs, nonce_snapshot
+                )
             elif LwdControlDiag.disable_down_enabled():
                 self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
         return engine_core_outputs

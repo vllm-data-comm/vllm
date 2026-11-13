@@ -44,8 +44,8 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
@@ -205,9 +205,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_rejected_nonces: dict[str, int] = {}
         self._lwd_request_routes: dict[str, LwdPeer] = {}
         self._lwd_retired_routes: dict[str, LwdPeer] = {}
-        self._lwd_pending_seqnos: dict[
-            LwdConnectionId, dict[int, set[str]]
-        ] = {}
+        self._lwd_pending_seqnos: dict[LwdConnectionId, dict[int, set[str]]] = {}
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqnos: dict[LwdConnectionId, int] = {}
         self._lwd_failed_connections: set[LwdConnectionId] = set()
@@ -341,9 +339,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
         self._lwd_send_until_queued(
             peer,
-            LwdPrefixReadyNotify(
-                unwrap_req_id(request_id), hit_tokens, nonce, error
-            ),
+            LwdPrefixReadyNotify(unwrap_req_id(request_id), hit_tokens, nonce, error),
         )
         lwd_logger.info(
             "[LWD][prefix] READY req=%s hit=%d nonce=%d error=%r",
@@ -617,15 +613,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         request_ids: list[str],
     ) -> None:
         self._lwd_latest_seqnos[connection_id] = seqno
-        self._lwd_pending_seqnos.setdefault(connection_id, {})[seqno] = set(
-            request_ids
-        )
+        self._lwd_pending_seqnos.setdefault(connection_id, {})[seqno] = set(request_ids)
         for request_id in request_ids:
             self._lwd_request_seqnos.setdefault(request_id, set()).add(seqno)
 
-    def _lwd_complete_seqno(
-        self, connection_id: LwdConnectionId, seqno: int
-    ) -> None:
+    def _lwd_complete_seqno(self, connection_id: LwdConnectionId, seqno: int) -> None:
         pending_by_seqno = self._lwd_pending_seqnos.get(connection_id)
         if pending_by_seqno is None:
             return
@@ -958,11 +950,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 ):
                     self.scheduler.lwd_refill_done(str(item[1]), int(item[2]))
                     continue
-                if (
-                    isinstance(item, tuple)
-                    and len(item) == 4
-                    and item[1] == "error"
-                ):
+                if isinstance(item, tuple) and len(item) == 4 and item[1] == "error":
                     if item[0] != connection:
                         raise ValueError(
                             f"[LWD] cross-connection early-recv error on "
@@ -1113,10 +1101,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 # Finished routes stay pinned until every pending C2E has
                 # flushed; later zero-accepted/retirement notices are legal.
                 for index, request_id in enumerate(notify.req_ids):
-                    if (
-                        notify.finish_reasons
-                        and notify.finish_reasons[index] != -1
-                    ):
+                    if notify.finish_reasons and notify.finish_reasons[index] != -1:
                         finished_ids.append(request_id)
             self.scheduler.pending_c2e.clear()
             for request_id in finished_ids:

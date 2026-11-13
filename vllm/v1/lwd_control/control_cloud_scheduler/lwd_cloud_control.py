@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Cloud-side prefix negotiation HTTP control plane (SSE gateway form).
 
@@ -139,9 +142,7 @@ class LwdCloudControlBridge:
         exit could only hard-kill the daemon dispatch thread."""
         self._closed = True
         with self._lock:
-            pending = [
-                *self._probe_futures.values(), *self._usage_futures.values()
-            ]
+            pending = [*self._probe_futures.values(), *self._usage_futures.values()]
             self._probe_futures.clear()
             self._usage_futures.clear()
             loop = self._loop
@@ -220,21 +221,27 @@ class LwdCloudControlBridge:
         if stale_probe is not None or stale_usage is not None:
             logger.warning(
                 "[LWD][ctrl] duplicate control request req=%s: superseding "
-                "the previous registration", request_id,
+                "the previous registration",
+                request_id,
             )
             if stale_usage is not None and not stale_usage.done():
                 stale_usage.set_result(None)
             if stale_probe is not None and not stale_probe.done():
-                stale_probe.set_exception(RuntimeError(
-                    f"control request {request_id} superseded by a newer probe"))
+                stale_probe.set_exception(
+                    RuntimeError(
+                        f"control request {request_id} superseded by a newer probe"
+                    )
+                )
         # [LWD][perf] I8a: t_cmd is command submission time in the parent
         # (CLOCK_MONOTONIC). Parent and child share a host clock; never compare
         # edge and cloud timestamps across nodes.
-        self._command_queue.put({
-            "type": "probe",
-            "manifest": manifest,
-            "t_cmd": time.monotonic(),
-        })
+        self._command_queue.put(
+            {
+                "type": "probe",
+                "manifest": manifest,
+                "t_cmd": time.monotonic(),
+            }
+        )
         try:
             return await asyncio.wait_for(probe_future, timeout)
         except BaseException:
@@ -290,31 +297,39 @@ class LwdCloudControlBridge:
             usage_future: asyncio.Future = loop.create_future()
             self._usage_futures[request_id] = usage_future
             self._fanout_waiters[probe_key] = waiter
-        if stale_probe is not None or stale_usage is not None or (
-            stale_waiter is not None
+        if (
+            stale_probe is not None
+            or stale_usage is not None
+            or (stale_waiter is not None)
         ):
             logger.warning(
                 "[LWD][ctrl] duplicate control request req=%s: superseding "
-                "the previous registration", request_id,
+                "the previous registration",
+                request_id,
             )
             if stale_usage is not None and not stale_usage.done():
                 stale_usage.set_result(None)
             if stale_probe is not None and not stale_probe.done():
-                stale_probe.set_exception(RuntimeError(
-                    f"control request {request_id} superseded by a newer probe"))
+                stale_probe.set_exception(
+                    RuntimeError(
+                        f"control request {request_id} superseded by a newer probe"
+                    )
+                )
             if stale_waiter is not None:
                 with contextlib.suppress(queue.Full):
                     stale_waiter.put_nowait((False, -1, "superseded"))
         results: dict[int, LwdProbeResult] = {}
         try:
             for idx, cmd_queue in enumerate(self._command_queues):
-                cmd_queue.put({
-                    "type": "probe",
-                    "manifest": manifest,
-                    "reserve": False,
-                    "engine_index": idx,
-                    "reply_key": probe_key,
-                })
+                cmd_queue.put(
+                    {
+                        "type": "probe",
+                        "manifest": manifest,
+                        "reserve": False,
+                        "engine_index": idx,
+                        "reply_key": probe_key,
+                    }
+                )
             deadline = loop.time() + timeout
             try:
                 while len(results) < n:
@@ -329,15 +344,16 @@ class LwdCloudControlBridge:
                         break
                     if eng_idx == -1 and payload == "superseded":
                         raise RuntimeError(
-                            f"control request {request_id} superseded by a "
-                            "newer probe"
+                            f"control request {request_id} superseded by a newer probe"
                         )
                     if ok:
                         results[eng_idx] = payload
                     else:
                         logger.warning(
                             "[LWD][ctrl] fanout probe failed req=%s engine=%s: %s",
-                            request_id, eng_idx, payload,
+                            request_id,
+                            eng_idx,
+                            payload,
                         )
             finally:
                 with self._lock:
@@ -353,15 +369,16 @@ class LwdCloudControlBridge:
                 # are never placement candidates. Fail only if none answered.
                 logger.warning(
                     "[LWD][ctrl] fanout probe partial req=%s missing=%s "
-                    "(treated as zero hit)", request_id, missing,
+                    "(treated as zero hit)",
+                    request_id,
+                    missing,
                 )
                 if not results:
                     raise TimeoutError(
-                        f"prefix probe fanout timed out after {timeout}s")
+                        f"prefix probe fanout timed out after {timeout}s"
+                    )
             # Select argmax(hit_tokens), rotating among tied live engines.
-            hits = [
-                results[i].hit_tokens if i in results else 0 for i in range(n)
-            ]
+            hits = [results[i].hit_tokens if i in results else 0 for i in range(n)]
             top = max(hits[i] for i in results) if results else 0
             candidates = [i for i in results if hits[i] == top]
             if len(candidates) > 1:
@@ -371,7 +388,9 @@ class LwdCloudControlBridge:
                 winner = candidates[0]
             logger.info(
                 "[LWD][ctrl] fanout placement req=%s hits=%s winner=%d",
-                request_id, hits, winner,
+                request_id,
+                hits,
+                winner,
             )
             with self._lock:
                 if self._usage_futures.get(request_id) is not usage_future:
@@ -428,15 +447,17 @@ class LwdCloudControlBridge:
             kind = event.get("type")
             request_id = event.get("request_id")
             with self._lock:
-                table = (self._probe_futures if kind == "probe"
-                         else self._usage_futures)
+                table = self._probe_futures if kind == "probe" else self._usage_futures
                 registered = request_id in table
                 loop = self._loop
             # One debug log per event, consistent with this branch's hot-path
             # logging policy.
             logger.debug(
                 "[LWD][ctrl] dispatch got event type=%s req=%s ok=%s engine=%s",
-                kind, request_id, event.get("ok"), event.get("engine_index"),
+                kind,
+                request_id,
+                event.get("ok"),
+                event.get("engine_index"),
             )
             # Cloud-local DP fanout/reservation replies carry engine_index and
             # use reply_key to find their collection queue. Late replies after
@@ -446,15 +467,16 @@ class LwdCloudControlBridge:
                 with self._lock:
                     waiter = self._fanout_waiters.get(request_id)
                 if waiter is not None:
-                    try:
-                        waiter.put_nowait((
-                            bool(event.get("ok")),
-                            int(event.get("engine_index", 0)),
-                            event.get("result")
-                            if event.get("ok") else event.get("error"),
-                        ))
-                    except queue.Full:
-                        pass
+                    with contextlib.suppress(queue.Full):
+                        waiter.put_nowait(
+                            (
+                                bool(event.get("ok")),
+                                int(event.get("engine_index", 0)),
+                                event.get("result")
+                                if event.get("ok")
+                                else event.get("error"),
+                            )
+                        )
                 continue
             if not registered or loop is None:
                 # The waiter timed out or disconnected, or this accounting
@@ -462,7 +484,8 @@ class LwdCloudControlBridge:
                 # without one). Drop it without raising.
                 logger.warning(
                     "[LWD][ctrl] orphan %s event req=%s (no waiter/loop)",
-                    kind, request_id,
+                    kind,
+                    request_id,
                 )
                 continue
             try:
@@ -491,8 +514,7 @@ class LwdCloudControlBridge:
             if event.get("ok"):
                 future.set_result(event.get("result"))
             else:
-                future.set_exception(
-                    RuntimeError(event.get("error") or "probe failed"))
+                future.set_exception(RuntimeError(event.get("error") or "probe failed"))
             return
         if kind == "usage":
             # Accounting carries only request_id, not a probe generation, so it
@@ -542,7 +564,9 @@ class LwdCloudControlProcessor:
             except queue.Empty:
                 return consumed
             consumed += 1
-            logger.debug("[LWD][ctrl] poll consumed command type=%s", command.get("type"))
+            logger.debug(
+                "[LWD][ctrl] poll consumed command type=%s", command.get("type")
+            )
             if command.get("type") == "probe":
                 manifest: LwdPrefixManifest = command["manifest"]
                 # Cloud-local DP protocol fields (defaults preserve legacy
@@ -559,9 +583,7 @@ class LwdCloudControlProcessor:
                 # was spent returning and settling the result.
                 t_take = time.monotonic()
                 t_cmd = command.get("t_cmd")
-                cmd_wait_ms = (
-                    (t_take - t_cmd) * 1000.0 if t_cmd is not None else -1.0
-                )
+                cmd_wait_ms = (t_take - t_cmd) * 1000.0 if t_cmd is not None else -1.0
                 try:
                     if reserve:
                         result = coordinator.probe(manifest)
@@ -619,9 +641,7 @@ def _negotiate_lwd_protocol_headers(
                 f"{HEADER_MM_ABI} fingerprint on the cloud"
             )
         if enforce_mm_abi_match and value != expected_mm_abi:
-            raise ValueError(
-                f"{HEADER_MM_ABI} fingerprint does not match this cloud"
-            )
+            raise ValueError(f"{HEADER_MM_ABI} fingerprint does not match this cloud")
         # Honest negotiation: advertise the cloud's own identity. Echoing the
         # edge value would make an unchecked negotiation look successful.
         return expected_mm_abi
@@ -685,7 +705,8 @@ def create_lwd_cloud_control_app(
             return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
         try:
             mm_abi_header = _negotiate_lwd_protocol_headers(
-                headers, expected_mm_abi,
+                headers,
+                expected_mm_abi,
                 enforce_mm_abi_match=enforce_mm_abi_match,
             )
             parse_headers: Mapping[str, str] = headers
@@ -699,9 +720,7 @@ def create_lwd_cloud_control_app(
                     if k.lower() != HEADER_PROTOCOL.lower()
                 }
                 parse_headers[HEADER_PROTOCOL] = PROTOCOL_VERSION
-            manifest = LwdPrefixManifest.from_openai_request(
-                parse_headers, body
-            )
+            manifest = LwdPrefixManifest.from_openai_request(parse_headers, body)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -728,12 +747,14 @@ def create_lwd_cloud_control_app(
         try:
             logger.debug(
                 "[LWD][ctrl] handler entering probe req=%s edge=%d",
-                manifest.request_id, edge_id,
+                manifest.request_id,
+                edge_id,
             )
             result = await bridge.probe(manifest, timeout=probe_timeout)
             logger.debug(
                 "[LWD][ctrl] handler probe resolved req=%s hit=%d",
-                manifest.request_id, result.hit_tokens,
+                manifest.request_id,
+                result.hit_tokens,
             )
         except TimeoutError as exc:
             # This limit gives the edge headroom, so normally the cloud answers
@@ -746,7 +767,9 @@ def create_lwd_cloud_control_app(
                 "[LWD][ctrl] probe timeout req=%s edge=%d: %s "
                 "(engine loop did not answer in time; edge already "
                 "failed-open)",
-                manifest.request_id, edge_id, exc,
+                manifest.request_id,
+                edge_id,
+                exc,
             )
             return JSONResponse({"error": str(exc)}, status_code=503)
         except Exception as exc:  # noqa: BLE001
@@ -759,7 +782,7 @@ def create_lwd_cloud_control_app(
         # original unwrapped request ID to the edge for consistency validation.
         display_request_id = result.request_id
         if display_request_id.startswith(f"e{edge_id}-"):
-            display_request_id = display_request_id[len(f"e{edge_id}-"):]
+            display_request_id = display_request_id[len(f"e{edge_id}-") :]
         model = body.get("model", "edge-cloud-prefix")
 
         # Echo the negotiated protocol so the edge can verify that the cloud
@@ -773,28 +796,40 @@ def create_lwd_cloud_control_app(
 
         async def _events_inner() -> AsyncIterator[str]:
             # 1. Probe control message in delta.content, preserved by DTOs.
-            yield _sse_data(_build_chunk(
-                display_request_id,
-                model,
-                [{"index": 0, "delta": {
-                    "role": "assistant",
-                    "content": json.dumps(control_message, separators=(",", ":")),
-                }, "finish_reason": None}],
-            ))
+            yield _sse_data(
+                _build_chunk(
+                    display_request_id,
+                    model,
+                    [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    control_message, separators=(",", ":")
+                                ),
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                )
+            )
             # 2. Empty delta frame flushes gateway buffering (NewAPI, etc.).
-            yield _sse_data(_build_chunk(
-                display_request_id,
-                model,
-                [{"index": 0, "delta": {}, "finish_reason": None}],
-            ))
+            yield _sse_data(
+                _build_chunk(
+                    display_request_id,
+                    model,
+                    [{"index": 0, "delta": {}, "finish_reason": None}],
+                )
+            )
             # 3. Wait for usage pushed by the engine after inference finishes.
             usage: LwdUsage | None = None
-            usage_task = asyncio.create_task(
-                bridge.wait_usage(manifest.request_id))
+            usage_task = asyncio.create_task(bridge.wait_usage(manifest.request_id))
             try:
                 while not usage_task.done():
                     done, _ = await asyncio.wait(
-                        {usage_task}, timeout=_USAGE_HEARTBEAT_INTERVAL)
+                        {usage_task}, timeout=_USAGE_HEARTBEAT_INTERVAL
+                    )
                     if not done:
                         yield ": edge-cloud-usage-pending\n\n"
                 usage = usage_task.result()
@@ -817,12 +852,14 @@ def create_lwd_cloud_control_app(
                 yield ": edge-cloud-usage-unavailable\n\n"
                 yield "data: [DONE]\n\n"
                 return
-            yield _sse_data(_build_chunk(
-                display_request_id,
-                model,
-                [],
-                usage=usage.to_openai_dict(),
-            ))
+            yield _sse_data(
+                _build_chunk(
+                    display_request_id,
+                    model,
+                    [],
+                    usage=usage.to_openai_dict(),
+                )
+            )
             yield "data: [DONE]\n\n"
 
         async def events() -> AsyncIterator[str]:
@@ -876,9 +913,9 @@ def start_lwd_cloud_control_server(
     if lwd_config.role != "cloud":
         return None, None
 
-    from vllm.utils.system_utils import get_mp_context
-
     import uvicorn
+
+    from vllm.utils.system_utils import get_mp_context
 
     mp_ctx = get_mp_context()
     # Each cloud-local DP engine has an independent KV pool/prefix cache, so
@@ -896,9 +933,7 @@ def start_lwd_cloud_control_server(
     # the edge's _lwd_processor_fingerprint; use it for v2 only when enforcement
     # is enabled. Derive the probe limit from the edge timeout minus headroom so
     # the cloud answers first (200/503).
-    cloud_probe_timeout = max(
-        coord_cfg.probe_timeout - _CLOUD_PROBE_HEADROOM_S, 1.0
-    )
+    cloud_probe_timeout = max(coord_cfg.probe_timeout - _CLOUD_PROBE_HEADROOM_S, 1.0)
     app = create_lwd_cloud_control_app(
         bridge,
         compute_processor_fingerprint(vllm_config.model_config),
@@ -920,8 +955,11 @@ def start_lwd_cloud_control_server(
         "[LWD] cloud control HTTP server listening on %s:%s "
         "(cloud dp_size=%d, %d engine command queue(s), "
         "probe_timeout=%.1fs enforce_mm_abi_match=%s)",
-        coord_cfg.listen_host, coord_cfg.listen_port,
-        dp_size, len(command_queues),
-        cloud_probe_timeout, coord_cfg.enforce_mm_abi_match,
+        coord_cfg.listen_host,
+        coord_cfg.listen_port,
+        dp_size,
+        len(command_queues),
+        cloud_probe_timeout,
+        coord_cfg.enforce_mm_abi_match,
     )
     return command_queues, event_queue

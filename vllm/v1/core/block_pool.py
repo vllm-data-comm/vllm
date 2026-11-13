@@ -533,9 +533,9 @@ class BlockPool:
                 # Append-only content: the shorter keys stay valid. Move the
                 # current primary into the extra set and re-primary under the
                 # longest boundary instead of dropping every key.
-                self.cached_block_hashes_by_block.setdefault(
-                    block.block_id, set()
-                ).add(block.block_hash)
+                self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
+                    block.block_hash
+                )
                 block.reset_hash()
             else:
                 removed_hashes = self._remove_cached_block_hashes(block)

@@ -38,11 +38,7 @@ VLLM_DIR = REPO_ROOT / "vllm"
 SERVE_PATH = VLLM_DIR / "entrypoints" / "cli" / "serve.py"
 ATTACH_PATH = VLLM_DIR / "entrypoints" / "openai" / "lwd" / "frontend_attach.py"
 SCHED_PATH = (
-    VLLM_DIR
-    / "v1"
-    / "lwd_control"
-    / "control_edge_scheduler"
-    / "lwd_edge_scheduler.py"
+    VLLM_DIR / "v1" / "lwd_control" / "control_edge_scheduler" / "lwd_edge_scheduler.py"
 )
 
 # 1E1C edge_share: two one-to-one pairs (edge i -> cloud i).
@@ -96,9 +92,7 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
     if scene == "edge_share":
         links = [{"edge": i, "cloud": i} for i in range(edges)]
     else:
-        links = [
-            {"edge": i, "cloud": j} for i in range(edges) for j in range(clouds)
-        ]
+        links = [{"edge": i, "cloud": j} for i in range(edges) for j in range(clouds)]
     return LwdTopology.from_dict(
         {
             "deployment": {
@@ -203,9 +197,7 @@ def _load_attach_fn(fn_name: str, **dependencies: Any) -> Any:
 _LWD_IDENTITIES: dict[int, NS] = {}
 
 
-def _stub_lwd_identity(
-    additional_config: dict[str, Any], *, api: LwdAPIConfig
-) -> NS:
+def _stub_lwd_identity(additional_config: dict[str, Any], *, api: LwdAPIConfig) -> NS:
     """Identity stub keyed by the additional-config mapping."""
     return _LWD_IDENTITIES[id(additional_config)]
 
@@ -438,9 +430,7 @@ class _SchedBase:
         self._lwd_route[request_id] = _CONNECTION
         return _CONNECTION
 
-    def _lwd_dp_of_settling(
-        self, request_id: str
-    ) -> tuple[str, int, int] | None:
+    def _lwd_dp_of_settling(self, request_id: str) -> tuple[str, int, int] | None:
         return self._lwd_route.get(request_id)
 
     def _lwd_account_of(self, request_id: str) -> _Account | None:
@@ -453,9 +443,7 @@ class _SchedBase:
     def _lwd_purge_mrope_positions(self) -> None:
         pass
 
-    def finish_requests(
-        self, request_ids: list[str], status: object = None
-    ) -> None:
+    def finish_requests(self, request_ids: list[str], status: object = None) -> None:
         for rid in request_ids:
             request = self.requests.get(rid)
             if request is not None:
@@ -517,9 +505,7 @@ def _make_sched() -> Any:
     return scope["LwdEdgeSchedulerUnderTest"]()
 
 
-def _request(
-    rid: str, client_index: int | None = None, finished: bool = False
-) -> NS:
+def _request(rid: str, client_index: int | None = None, finished: bool = False) -> NS:
     """Request stand-in; ``client_index`` left unset mimics legacy
     single-frontend callers (pin defaults to 0)."""
     request = NS(
@@ -534,9 +520,7 @@ def _request(
     return request
 
 
-def _notify(
-    req_ids: list[str], finish_reasons: list[object] | None = None
-) -> NS:
+def _notify(req_ids: list[str], finish_reasons: list[object] | None = None) -> NS:
     return NS(
         req_ids=list(req_ids),
         finish_reasons=list(finish_reasons or [_LWD_NOT_FINISHED] * len(req_ids)),
@@ -668,13 +652,9 @@ class TestOutputGrouping:
         request = _request("r1", client_index=2)
         sched.requests["r1"] = request
         sched.lwd_admit_request(request)
-        first = _unembed_step(
-            sched, _notify(["r1"], [_FinishReason.STOP]), {"r1": [1]}
-        )
+        first = _unembed_step(sched, _notify(["r1"], [_FinishReason.STOP]), {"r1": [1]})
         assert set(first) == {2}
-        late = _unembed_step(
-            sched, _notify(["r1"], [_FinishReason.STOP]), {"r1": [9]}
-        )
+        late = _unembed_step(sched, _notify(["r1"], [_FinishReason.STOP]), {"r1": [9]})
         assert late == {}
 
     def test_late_row_for_inflight_request_keeps_pin(self) -> None:

@@ -7,9 +7,10 @@ from __future__ import annotations
 import hashlib
 import queue
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_health import (
@@ -82,9 +83,7 @@ class LwdEdgeProbeManager:
         self._vllm_config = vllm_config
         self._wakeup = wakeup
         self._runtime: LwdProbeRuntime | None = None
-        self._done: queue.Queue[tuple[str, int, int, Any, int | None]] = (
-            queue.Queue()
-        )
+        self._done: queue.Queue[tuple[str, int, int, Any, int | None]] = queue.Queue()
         self._inflight: dict[str, _InflightProbe] = {}
         self._nonce = 0
         self._clients: dict[tuple[int, int], LwdEdgePrefixClient] = {}
@@ -197,8 +196,8 @@ class LwdEdgeProbeManager:
             manifest = client.build_manifest(
                 request_id, prompt_ids, media_items=media_items
             )
-            manifest_chain = None if placement_only else list(
-                manifest.full_block_hashes
+            manifest_chain = (
+                None if placement_only else list(manifest.full_block_hashes)
             )
             result = await client.negotiate(
                 session,
@@ -213,7 +212,9 @@ class LwdEdgeProbeManager:
         try:
             future = runtime.submit(job())
         except Exception:
-            logger.warning("[LWD] probe submission failed; using full prefill", exc_info=True)
+            logger.warning(
+                "[LWD] probe submission failed; using full prefill", exc_info=True
+            )
             runtime.stop()
             self._runtime = None
             return LwdProbeSubmission.UNAVAILABLE
@@ -276,7 +277,9 @@ class LwdEdgeProbeManager:
             result, chain = outcome
             if result is None:
                 completions.append(
-                    LwdProbeCompletion(inflight.request, None, chain, target, build_size)
+                    LwdProbeCompletion(
+                        inflight.request, None, chain, target, build_size
+                    )
                 )
                 continue
             learned = int(result.block_size)
@@ -297,9 +300,7 @@ class LwdEdgeProbeManager:
                 )
                 chain = list(rebuilt.full_block_hashes)
             completions.append(
-                LwdProbeCompletion(
-                    inflight.request, result, chain, target, build_size
-                )
+                LwdProbeCompletion(inflight.request, result, chain, target, build_size)
             )
         return completions
 

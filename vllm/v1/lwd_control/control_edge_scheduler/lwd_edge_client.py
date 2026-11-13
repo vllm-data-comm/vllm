@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Edge prefix-negotiation client for an SSE gateway.
 
@@ -69,7 +72,9 @@ async def _iter_sse_data(
             value = line.partition(":")[2].removeprefix(" ")
             size += len(value) + 1
             if size > _MAX_CONTROL_MESSAGE_CHARS:
-                raise ValueError("edge-cloud SSE event exceeds the control message limit")
+                raise ValueError(
+                    "edge-cloud SSE event exceeds the control message limit"
+                )
             data.append(value)
     if data:
         yield "\n".join(data)
@@ -94,9 +99,7 @@ class LwdEdgePrefixClient:
         if probe_timeout <= 0:
             raise ValueError("probe_timeout must be positive")
         self._control_url = control_url
-        self._hasher = LwdPrefixHasher(
-            tenant_key, block_size, processor_fingerprint
-        )
+        self._hasher = LwdPrefixHasher(tenant_key, block_size, processor_fingerprint)
         # MM-ABI header for image requests, rendered from the local processor
         # fingerprint; without one, the client cannot issue a v2 request.
         self._mm_abi_header: str | None = (
@@ -118,17 +121,16 @@ class LwdEdgePrefixClient:
         # Sensitive gateway Bearer token, read from the environment and never
         # logged. None means no Authorization header.
         api_key = envs.VLLM_LWD_CLOUD_API_KEY
-        if api_key is not None:
-            if (
-                not api_key
-                or not api_key.isascii()
-                or not api_key.isprintable()
-                or any(c.isspace() for c in api_key)
-            ):
-                raise ValueError(
-                    "VLLM_LWD_CLOUD_API_KEY must contain a non-empty ASCII "
-                    "API token without whitespace"
-                )
+        if api_key is not None and (
+            not api_key
+            or not api_key.isascii()
+            or not api_key.isprintable()
+            or any(c.isspace() for c in api_key)
+        ):
+            raise ValueError(
+                "VLLM_LWD_CLOUD_API_KEY must contain a non-empty ASCII "
+                "API token without whitespace"
+            )
         self._api_key: str | None = api_key
 
     @property
@@ -211,9 +213,7 @@ class LwdEdgePrefixClient:
         awaiting usage. See ``_post_and_read_probe`` for ownership on abort.
         """
         if manifest is None:
-            manifest = self.build_manifest(
-                request_id, prompt_token_ids, media_items
-            )
+            manifest = self.build_manifest(request_id, prompt_token_ids, media_items)
         # A nonempty media identity means domains 0x04/0x05 were mixed into
         # the chain, so this request must use protocol v2.
         multimodal = bool(media_items)
@@ -223,7 +223,9 @@ class LwdEdgePrefixClient:
         try:
             response, sse_data, probe = await asyncio.wait_for(
                 self._post_and_read_probe(
-                    session, headers, body,
+                    session,
+                    headers,
+                    body,
                     request_id=request_id,
                     prompt_token_ids=prompt_token_ids,
                     multimodal=multimodal,
@@ -267,9 +269,7 @@ class LwdEdgePrefixClient:
         """
         import aiohttp
 
-        timeout = aiohttp.ClientTimeout(
-            total=None, connect=self._connect_timeout
-        )
+        timeout = aiohttp.ClientTimeout(total=None, connect=self._connect_timeout)
         response = await session.post(
             self._control_url, json=body, headers=headers, timeout=timeout
         )
@@ -286,9 +286,7 @@ class LwdEdgePrefixClient:
             # Share this iterator with the drain task, which continues reading
             # frames after the probe frame.
             sse_data = _iter_sse_data(response.content)
-            probe = await self._read_probe_from_sse(
-                sse_data, multimodal=multimodal
-            )
+            probe = await self._read_probe_from_sse(sse_data, multimodal=multimodal)
             if probe.request_id != request_id:
                 raise RuntimeError("cloud returned a different request ID")
             # Block granularity need not match: for hybrid models such as
@@ -322,9 +320,7 @@ class LwdEdgePrefixClient:
         collected before usage arrives, causing gateway client_gone and lost
         usage. Return the task only so tests can assert its registration.
         """
-        task = asyncio.create_task(
-            self._drain_stream(request_id, response, sse_data)
-        )
+        task = asyncio.create_task(self._drain_stream(request_id, response, sse_data))
         self._drain_tasks.add(task)
         task.add_done_callback(self._drain_tasks.discard)
         return task
@@ -416,9 +412,7 @@ class LwdEdgePrefixClient:
         ordering and is an error. Gateway-fragmented content is accumulated,
         so validate only after a complete JSON object has been assembled.
         """
-        expected_protocol = (
-            PROTOCOL_VERSION_MM if multimodal else PROTOCOL_VERSION
-        )
+        expected_protocol = PROTOCOL_VERSION_MM if multimodal else PROTOCOL_VERSION
         content_buf = ""
         async for payload in sse_data:
             if payload == "[DONE]":
@@ -427,9 +421,7 @@ class LwdEdgePrefixClient:
             if not isinstance(chunk, dict):
                 raise ValueError("cloud returned a non-object SSE chunk")
             if chunk.get("usage") is not None or chunk.get("error") is not None:
-                raise RuntimeError(
-                    "cloud returned usage or an error before the probe"
-                )
+                raise RuntimeError("cloud returned usage or an error before the probe")
             choices = chunk.get("choices") or []
             if not choices:
                 continue

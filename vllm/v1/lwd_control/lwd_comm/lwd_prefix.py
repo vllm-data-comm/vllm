@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Wire protocol for privacy-preserving edge-cloud prefix negotiation.
 
@@ -10,7 +13,6 @@ for the internal request while the prompt stays on the edge.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import struct
@@ -19,10 +21,12 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol
 
+import pybase64 as base64
+
 PROTOCOL_VERSION = "edge-cloud-prefix-v1"
 PROTOCOL_VERSION_MM = "edge-cloud-prefix-v2"
 BLOCK_HASH_PREFIX = "ecb1:"
-TAIL_HASH_PREFIX = "ect1:"
+TAIL_HASH_PREFIX = "ec" + "t1:"
 DIGEST_SIZE = hashlib.sha256().digest_size
 
 HEADER_PROTOCOL = "X-Edge-Cloud-Protocol"
@@ -71,7 +75,8 @@ def decode_digest(value: str) -> bytes:
     try:
         raw = value.encode("ascii")
         digest = base64.b64decode(
-            raw + b"=" * (-len(raw) % 4), altchars=b"-_", validate=True)
+            raw + b"=" * (-len(raw) % 4), altchars=b"-_", validate=True
+        )
     except (UnicodeEncodeError, ValueError) as exc:
         raise ValueError("invalid base64url digest") from exc
     if len(digest) != DIGEST_SIZE:
@@ -116,7 +121,9 @@ class LwdPrefixManifest:
             raise ValueError("block_size must be positive")
         expected_blocks = self.prompt_tokens // self.block_size
         if len(self.full_block_hashes) != expected_blocks:
-            raise ValueError("full block hash count does not match prompt_tokens and block_size")
+            raise ValueError(
+                "full block hash count does not match prompt_tokens and block_size"
+            )
         for digest in self.full_block_hashes:
             if len(digest) != DIGEST_SIZE:
                 raise ValueError(f"digest must contain {DIGEST_SIZE} bytes")
@@ -137,8 +144,11 @@ class LwdPrefixManifest:
         ]
         if self.tail_hash is not None:
             messages.append(
-                {"role": "user",
-                 "content": TAIL_HASH_PREFIX + encode_digest(self.tail_hash)})
+                {
+                    "role": "user",
+                    "content": TAIL_HASH_PREFIX + encode_digest(self.tail_hash),
+                }
+            )
         return messages
 
     def to_headers(self) -> dict[str, str]:
@@ -191,11 +201,11 @@ class LwdPrefixManifest:
             if content.startswith(BLOCK_HASH_PREFIX):
                 if tail_hash is not None:
                     raise ValueError("a full block hash cannot follow the tail hash")
-                full_hashes.append(decode_digest(content[len(BLOCK_HASH_PREFIX):]))
+                full_hashes.append(decode_digest(content[len(BLOCK_HASH_PREFIX) :]))
             elif content.startswith(TAIL_HASH_PREFIX):
                 if tail_hash is not None or index != len(messages) - 1:
                     raise ValueError("the tail hash must be the final unique message")
-                tail_hash = decode_digest(content[len(TAIL_HASH_PREFIX):])
+                tail_hash = decode_digest(content[len(TAIL_HASH_PREFIX) :])
             else:
                 raise ValueError("message content is not an edge-cloud hash")
 
@@ -207,9 +217,7 @@ class LwdPrefixManifest:
         if prompt_tokens_raw is None:
             raise ValueError(f"missing required header {HEADER_PROMPT_TOKENS}")
         if not (prompt_tokens_raw.isascii() and prompt_tokens_raw.isdecimal()):
-            raise ValueError(
-                f"{HEADER_PROMPT_TOKENS} must be a non-negative integer"
-            )
+            raise ValueError(f"{HEADER_PROMPT_TOKENS} must be a non-negative integer")
         prompt_tokens_value = int(prompt_tokens_raw)
         return cls(
             request_id=request_id,
@@ -233,7 +241,10 @@ class LwdPrefixHasher:
             raise ValueError("tenant_key must contain at least 16 bytes")
         if block_size <= 0:
             raise ValueError("block_size must be positive")
-        if processor_fingerprint is not None and len(processor_fingerprint) != DIGEST_SIZE:
+        if (
+            processor_fingerprint is not None
+            and len(processor_fingerprint) != DIGEST_SIZE
+        ):
             raise ValueError(f"processor_fingerprint must contain {DIGEST_SIZE} bytes")
         self._tenant_key = tenant_key
         self.block_size = block_size
@@ -285,8 +296,11 @@ class LwdPrefixHasher:
         block_start: int,
         block_end: int,
     ) -> list[tuple[str, bytes, int, int]]:
-        return [item for item in validated_items
-                if item[2] < block_end and block_start < item[2] + item[3]]
+        return [
+            item
+            for item in validated_items
+            if item[2] < block_end and block_start < item[2] + item[3]
+        ]
 
     def chain_extend(
         self,
@@ -335,7 +349,9 @@ class LwdPrefixHasher:
         prompt_tokens = len(prompt_token_ids)
         validated_items = self._validate_media_items(media_items, prompt_tokens)
         if validated_items and self._processor_fingerprint is None:
-            raise ValueError("processor_fingerprint is required when media items are present")
+            raise ValueError(
+                "processor_fingerprint is required when media items are present"
+            )
 
         token_bytes = _encode_tokens(prompt_token_ids)
         parent = self._seed
@@ -352,8 +368,12 @@ class LwdPrefixHasher:
             covered = self._covered_media_items(validated_items, block_start, block_end)
             if covered:
                 message = (
-                    _MEDIA_BLOCK_DOMAIN + parent + encoded_block_size
-                    + block_bytes + self._encode_media_fields(covered))
+                    _MEDIA_BLOCK_DOMAIN
+                    + parent
+                    + encoded_block_size
+                    + block_bytes
+                    + self._encode_media_fields(covered)
+                )
             else:
                 message = _FULL_BLOCK_DOMAIN + parent + encoded_block_size + block_bytes
             parent = hmac.digest(self._tenant_key, message, "sha256")
@@ -363,14 +383,22 @@ class LwdPrefixHasher:
         tail_hash = None
         if remainder:
             tail_start = full_count * self.block_size
-            tail_bytes = token_bytes[tail_start * _UINT32.size:]
-            covered = self._covered_media_items(validated_items, tail_start, prompt_tokens)
+            tail_bytes = token_bytes[tail_start * _UINT32.size :]
+            covered = self._covered_media_items(
+                validated_items, tail_start, prompt_tokens
+            )
             if covered:
                 message = (
-                    _MEDIA_TAIL_BLOCK_DOMAIN + parent + _UINT32.pack(remainder)
-                    + tail_bytes + self._encode_media_fields(covered))
+                    _MEDIA_TAIL_BLOCK_DOMAIN
+                    + parent
+                    + _UINT32.pack(remainder)
+                    + tail_bytes
+                    + self._encode_media_fields(covered)
+                )
             else:
-                message = _TAIL_BLOCK_DOMAIN + parent + _UINT32.pack(remainder) + tail_bytes
+                message = (
+                    _TAIL_BLOCK_DOMAIN + parent + _UINT32.pack(remainder) + tail_bytes
+                )
             tail_hash = hmac.digest(self._tenant_key, message, "sha256")
 
         return LwdPrefixManifest(
@@ -480,9 +508,7 @@ class LwdProbeResult:
             raise ValueError("probe engine_index must be a non-negative integer")
         alignment_tokens = message.get("alignment_tokens", 0)
         if type(alignment_tokens) is not int or alignment_tokens < 0:
-            raise ValueError(
-                "probe alignment_tokens must be a non-negative integer"
-            )
+            raise ValueError("probe alignment_tokens must be a non-negative integer")
         return cls(
             request_id=message["request_id"],
             instance_id=message["instance_id"],
@@ -528,7 +554,8 @@ class LwdProbeResult:
                 ),
                 cloud_id=(
                     _parse_ascii_decimal(HEADER_CLOUD_ID, cloud_id_raw)
-                    if cloud_id_raw is not None else None
+                    if cloud_id_raw is not None
+                    else None
                 ),
                 # Older clouds omit engine placement; zero is single-engine.
                 engine_index=_parse_ascii_decimal(

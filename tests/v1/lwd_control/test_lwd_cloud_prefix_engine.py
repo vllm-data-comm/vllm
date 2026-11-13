@@ -17,7 +17,6 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineC
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRequestNotify
 from vllm.v1.request import RequestStatus
 
-
 _CONNECTION = LwdConnectionId(0, 0, 0)
 
 

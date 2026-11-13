@@ -12,7 +12,6 @@ import pytest
 import torch
 
 from vllm.config.lwd import LwdConnectionId
-
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import LwdBatch, LwdBatchType, SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
@@ -226,7 +225,9 @@ def test_w2_rejects_unarrived_rows_and_allows_native_under_scheduling() -> None:
     scheduler._lwd_warn_under_scheduled(out, [window])
 
 
-def test_visible_set_restores_native_preempted_at_head_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_visible_set_restores_native_preempted_at_head_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hidden_running = _request("hidden-running")
     hidden_waiting = _request("hidden-waiting")
     p1 = _request("p1")
@@ -234,9 +235,7 @@ def test_visible_set_restores_native_preempted_at_head_order(monkeypatch: pytest
     p2 = _request("p2")
     scheduler = _visible_set_scheduler([hidden_running, p1, p2], [hidden_waiting, rest])
 
-    def native_schedule(
-        self, throttle_prefills: bool = False
-    ) -> SchedulerOutput:
+    def native_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.running = []
         self.waiting = FCFSRequestQueue([p1, rest, p2])
         out = SchedulerOutput.make_empty()
@@ -255,7 +254,9 @@ def test_visible_set_restores_native_preempted_at_head_order(monkeypatch: pytest
     ]
 
 
-def test_visible_set_preserves_non_preempted_order_when_output_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_visible_set_preserves_non_preempted_order_when_output_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hidden_running = _request("hidden-running")
     visible_running = _request("visible-running")
     hidden_waiting = _request("hidden-waiting")
@@ -310,7 +311,9 @@ def test_preemption_recomputes_window_from_zero_and_clears_cap() -> None:
     assert request.lwd_window_cap is None
 
 
-def test_abort_records_drop_and_preserves_native_iterable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_abort_records_drop_and_preserves_native_iterable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request = _request()
     scheduler = _scheduler(request)
     received = []
@@ -349,7 +352,9 @@ def test_abort_only_embed_and_non_embed_retry_do_not_lose_notice() -> None:
     assert out.lwd_batch.batch_type is LwdBatchType.LWD_UNEMBED
 
 
-def test_pending_abort_keeps_native_engine_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pending_abort_keeps_native_engine_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scheduler = _scheduler(_request())
     scheduler._lwd_abort_pending = ["p"]
     monkeypatch.setattr(LwdBaseScheduler, "has_requests", lambda self: False)
@@ -423,7 +428,9 @@ def test_range_notify_without_prompt_length_fails_fast() -> None:
         engine._lwd_handle_range_notify(_CONNECTION, notify)
 
 
-def test_done_arrivals_merge_by_max_and_keep_watermark_items(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_done_arrivals_merge_by_max_and_keep_watermark_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine()
@@ -507,7 +514,9 @@ def test_normal_finish_retires_from_outputs_and_cleans_after_drain() -> None:
     assert engine._lwd_request_seqnos == {}
 
 
-def test_abort_before_mixed_range_still_posts_complete_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_abort_before_mixed_range_still_posts_complete_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine({"a": 8, "b": 6})
@@ -561,7 +570,9 @@ def test_drained_retirement_allows_same_id_reuse(retire_kind: str) -> None:
     assert engine.scheduler.lwd_recv_rows == {"p": 4}
 
 
-def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_early_reuse_error_ready_late_messages_and_resubmit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine({"p": 4})
@@ -587,8 +598,7 @@ def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch: pytest.
     assert engine._lwd_prompt_lens["p"] == 4
 
     engine._lwd_handle_range_notify(
-        _CONNECTION,
-        LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
+        _CONNECTION, LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
     )
     engine._lwd_handle_abort_notify(LwdAbortNotify("p", prefix_nonce=2))
 
@@ -607,14 +617,15 @@ def test_early_reuse_error_ready_late_messages_and_resubmit(monkeypatch: pytest.
     assert engine._lwd_prompt_lens["p"] == 8
 
     engine._lwd_handle_range_notify(
-        _CONNECTION,
-        LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
+        _CONNECTION, LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
     )
     assert len(posted) == 1
     assert engine._lwd_pending_seqnos == {_CONNECTION: {2: {"p"}}}
 
 
-def test_rejected_range_does_not_block_other_seqnos(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rejected_range_does_not_block_other_seqnos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine({"p": 4, "q": 6})
@@ -630,13 +641,11 @@ def test_rejected_range_does_not_block_other_seqnos(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
     engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
     engine._lwd_handle_range_notify(
-        _CONNECTION,
-        LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
+        _CONNECTION, LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
     )
 
     engine._lwd_handle_range_notify(
-        _CONNECTION,
-        LwdRangeNotify(3, [LwdRangeItem("q", 0, 6, prefix_nonce=1)])
+        _CONNECTION, LwdRangeNotify(3, [LwdRangeItem("q", 0, 6, prefix_nonce=1)])
     )
 
     assert [args[0] for args, _kwargs in posted] == [3]
@@ -683,7 +692,9 @@ def test_finish_without_pending_clears_retired_state_immediately() -> None:
     assert engine._lwd_prompt_lens == {}
 
 
-def test_worker_error_fails_connection_without_advancing_failed_item(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_error_fails_connection_without_advancing_failed_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
     engine = _engine()
@@ -808,15 +819,15 @@ def test_update_c2e_preserves_nonce_after_finish_and_abort(
     assert scheduler.pending_c2e[0].finish_reasons == [finish_code]
 
 
-def test_visible_set_releases_only_successful_prefix_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_visible_set_releases_only_successful_prefix_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     p1 = _request("p1")
     p2 = _request("p2")
     scheduler = _visible_set_scheduler([p1, p2], [])
     scheduler.lwd_prefix_reservations = Mock()
 
-    def native_schedule(
-        self, throttle_prefills: bool = False
-    ) -> SchedulerOutput:
+    def native_schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         out = SchedulerOutput.make_empty()
         out.num_scheduled_tokens = {"p1": 4, "p2": 0}
         return out
@@ -827,7 +838,9 @@ def test_visible_set_releases_only_successful_prefix_allocation(monkeypatch: pyt
     scheduler.lwd_prefix_reservations.release.assert_called_once_with("p1")
 
 
-def test_free_request_cleans_prefix_reservation_and_refill_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_free_request_cleans_prefix_reservation_and_refill_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request = _request()
     scheduler = _visible_set_scheduler([request], [])
     scheduler.lwd_prefix_reservations = Mock()

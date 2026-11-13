@@ -93,17 +93,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
         self._lwd_probe_manager = LwdEdgeProbeManager(
             self.vllm_config,
-            lambda: self.input_queue.put_nowait(
-                (EngineCoreRequestType.WAKEUP, None)
-            ),
+            lambda: self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
         )
         self._lwd_probe_chains: dict[str, list[bytes]] = {}
         self.scheduler.lwd_on_finish = self._lwd_finish_request
         self.scheduler.lwd_has_pending = lambda: (
             self._lwd_probe_manager.pending
-            or bool(
-                self._lwd_prefix_control and self._lwd_prefix_control.pending
-            )
+            or bool(self._lwd_prefix_control and self._lwd_prefix_control.pending)
         )
         self._lwd_cloud_params_received = threading.Event()
         plane = self._lwd_start_control_plane()
@@ -346,9 +342,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_probe_chains[request.request_id] = completion.chain
         if completion is not None and completion.result is not None:
             coordination = self.lwd_config.coordination
-            placement_only = (
-                coordination is not None and coordination.placement_only
-            )
+            placement_only = coordination is not None and coordination.placement_only
             request.lwd_prefix_probe_succeeded = not placement_only
             hit = 0 if placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
@@ -369,9 +363,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         cloud_id = completion.cloud_id
         engine = completion.engine_index
         if engine is not None:
-            candidate = LwdConnectionId(
-                self.lwd_config.instance_id, cloud_id, engine
-            )
+            candidate = LwdConnectionId(self.lwd_config.instance_id, cloud_id, engine)
             if candidate in self._lwd_clouds:
                 return candidate
         return next(
@@ -410,15 +402,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             request = self.scheduler.requests.get(request_id)
             self._lwd_send_to_cloud(
                 dp_idx,
-                LwdAbortNotify(
-                    request_id, getattr(request, "lwd_prefix_nonce", 0)
-                ),
+                LwdAbortNotify(request_id, getattr(request, "lwd_prefix_nonce", 0)),
             )
         super().abort_requests(request_ids)
 
-    def _lwd_notify_request(
-        self, dp_idx: LwdConnectionId, request: Request
-    ) -> None:
+    def _lwd_notify_request(self, dp_idx: LwdConnectionId, request: Request) -> None:
         """Announce the request to one cloud DP rank, packing the sampling
         fields from the shared table."""
         sampling_params = request.sampling_params
@@ -435,9 +423,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 request_id=request.request_id,
                 num_prompt_tokens=request.num_prompt_tokens,
                 block_hashes=list(
-                    self._lwd_probe_chains.get(
-                        request.request_id, request.block_hashes
-                    )
+                    self._lwd_probe_chains.get(request.request_id, request.block_hashes)
                 ),
                 eos_token_id=sampling_params.eos_token_id,
                 prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),

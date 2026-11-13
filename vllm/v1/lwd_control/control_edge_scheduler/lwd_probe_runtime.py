@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from collections.abc import Coroutine
 from concurrent.futures import Future
@@ -69,7 +70,5 @@ class LwdProbeRuntime:
                 asyncio.ensure_future(self._session.close())
             self._loop.call_later(1.0, self._loop.stop)
 
-        try:
+        with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(cleanup)
-        except RuntimeError:
-            pass

@@ -89,9 +89,7 @@ def _manifest(request_id: str) -> LwdPrefixManifest:
     )
 
 
-def _result(
-    request_id: str, hit_blocks: int, engine_index: int = 0
-) -> LwdProbeResult:
+def _result(request_id: str, hit_blocks: int, engine_index: int = 0) -> LwdProbeResult:
     return LwdProbeResult(
         request_id=request_id,
         instance_id="cloud-test",
@@ -108,9 +106,7 @@ async def _start_probe(
     request_id: str,
     timeout: float = 1.0,
 ) -> tuple[asyncio.Task[LwdProbeResult], list[dict[str, Any]]]:
-    task = asyncio.create_task(
-        bridge.probe(_manifest(request_id), timeout=timeout)
-    )
+    task = asyncio.create_task(bridge.probe(_manifest(request_id), timeout=timeout))
     await asyncio.sleep(0)
     commands = [command_queue.get_nowait() for command_queue in command_queues]
     assert all(command["type"] == "probe" for command in commands)
@@ -184,9 +180,7 @@ async def test_total_timeout_cleans_waiters_and_drops_late_reply(
     bridge_factory: BridgeFactory,
 ) -> None:
     bridge, command_queues, event_queue = bridge_factory(2)
-    probe_task, _ = await _start_probe(
-        bridge, command_queues, "timeout", timeout=0.01
-    )
+    probe_task, _ = await _start_probe(bridge, command_queues, "timeout", timeout=0.01)
 
     with pytest.raises(TimeoutError, match="fanout timed out"):
         await asyncio.wait_for(probe_task, timeout=1)
@@ -216,9 +210,7 @@ async def test_usage_delivery_cleans_registration(
     await asyncio.wait_for(probe_task, timeout=1)
 
     expected = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
-    event_queue.put(
-        {"type": "usage", "request_id": "usage", "usage": expected}
-    )
+    event_queue.put({"type": "usage", "request_id": "usage", "usage": expected})
     assert await bridge.wait_usage("usage", timeout=1) is expected
     assert bridge.registration("usage") is None
 
@@ -290,9 +282,7 @@ async def test_duplicate_supersedes_and_old_release_preserves_new_generation(
     with pytest.raises(RuntimeError, match="superseded"):
         await old_probe
     assert (
-        await bridge.wait_usage(
-            request_id, timeout=1, registration=old_registration
-        )
+        await bridge.wait_usage(request_id, timeout=1, registration=old_registration)
         is None
     )
     new_registration = bridge.registration(request_id)

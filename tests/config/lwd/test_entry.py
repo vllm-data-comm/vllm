@@ -241,9 +241,7 @@ def test_cloud_coordination_name_preserves_override_or_defaults_to_selected_clou
         **({"instance_id": name} if name else {}),
     }
     original = supplied.copy()
-    topology = yaml.safe_load(
-        (lwd_yaml_dir / "s2_edge_share_1dp.yaml").read_text()
-    )
+    topology = yaml.safe_load((lwd_yaml_dir / "s2_edge_share_1dp.yaml").read_text())
     topology["clouds"][cloud_id]["coordination"] = supplied
     path = tmp_path / "topology.yaml"
     path.write_text(yaml.safe_dump(topology, sort_keys=False))

@@ -530,7 +530,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self.deepstack_num_level = 0
             self.multiscale_dim = 0
 
-
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
                 vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
@@ -757,7 +756,6 @@ class Qwen3_5MoeForConditionalGeneration(
             self.use_deepstack = False
             self.deepstack_num_level = 0
             self.multiscale_dim = 0
-
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5MoeForCausalLM(
