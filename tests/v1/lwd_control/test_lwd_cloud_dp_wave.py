@@ -14,15 +14,14 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudDPEngineCore,
     LwdCloudEngineCore,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
+    LwdCloudLedger,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRequestNotify
 
 
 def _engine(engine_cls, *, has_coordinator: bool):
     engine = object.__new__(engine_cls)
-    engine._lwd_prompt_lens = {}
-    engine._lwd_request_nonces = {}
-    engine._lwd_request_seqnos = {}
-    engine._lwd_rejected_nonces = {}
     engine._lwd_prefix_enabled = False
     engine.input_queue = queue.Queue()
     engine.output_queue = queue.Queue()
@@ -32,6 +31,7 @@ def _engine(engine_cls, *, has_coordinator: bool):
     engine.scheduler = SimpleNamespace(
         add_request=Mock(), pause_state=PauseState.UNPAUSED
     )
+    engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
     request = SimpleNamespace(
         request_id="r",
         use_structured_output=False,

@@ -13,6 +13,9 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCoreMixin,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
+    LwdCloudLedger,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRequestNotify
 from vllm.v1.request import RequestStatus
@@ -24,6 +27,7 @@ def _cloud_engine() -> LwdCloudEngineCoreMixin:
     engine = object.__new__(LwdCloudEngineCoreMixin)
     engine._lwd_prefix_enabled = True
     engine.scheduler = SimpleNamespace()
+    engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
     engine._lwd_send_prefix_ready = Mock()
     return engine
 
@@ -287,7 +291,8 @@ def test_refill_done_bypasses_watermark_recording(
 def test_send_refill_carries_generation() -> None:
     engine = object.__new__(LwdCloudEngineCoreMixin)
     peer = object()
-    engine._lwd_request_routes = {"r": peer}
+    engine._lwd_ledger = LwdCloudLedger(SimpleNamespace())
+    engine._lwd_ledger.request_routes = {"r": peer}
     engine._lwd_send_until_queued = Mock()
 
     engine._lwd_send_refill("r", 16, 32, 7)

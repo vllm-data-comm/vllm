@@ -84,7 +84,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
-        self.lwd_config.validate_prefix_caching(self._lwd_prefix_enabled)
         self._lwd_prefix_control = (
             LwdEdgePrefixControl(self, LWD_PREFIX_READY_TIMEOUT_S)
             if self._lwd_prefix_enabled

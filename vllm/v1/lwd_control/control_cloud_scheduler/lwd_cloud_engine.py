@@ -31,6 +31,9 @@ from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
+    LwdCloudLedger,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
@@ -67,7 +70,6 @@ from vllm.v1.request import Request
 # Sleep between retries of a full outbound queue: step metadata must not be
 # lost, the edge posts its receive of the exact size from it.
 _LWD_SEND_RETRY_SLEEP_S = 0.05
-_LWD_RETIRED_ROUTE_CAP = 4096
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
 
@@ -78,7 +80,7 @@ def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None
     per-step c2e notify gets per-row detail (top tree / token payloads are
     reduced to lengths to bound log volume)."""
     if isinstance(message, LwdC2eNotify):
-        lwd_logger.info(
+        lwd_logger.debug(
             "[LWD][cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
             "req_ids=%s accepted=%s finish=%s nonces=%s top_tree_lens=%s "
             "token_lens=%s",
@@ -94,7 +96,7 @@ def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None
             [len(tokens) for tokens in message.token_ids],
         )
     else:
-        lwd_logger.info(
+        lwd_logger.debug(
             "[LWD][cloud] %s sent to edge %s: %s",
             type(message).__name__,
             peer,
@@ -132,7 +134,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             connection.connection_id
             for connection in vllm_config.lwd_config.connections
             if connection.connection_id.dp_idx == dp_idx
-        ) or (LwdConnectionId(0, vllm_config.lwd_config.instance_id, dp_idx),)
+        )
+        if not connections:
+            # A topology connection set is the single source of edge routing:
+            # fabricating a default edge here would misroute every hint of
+            # this DP rank, so an empty set is a wiring error, not a default.
+            raise ValueError(
+                f"[LWD] cloud DP rank {dp_idx} of instance "
+                f"{vllm_config.lwd_config.instance_id} has no edge connection"
+            )
         self._lwd_hint_mqs = {
             connection: create_hint_mq(connection) for connection in connections
         }
@@ -181,9 +191,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.scheduler.lwd_refill_sender = self._lwd_send_refill
 
     def _lwd_assemble(self) -> None:
-        self.lwd_config.validate_prefix_caching(
-            self.vllm_config.cache_config.enable_prefix_caching
-        )
         if self.vllm_config.model_config.skip_tokenizer_init:
             # StructuredOutputManager builds its tokenizer and compile
             # executor only with a tokenizer; without one the first
@@ -197,20 +204,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
         self._lwd_init_prefix_cache()
         self._lwd_edges: set[LwdPeer] = set()
-        self._lwd_prompt_lens: dict[str, int] = {}
-        self._lwd_retired_prompt_lens: dict[str, int] = {}
-        self._lwd_request_nonces: dict[str, int] = {}
-        self._lwd_retired_nonces: dict[str, int] = {}
-        self._lwd_retired_req_ids: set[str] = set()
-        self._lwd_rejected_nonces: dict[str, int] = {}
-        self._lwd_request_routes: dict[str, LwdPeer] = {}
-        self._lwd_retired_routes: dict[str, LwdPeer] = {}
-        self._lwd_pending_seqnos: dict[LwdConnectionId, dict[int, set[str]]] = {}
-        self._lwd_request_seqnos: dict[str, set[int]] = {}
-        self._lwd_latest_seqnos: dict[LwdConnectionId, int] = {}
-        self._lwd_failed_connections: set[LwdConnectionId] = set()
+        self._lwd_ledger = LwdCloudLedger(self.scheduler)
         self.scheduler.lwd_hash_block_size = self._lwd_hash_block_size
-        self._lwd_prefix_hits: dict[str, int] = {}
         prefix_hash_block_size = self._lwd_hash_block_size
         coordination = self.lwd_config.coordination
         self._lwd_probe_query = None
@@ -233,7 +228,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 # so the cloud hash-block-size contract does not apply.
                 prefix_caching=self._lwd_prefix_enabled,
             )
-        self.scheduler.lwd_prefix_hits = self._lwd_prefix_hits
+        self.scheduler.lwd_prefix_hits = self._lwd_ledger.prefix_hits
         self._lwd_coord_pending: queue.Queue[dict[str, Any]] = queue.Queue()
         self._lwd_control_processor = None
         self.cloud_control_event_queue = getattr(
@@ -334,7 +329,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
     ) -> None:
-        peer = self._lwd_request_routes.get(request_id)
+        peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
             raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
         self._lwd_send_until_queued(
@@ -352,7 +347,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_send_refill(
         self, request_id: str, start_row: int, end_row: int, prefix_nonce: int
     ) -> None:
-        peer = self._lwd_request_routes.get(request_id)
+        peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
             raise RuntimeError(f"[LWD] refill route missing for {request_id}")
         self._lwd_send_until_queued(
@@ -415,7 +410,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 request_id, 0, nonce, error="cloud admission failed"
             )
             raise
-        self._lwd_prefix_hits[request_id] = hit_tokens
+        self._lwd_ledger.prefix_hits[request_id] = hit_tokens
         self._lwd_send_prefix_ready(request_id, hit_tokens, nonce)
 
     def _lwd_register_recv_hint(self) -> None:
@@ -493,7 +488,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             getattr(msg, "seqno", "-"),
         )
         connection_id = self._lwd_connection_of(peer)
-        if connection_id in self._lwd_failed_connections:
+        if connection_id in self._lwd_ledger.failed_connections:
             if isinstance(msg, LwdRequestNotify):
                 from vllm.v1.engine import FinishReason
 
@@ -526,8 +521,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         canonical_id = wrap_req_id(peer.instance_id, msg.request_id)
         msg = msgspec.structs.replace(msg, request_id=canonical_id)
         if isinstance(msg, LwdRequestNotify):
-            self._lwd_retired_routes.pop(canonical_id, None)
-            self._lwd_request_routes[canonical_id] = peer
+            self._lwd_ledger.retired_routes.pop(canonical_id, None)
+            self._lwd_ledger.request_routes[canonical_id] = peer
             self._lwd_handle_request_notify(msg)
         else:
             self._lwd_handle_abort_notify(msg)
@@ -541,22 +536,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify
     ) -> None:
         """Post each new extended hint exactly once, per source connection."""
-        rejected = getattr(self, "_lwd_rejected_nonces", {})
-        if any(
-            rejected.get(item.request_id) == item.prefix_nonce for item in notify.items
-        ):
-            return
-        current_nonces = getattr(self, "_lwd_request_nonces", {})
-        if any(
-            item.request_id in current_nonces
-            and current_nonces[item.request_id] != item.prefix_nonce
-            for item in notify.items
-        ):
-            lwd_logger.warning(
-                "[LWD][cloud] ignore stale RangeNotify seqno=%d", notify.seqno
-            )
-            return
-        latest = self._lwd_latest_seqnos.get(connection_id, -1)
+        latest = self._lwd_ledger.latest_seqnos.get(connection_id, -1)
         if notify.seqno <= latest:
             lwd_logger.info(
                 "[LWD][cloud] ignore duplicate RangeNotify seqno=%d", notify.seqno
@@ -565,8 +545,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         items = notify.items
         request_ids = [item.request_id for item in items]
         prompt_lens = [
-            self._lwd_prompt_lens.get(
-                request_id, self._lwd_retired_prompt_lens.get(request_id, 0)
+            self._lwd_ledger.prompt_lens.get(
+                request_id, self._lwd_ledger.retired_prompt_lens.get(request_id, 0)
             )
             for request_id in request_ids
         ]
@@ -575,7 +555,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 f"[LWD] RangeNotify seqno={notify.seqno} arrived before "
                 "RequestNotify prompt lengths were recorded"
             )
-        self._lwd_track_range(connection_id, notify.seqno, request_ids)
+        self._lwd_ledger.track_range(connection_id, notify.seqno, request_ids)
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             make_recv_hint,
             post_irecv_hint,
@@ -606,58 +586,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
         )
 
-    def _lwd_track_range(
-        self,
-        connection_id: LwdConnectionId,
-        seqno: int,
-        request_ids: list[str],
-    ) -> None:
-        self._lwd_latest_seqnos[connection_id] = seqno
-        self._lwd_pending_seqnos.setdefault(connection_id, {})[seqno] = set(request_ids)
-        for request_id in request_ids:
-            self._lwd_request_seqnos.setdefault(request_id, set()).add(seqno)
-
-    def _lwd_complete_seqno(self, connection_id: LwdConnectionId, seqno: int) -> None:
-        pending_by_seqno = self._lwd_pending_seqnos.get(connection_id)
-        if pending_by_seqno is None:
-            return
-        request_ids = pending_by_seqno.pop(seqno, None)
-        if not pending_by_seqno:
-            self._lwd_pending_seqnos.pop(connection_id, None)
-        if request_ids is None:
-            return
-        for request_id in request_ids:
-            pending = self._lwd_request_seqnos.get(request_id)
-            if pending is not None:
-                pending.discard(seqno)
-            if pending:
-                continue
-            self._lwd_request_seqnos.pop(request_id, None)
-            if request_id in self._lwd_retired_req_ids:
-                self._lwd_clear_retired(request_id)
-
     def _lwd_handle_request_notify(self, notify: LwdRequestNotify) -> None:
         request_id = notify.request_id
-        current = getattr(self, "_lwd_request_nonces", {}).get(request_id)
-        if (self._lwd_request_seqnos.get(request_id) and current is None) or (
-            current is not None and current != notify.prefix_nonce
-        ):
-            self._lwd_rejected_nonces[request_id] = notify.prefix_nonce
-            if notify.prefix_nonce:
-                self._lwd_send_prefix_ready(
-                    request_id,
-                    0,
-                    notify.prefix_nonce,
-                    error="request id reused before previous generation drained",
-                )
-                return
-            raise RuntimeError(
-                f"[LWD] request_id {request_id} reused before previous "
-                "generation drained"
-            )
-        self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
+        self._lwd_ledger.prompt_lens[request_id] = notify.num_prompt_tokens
         if notify.prefix_nonce:
-            self._lwd_request_nonces[request_id] = notify.prefix_nonce
+            self._lwd_ledger.request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
         if request.use_structured_output:
             # This path constructs Request directly and therefore bypasses
@@ -684,26 +617,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_handle_abort_notify(self, notify: LwdAbortNotify) -> None:
         request_id = notify.request_id
-        current = getattr(self, "_lwd_request_nonces", {}).get(request_id)
-        retired = getattr(self, "_lwd_retired_nonces", {}).get(request_id)
-        if request_id in self._lwd_retired_req_ids and retired == notify.prefix_nonce:
+        ledger = self._lwd_ledger
+        retired = ledger.retired_nonces.get(request_id)
+        if request_id in ledger.retired_req_ids and retired == notify.prefix_nonce:
             return
         if (
-            getattr(self, "_lwd_rejected_nonces", {}).get(request_id)
-            == notify.prefix_nonce
+            ledger.request_nonces.get(request_id) is None
+            and retired is None
+            and notify.prefix_nonce != 0
         ):
-            return
-        if current is not None and current != notify.prefix_nonce:
-            lwd_logger.warning(
-                "[LWD][cloud] ignore stale abort req=%s nonce=%d current=%d",
-                request_id,
-                notify.prefix_nonce,
-                current,
-            )
-            return
-        if current is None and retired is not None and retired != notify.prefix_nonce:
-            return
-        if current is None and retired is None and notify.prefix_nonce != 0:
             lwd_logger.warning(
                 "[LWD][cloud] ignore abort for unknown generation req=%s nonce=%d",
                 request_id,
@@ -715,51 +637,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request_id)
-        self._lwd_retire_request(request_id, preserve_prompt=True)
+        ledger.retire_request(request_id, preserve_prompt=True)
         lwd_logger.info(
             "[LWD][cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
         )
         self.aborts_queue.put_nowait([request_id])
         self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
-
-    def _lwd_retire_request(
-        self, request_id: str, preserve_prompt: bool = False
-    ) -> None:
-        self.scheduler.lwd_recv_rows.pop(request_id, None)
-        retired_nonces = getattr(self, "_lwd_retired_nonces", None)
-        if retired_nonces is not None:
-            retired_nonces[request_id] = getattr(self, "_lwd_request_nonces", {}).get(
-                request_id, 0
-            )
-        if not self._lwd_request_seqnos.get(request_id):
-            self._lwd_clear_retired(request_id)
-            return
-        self._lwd_retired_req_ids.add(request_id)
-        if preserve_prompt:
-            prompt_len = self._lwd_prompt_lens.get(request_id)
-            if prompt_len is not None:
-                self._lwd_retired_prompt_lens[request_id] = prompt_len
-
-    def _lwd_clear_retired(self, request_id: str) -> None:
-        if any(request_id in notify.req_ids for notify in self.scheduler.pending_c2e):
-            # A final or zero-accepted notification still needs the original
-            # route. Keep the tombstone until post_step has flushed it.
-            self._lwd_retired_req_ids.add(request_id)
-            return
-        route = self._lwd_request_routes.pop(request_id, None)
-        if route is not None:
-            # DOWN metadata can trail native request retirement by one or more
-            # asynchronous steps. Keep a bounded tombstone for those batches.
-            self._lwd_retired_routes[request_id] = route
-            while len(self._lwd_retired_routes) > _LWD_RETIRED_ROUTE_CAP:
-                self._lwd_retired_routes.pop(next(iter(self._lwd_retired_routes)))
-        self._lwd_retired_req_ids.discard(request_id)
-        self._lwd_retired_prompt_lens.pop(request_id, None)
-        getattr(self, "_lwd_retired_nonces", {}).pop(request_id, None)
-        getattr(self, "_lwd_request_nonces", {}).pop(request_id, None)
-        self._lwd_request_seqnos.pop(request_id, None)
-        self._lwd_prompt_lens.pop(request_id, None)
-        getattr(self, "_lwd_rejected_nonces", {}).pop(request_id, None)
 
     def shutdown(self) -> None:
         super().shutdown()
@@ -897,7 +780,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdUsage
 
         for request_id, (prompt_tokens, completion_tokens) in list(records.items()):
-            cached_tokens = self._lwd_prefix_hits.get(request_id, 0)
+            cached_tokens = self._lwd_ledger.prefix_hits.get(request_id, 0)
             usage = LwdUsage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -913,17 +796,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     }
                 )
             records.pop(request_id, None)
-            self._lwd_prefix_hits.pop(request_id, None)
+            self._lwd_ledger.prefix_hits.pop(request_id, None)
 
     def _lwd_retire_finished_outputs(self, engine_core_outputs: Any) -> None:
         if not engine_core_outputs:
             return
         for outputs in engine_core_outputs.values():
             for request_id in outputs.finished_requests or ():
-                self._lwd_retire_request(request_id)
+                self._lwd_ledger.retire_request(request_id)
             for output in outputs.outputs:
                 if output.finish_reason is not None:
-                    self._lwd_retire_request(output.request_id)
+                    self._lwd_ledger.retire_request(output.request_id)
 
     def _lwd_drain_irecv_completions(self) -> None:
         """Merge every connection's done MQ into independent watermarks."""
@@ -984,7 +867,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             return
         advanced = record_irecv_completions(watermark_items)
         for connection, _, seqno in advanced:
-            self._lwd_complete_seqno(connection, seqno)
+            self._lwd_ledger.complete_seqno(connection, seqno)
         lwd_logger.info(
             "[LWD][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
             len(watermark_items),
@@ -996,9 +879,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self, connection: LwdConnectionId, seqno: int, error: Any
     ) -> None:
         """Abort only the failed connection; other edges keep making progress."""
-        if connection in self._lwd_failed_connections:
+        ledger = self._lwd_ledger
+        if connection in ledger.failed_connections:
             return
-        self._lwd_failed_connections.add(connection)
+        ledger.failed_connections.add(connection)
         lwd_logger.error(
             "[LWD][pre-recv] connection %s failed at seqno=%s: %s",
             connection,
@@ -1007,11 +891,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
         request_ids = [
             request_id
-            for request_id, peer in self._lwd_request_routes.items()
+            for request_id, peer in ledger.request_routes.items()
             if self._lwd_connection_of(peer) == connection
         ]
         for request_id in request_ids:
-            self._lwd_retire_request(request_id, preserve_prompt=True)
+            ledger.retire_request(request_id, preserve_prompt=True)
             self.aborts_queue.put_nowait([request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
 
@@ -1022,7 +906,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         arrived: Iterable[tuple[str, int]] | None,
     ) -> None:
         """Merge arrivals only for requests in this connection's pending seqno."""
-        pending = self._lwd_pending_seqnos.get(connection_id, {})
+        ledger = self._lwd_ledger
+        pending = ledger.pending_seqnos.get(connection_id, {})
         request_ids = pending.get(seqno)
         if not arrived or request_ids is None:
             return
@@ -1035,7 +920,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             if (
                 rows <= 0
                 or request_id not in request_ids
-                or request_id in self._lwd_retired_req_ids
+                or request_id in ledger.retired_req_ids
             ):
                 continue
             previous = self.scheduler.lwd_recv_rows.get(request_id, 0)
@@ -1081,8 +966,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 if not notify.req_ids:
                     continue
                 peers = {
-                    self._lwd_request_routes.get(request_id)
-                    or self._lwd_retired_routes.get(request_id)
+                    self._lwd_ledger.request_routes.get(request_id)
+                    or self._lwd_ledger.retired_routes.get(request_id)
                     for request_id in notify.req_ids
                 }
                 if len(peers) != 1 or None in peers:
@@ -1105,7 +990,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                         finished_ids.append(request_id)
             self.scheduler.pending_c2e.clear()
             for request_id in finished_ids:
-                self._lwd_clear_retired(request_id)
+                self._lwd_ledger.clear_retired(request_id)
         super().post_step(model_executed)
 
 

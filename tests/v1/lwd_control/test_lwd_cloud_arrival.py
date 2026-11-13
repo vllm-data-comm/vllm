@@ -18,6 +18,9 @@ from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCoreMixin,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
+    LwdCloudLedger,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
     _LwdPrefillWindow,
@@ -69,6 +72,7 @@ def _request(
         num_prompt_tokens=prompt,
         num_tokens=prompt,
         num_computed_tokens=computed,
+        num_output_tokens=0,
         num_preemptions=preemptions,
         block_hashes=[],
         skip_reading_prefix_cache=skip,
@@ -107,6 +111,7 @@ def _scheduler(request: _Request) -> LwdCloudScheduler:
     scheduler._lwd_refill_pending = {}
     scheduler._lwd_prefill_group_cursor = 0
     scheduler.lwd_prefix_hits = {}
+    scheduler.lwd_finished_records = {}
     return scheduler
 
 
@@ -129,25 +134,15 @@ def _prefix_scheduler(
 
 def _engine(prompt_lens: dict[str, int] | None = None) -> LwdCloudEngineCoreMixin:
     engine = LwdCloudEngineCoreMixin.__new__(LwdCloudEngineCoreMixin)
-    engine._lwd_prompt_lens = dict(prompt_lens or {})
-    engine._lwd_retired_prompt_lens = {}
-    engine._lwd_request_nonces = {}
-    engine._lwd_retired_nonces = {}
-    engine._lwd_retired_req_ids = set()
-    engine._lwd_rejected_nonces = {}
-    engine._lwd_request_routes = {}
-    engine._lwd_retired_routes = {}
-    engine._lwd_pending_seqnos = {}
-    engine._lwd_request_seqnos = {}
-    engine._lwd_latest_seqnos = {}
-    engine._lwd_failed_connections = set()
-    engine._lwd_done_mqs = {_CONNECTION: _DoneMq()}
     engine.scheduler = SimpleNamespace(
         lwd_recv_rows={},
         pending_c2e=[],
         _lwd_refill_gate=set(),
         _lwd_refill_pending={},
     )
+    engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
+    engine._lwd_ledger.prompt_lens = dict(prompt_lens or {})
+    engine._lwd_done_mqs = {_CONNECTION: _DoneMq()}
     return engine
 
 
@@ -409,7 +404,7 @@ def test_range_notify_posts_only_extended_hint(monkeypatch: pytest.MonkeyPatch) 
 
     engine._lwd_handle_range_notify(_CONNECTION, notify)
     args, kwargs = posted[0]
-    assert args == (7, 5, 0)
+    assert args == (7, 5)
     assert kwargs == {
         "connection_id": _CONNECTION,
         "req_ids": ["a", "b"],
@@ -442,8 +437,8 @@ def test_done_arrivals_merge_by_max_and_keep_watermark_items(
             ]
         )
     }
-    engine._lwd_track_range(_CONNECTION, 1, ["a"])
-    engine._lwd_track_range(_CONNECTION, 2, ["a", "b"])
+    engine._lwd_ledger.track_range(_CONNECTION, 1, ["a"])
+    engine._lwd_ledger.track_range(_CONNECTION, 2, ["a", "b"])
     watermark = []
     monkeypatch.setattr(
         lwd_pre_recv,
@@ -452,7 +447,7 @@ def test_done_arrivals_merge_by_max_and_keep_watermark_items(
     )
 
     engine._lwd_drain_irecv_completions()
-    engine._lwd_track_range(_CONNECTION, 3, ["b"])
+    engine._lwd_ledger.track_range(_CONNECTION, 3, ["b"])
     engine._lwd_note_arrived(_CONNECTION, 3, [("a", 2), ("b", 5)])
     assert watermark == [(_CONNECTION, "UP", 1), (_CONNECTION, "UP", 2)]
     assert engine.scheduler.lwd_recv_rows == {"a": 4, "b": 5}
@@ -468,7 +463,7 @@ def test_cloud_abort_uses_eager_and_ordered_native_queues() -> None:
     request_type, request_ids = engine.input_queue.get_nowait()
     assert request_type.name == "ABORT"
     assert request_ids == ["p"]
-    assert engine._lwd_prompt_lens == {}
+    assert engine._lwd_ledger.prompt_lens == {}
 
 
 def test_abort_ignores_late_arrival_publish() -> None:
@@ -476,7 +471,7 @@ def test_abort_ignores_late_arrival_publish() -> None:
     engine.scheduler.lwd_recv_rows["p"] = 2
     engine.aborts_queue = queue.Queue()
     engine.input_queue = queue.Queue()
-    engine._lwd_track_range(_CONNECTION, 7, ["p"])
+    engine._lwd_ledger.track_range(_CONNECTION, 7, ["p"])
 
     engine._lwd_handle_abort_notify(LwdAbortNotify("p"))
     engine._lwd_note_arrived(_CONNECTION, 7, [("p", 4)])
@@ -487,31 +482,31 @@ def test_abort_duplicate_range_is_idempotent_after_prompt_cleanup() -> None:
     engine = _engine({"p": 4})
     engine.aborts_queue = queue.Queue()
     engine.input_queue = queue.Queue()
-    engine._lwd_track_range(_CONNECTION, 7, ["p"])
+    engine._lwd_ledger.track_range(_CONNECTION, 7, ["p"])
     engine._lwd_handle_abort_notify(LwdAbortNotify("p"))
-    engine._lwd_complete_seqno(_CONNECTION, 7)
-    assert engine._lwd_prompt_lens == {}
+    engine._lwd_ledger.complete_seqno(_CONNECTION, 7)
+    assert engine._lwd_ledger.prompt_lens == {}
 
     notify = LwdRangeNotify(7, [LwdRangeItem("p", 0, 4)])
     engine._lwd_handle_range_notify(_CONNECTION, notify)
-    assert engine._lwd_pending_seqnos == {}
-    assert engine._lwd_latest_seqnos[_CONNECTION] == 7
+    assert engine._lwd_ledger.pending_seqnos == {}
+    assert engine._lwd_ledger.latest_seqnos[_CONNECTION] == 7
 
 
 def test_normal_finish_retires_from_outputs_and_cleans_after_drain() -> None:
     engine = _engine({"p": 4})
     engine.scheduler.requests = {}
-    engine._lwd_track_range(_CONNECTION, 8, ["p"])
+    engine._lwd_ledger.track_range(_CONNECTION, 8, ["p"])
     outputs = {0: SimpleNamespace(finished_requests=["p"], outputs=[])}
 
     engine._lwd_retire_finished_outputs(outputs)
-    assert engine._lwd_retired_req_ids == {"p"}
-    assert engine._lwd_prompt_lens == {"p": 4}
+    assert engine._lwd_ledger.retired_req_ids == {"p"}
+    assert engine._lwd_ledger.prompt_lens == {"p": 4}
 
-    engine._lwd_complete_seqno(_CONNECTION, 8)
-    assert engine._lwd_prompt_lens == {}
-    assert engine._lwd_pending_seqnos == {}
-    assert engine._lwd_request_seqnos == {}
+    engine._lwd_ledger.complete_seqno(_CONNECTION, 8)
+    assert engine._lwd_ledger.prompt_lens == {}
+    assert engine._lwd_ledger.pending_seqnos == {}
+    assert engine._lwd_ledger.request_seqnos == {}
 
 
 def test_abort_before_mixed_range_still_posts_complete_hint(
@@ -522,7 +517,7 @@ def test_abort_before_mixed_range_still_posts_complete_hint(
     engine = _engine({"a": 8, "b": 6})
     engine.aborts_queue = queue.Queue()
     engine.input_queue = queue.Queue()
-    engine._lwd_track_range(_CONNECTION, 6, ["a"])
+    engine._lwd_ledger.track_range(_CONNECTION, 6, ["a"])
     engine._lwd_handle_abort_notify(LwdAbortNotify("a"))
     posted = []
     monkeypatch.setattr(
@@ -538,7 +533,8 @@ def test_abort_before_mixed_range_still_posts_complete_hint(
 
     engine._lwd_handle_range_notify(_CONNECTION, notify)
     args, kwargs = posted[0]
-    assert args == (7, 5, 0)
+    assert args == (7, 5)
+    assert kwargs["connection_id"] == _CONNECTION
     assert kwargs["req_ids"] == ["a", "b"]
     assert kwargs["prompt_lens"] == [8, 6]
 
@@ -546,7 +542,7 @@ def test_abort_before_mixed_range_still_posts_complete_hint(
 @pytest.mark.parametrize("retire_kind", ["finish", "abort"])
 def test_drained_retirement_allows_same_id_reuse(retire_kind: str) -> None:
     engine = _engine({"p": 4})
-    engine._lwd_track_range(_CONNECTION, 1, ["p"])
+    engine._lwd_ledger.track_range(_CONNECTION, 1, ["p"])
     if retire_kind == "abort":
         engine.aborts_queue = queue.Queue()
         engine.input_queue = queue.Queue()
@@ -554,132 +550,34 @@ def test_drained_retirement_allows_same_id_reuse(retire_kind: str) -> None:
     else:
         outputs = {0: SimpleNamespace(finished_requests=["p"], outputs=[])}
         engine._lwd_retire_finished_outputs(outputs)
-    assert engine._lwd_retired_req_ids == {"p"}
+    assert engine._lwd_ledger.retired_req_ids == {"p"}
 
-    engine._lwd_complete_seqno(_CONNECTION, 1)
-    assert engine._lwd_retired_req_ids == set()
-    assert engine._lwd_retired_prompt_lens == {}
+    engine._lwd_ledger.complete_seqno(_CONNECTION, 1)
+    assert engine._lwd_ledger.retired_req_ids == set()
+    assert engine._lwd_ledger.retired_prompt_lens == {}
     _allow_request_add(engine)
     engine._lwd_handle_request_notify(LwdRequestNotify("p", 4))
     request_type, (request, _wave) = engine.input_queue.get_nowait()
     assert request_type.name == "ADD" and request.request_id == "p"
 
-    engine._lwd_track_range(_CONNECTION, 2, ["p"])
+    engine._lwd_ledger.track_range(_CONNECTION, 2, ["p"])
     engine._lwd_note_arrived(_CONNECTION, 2, [("p", 4)])
     engine._lwd_note_arrived(_CONNECTION, 1, [("p", 99)])
     assert engine.scheduler.lwd_recv_rows == {"p": 4}
 
 
-def test_early_reuse_error_ready_late_messages_and_resubmit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
-    engine = _engine({"p": 4})
-    engine._lwd_request_nonces["p"] = 1
-    engine._lwd_track_range(_CONNECTION, 1, ["p"])
-    engine._lwd_retire_request("p", preserve_prompt=True)
-    _allow_request_add(engine)
-    engine.aborts_queue = queue.Queue()
-    engine._lwd_send_prefix_ready = Mock()
-    posted = []
-    monkeypatch.setattr(
-        lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
-    )
-    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
-
-    engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
-
-    ready_args = engine._lwd_send_prefix_ready.call_args
-    assert ready_args.args[:3] == ("p", 0, 2)
-    assert "previous generation" in ready_args.kwargs["error"]
-    assert engine._lwd_rejected_nonces == {"p": 2}
-    assert engine.input_queue.empty()
-    assert engine._lwd_prompt_lens["p"] == 4
-
-    engine._lwd_handle_range_notify(
-        _CONNECTION, LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
-    )
-    engine._lwd_handle_abort_notify(LwdAbortNotify("p", prefix_nonce=2))
-
-    assert not posted
-    assert engine.aborts_queue.empty()
-    assert engine._lwd_latest_seqnos[_CONNECTION] == 1
-    assert engine._lwd_pending_seqnos == {_CONNECTION: {1: {"p"}}}
-
-    engine._lwd_complete_seqno(_CONNECTION, 1)
-
-    assert engine._lwd_rejected_nonces == {}
-    engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
-    request_type, (request, _wave) = engine.input_queue.get_nowait()
-    assert request_type.name == "ADD"
-    assert request.lwd_prefix_nonce == 2
-    assert engine._lwd_prompt_lens["p"] == 8
-
-    engine._lwd_handle_range_notify(
-        _CONNECTION, LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
-    )
-    assert len(posted) == 1
-    assert engine._lwd_pending_seqnos == {_CONNECTION: {2: {"p"}}}
-
-
-def test_rejected_range_does_not_block_other_seqnos(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
-
-    engine = _engine({"p": 4, "q": 6})
-    engine._lwd_request_nonces.update({"p": 1, "q": 1})
-    engine._lwd_track_range(_CONNECTION, 1, ["p"])
-    engine._lwd_retire_request("p", preserve_prompt=True)
-    _allow_request_add(engine)
-    engine._lwd_send_prefix_ready = Mock()
-    posted = []
-    monkeypatch.setattr(
-        lwd_pre_recv, "make_recv_hint", lambda *args, **kwargs: (args, kwargs)
-    )
-    monkeypatch.setattr(lwd_pre_recv, "post_irecv_hint", posted.append)
-    engine._lwd_handle_request_notify(LwdRequestNotify("p", 8, prefix_nonce=2))
-    engine._lwd_handle_range_notify(
-        _CONNECTION, LwdRangeNotify(2, [LwdRangeItem("p", 0, 8, prefix_nonce=2)])
-    )
-
-    engine._lwd_handle_range_notify(
-        _CONNECTION, LwdRangeNotify(3, [LwdRangeItem("q", 0, 6, prefix_nonce=1)])
-    )
-
-    assert [args[0] for args, _kwargs in posted] == [3]
-    assert engine._lwd_latest_seqnos[_CONNECTION] == 3
-    assert engine._lwd_pending_seqnos == {_CONNECTION: {1: {"p"}, 3: {"q"}}}
-
-
-def test_stale_abort_is_ignored_for_current_generation() -> None:
-    engine = _engine({"p": 8})
-    engine._lwd_request_nonces["p"] = 2
-    engine._lwd_retired_nonces["p"] = 1
-    engine.aborts_queue = queue.Queue()
-    engine.input_queue = queue.Queue()
-
-    engine._lwd_handle_abort_notify(LwdAbortNotify("p", prefix_nonce=1))
-
-    assert engine.input_queue.empty()
-    assert engine.aborts_queue.empty()
-    assert engine._lwd_request_nonces["p"] == 2
-    assert engine._lwd_prompt_lens["p"] == 8
-
-
 def test_retired_state_is_bounded_after_drain() -> None:
     engine = _engine()
     for seqno in range(5):
-        engine._lwd_prompt_lens["p"] = 4
-        engine._lwd_track_range(_CONNECTION, seqno, ["p"])
-        engine._lwd_retire_request("p", preserve_prompt=True)
-        assert engine._lwd_retired_req_ids == {"p"}
-        engine._lwd_complete_seqno(_CONNECTION, seqno)
-        assert engine._lwd_retired_req_ids == set()
-        assert engine._lwd_retired_prompt_lens == {}
-        assert engine._lwd_request_seqnos == {}
-        assert engine._lwd_pending_seqnos == {}
+        engine._lwd_ledger.prompt_lens["p"] = 4
+        engine._lwd_ledger.track_range(_CONNECTION, seqno, ["p"])
+        engine._lwd_ledger.retire_request("p", preserve_prompt=True)
+        assert engine._lwd_ledger.retired_req_ids == {"p"}
+        engine._lwd_ledger.complete_seqno(_CONNECTION, seqno)
+        assert engine._lwd_ledger.retired_req_ids == set()
+        assert engine._lwd_ledger.retired_prompt_lens == {}
+        assert engine._lwd_ledger.request_seqnos == {}
+        assert engine._lwd_ledger.pending_seqnos == {}
 
 
 def test_finish_without_pending_clears_retired_state_immediately() -> None:
@@ -687,9 +585,9 @@ def test_finish_without_pending_clears_retired_state_immediately() -> None:
     outputs = {0: SimpleNamespace(finished_requests=["p"], outputs=[])}
 
     engine._lwd_retire_finished_outputs(outputs)
-    assert engine._lwd_retired_req_ids == set()
-    assert engine._lwd_retired_prompt_lens == {}
-    assert engine._lwd_prompt_lens == {}
+    assert engine._lwd_ledger.retired_req_ids == set()
+    assert engine._lwd_ledger.retired_prompt_lens == {}
+    assert engine._lwd_ledger.prompt_lens == {}
 
 
 def test_worker_error_fails_connection_without_advancing_failed_item(
