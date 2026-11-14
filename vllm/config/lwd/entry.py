@@ -86,14 +86,6 @@ class LwdConfig:
             api=api if api is not None else LwdAPIConfig(),
         )
 
-    def skips_module(self, path: str) -> bool:
-        """Whether this role replaces a model component with a placeholder."""
-        if self.role == "edge":
-            return path == "model.norm" or path.endswith(".model.norm")
-        if self.role == "cloud":
-            return path == "visual" or path.endswith(".visual")
-        return False
-
     @property
     def instance(self) -> LwdInstance:
         return self.topology.instance(self.role, self.instance_id)

@@ -95,7 +95,7 @@ PR4  F3 结构化输出     LWD_MESSAGE_VERSION bump + 5 接缝 + picker 过滤
 
 | 层 | 验证项 |
 | --- | --- |
-| F1 单测 | `skips_module` 点路径后缀匹配 (含 `visual.merger.norm` 反例); 完整 checkpoint + 过滤器 == 切片 checkpoint 加载结果 |
+| F1 单测 | `lwd_skips_module` 点路径后缀匹配 (含 `visual.merger.norm` 反例); 完整 checkpoint + 过滤器 == 切片 checkpoint 加载结果 |
 | F1 集成 | 两侧各自从本方切片启动成功; 误用对方切片应在加载期失败 (占位模块无参数) |
 | F2 单测 | 规则覆盖报告 (每个张量有归宿); 两次切分逐字节一致; 源目录只读 guard |
 | F3 单测 | wire 序列化/反序列化 roundtrip; 私有字段 (`_backend`) 处理 |
