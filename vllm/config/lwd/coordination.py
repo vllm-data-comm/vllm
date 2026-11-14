@@ -3,19 +3,16 @@
 """Cache coordination metadata only; no key reads, clients or server startup."""
 
 from typing import Annotated, Any
-from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, Field, StrictBool, field_validator
 from pydantic.dataclasses import dataclass
 
-from .topology import LwdPort, LwdString
-
-
-def _validate_http_url(value: str | None) -> None:
-    if value is not None:
-        url = urlsplit(value)
-        if url.scheme not in ("http", "https") or not url.hostname:
-            raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+from .topology import (
+    LwdPort,
+    LwdString,
+    _validate_control_url_map,
+    _validate_http_url,
+)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -47,11 +44,7 @@ class LwdCoordinationConfig:
     @field_validator("control_url_map")
     @classmethod
     def validate_url_map(cls, value: dict[int, str]) -> dict[int, str]:
-        for cloud_id, url in value.items():
-            if cloud_id < 0:
-                raise ValueError("[LWD] control_url_map keys must be non-negative")
-            _validate_http_url(url)
-        return value
+        return _validate_control_url_map(value)
 
     @classmethod
     def from_dict(
