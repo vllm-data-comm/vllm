@@ -496,7 +496,7 @@ class LwdTopology:
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
         if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
             raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
-        if scene == "lwd_cluster" and (edge_count < 1 or cloud_count < 2):
+        if scene == "lwd_cluster" and cloud_count < 2:
             raise ValueError("[LWD] lwd_cluster requires at least two clouds")
         # Coordination may be enabled explicitly in every scene. Shared and
         # multi-cloud scenes require it for every instance.
@@ -504,13 +504,13 @@ class LwdTopology:
             for edge in self.edges:
                 if edge.coordination is None or not edge.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each edge instance to have "
+                        f"[LWD] {scene} requires each edge instance to have "
                         "an enabled coordination block"
                     )
             for cloud in self.clouds:
                 if cloud.coordination is None or not cloud.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each cloud instance to have "
+                        f"[LWD] {scene} requires each cloud instance to have "
                         "an enabled coordination block"
                     )
         if scene == "edge_share":
