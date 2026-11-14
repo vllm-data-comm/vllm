@@ -95,15 +95,19 @@ def test_lwd_down_meta_harvested_before_output_enqueue(monkeypatch):
         raising=False,
     )
     ready_event = object()
+    connection = "conn-0"
     output = SimpleNamespace(
-        lwd_down_carrier=(
-            torch.tensor([10, 11], dtype=torch.int32),
-            [2, 1],
-            ["req-a", "req-b"],
-            99,
-            7,
-        ),
-        lwd_meta_ready_event=ready_event,
+        lwd_down_carriers=[
+            (
+                torch.tensor([10, 11], dtype=torch.int32),
+                [2, 1],
+                ["req-a", "req-b"],
+                99,
+                7,
+                connection,
+            )
+        ],
+        lwd_meta_ready_events={connection: ready_event},
     )
     enqueued = []
 
@@ -123,8 +127,11 @@ def test_lwd_down_meta_harvested_before_output_enqueue(monkeypatch):
         "synchronize",
         "enqueue",
     ]
-    assert not hasattr(output, "lwd_meta_ready_event")
-    packed, req_ids, hidden_numel, seqno = output.lwd_down_carrier
+    assert not hasattr(output, "lwd_meta_ready_events")
+    packed, req_ids, hidden_numel, seqno, harvested_connection = (
+        output.lwd_down_carriers[0]
+    )
+    assert harvested_connection == connection
     assert packed.tolist() == [10, 11, 2, 1]
     assert req_ids == ["req-a", "req-b"]
     assert hidden_numel == 99
@@ -134,13 +141,16 @@ def test_lwd_down_meta_harvested_before_output_enqueue(monkeypatch):
 
 def test_lwd_down_meta_requires_ready_event():
     output = SimpleNamespace(
-        lwd_down_carrier=(
-            torch.tensor([10], dtype=torch.int32),
-            None,
-            ["req-a"],
-            99,
-            7,
-        )
+        lwd_down_carriers=[
+            (
+                torch.tensor([10], dtype=torch.int32),
+                None,
+                ["req-a"],
+                99,
+                7,
+                "conn-0",
+            )
+        ]
     )
     worker_proc: Any = WorkerProc.__new__(WorkerProc)
     worker_proc.worker_response_mq = None
@@ -150,7 +160,7 @@ def test_lwd_down_meta_requires_ready_event():
 
 
 def test_enqueue_output_without_lwd_carrier_is_unchanged():
-    output = SimpleNamespace(lwd_down_carrier=None)
+    output = SimpleNamespace(lwd_down_carriers=None)
     enqueued = []
     worker_proc: Any = WorkerProc.__new__(WorkerProc)
     worker_proc.worker_response_mq = SimpleNamespace(enqueue=enqueued.append)
@@ -159,4 +169,4 @@ def test_enqueue_output_without_lwd_carrier_is_unchanged():
 
     assert enqueued == [(WorkerProc.ResponseStatus.SUCCESS, output)]
     assert not hasattr(worker_proc, "_lwd_harvest_stream")
-    assert not hasattr(worker_proc, "_lwd_harvest_pinned")
+    assert not hasattr(worker_proc, "_lwd_harvest_pinned_by_connection")

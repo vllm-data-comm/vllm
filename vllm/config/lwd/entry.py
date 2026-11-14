@@ -58,10 +58,9 @@ class LwdConfig:
         api: LwdAPIConfig | None = None,
     ) -> "LwdConfig":
         """Build an entry around an already parsed in-memory topology."""
-        topology.instance(role, identity)
+        instance = topology.instance(role, identity)
         coordination = None
         # coordination is embedded in each instance, not at the top level.
-        instance = topology.instance(role, identity)
         if instance.coordination is not None:
             coord_dict = asdict(instance.coordination)
             coordination = LwdCoordinationConfig.from_dict(
@@ -69,14 +68,6 @@ class LwdConfig:
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)
-            unknown_clouds = set(coordination.control_url_map) - {
-                cloud.id for cloud in topology.clouds
-            }
-            if unknown_clouds:
-                raise ValueError(
-                    f"[LWD] control_url_map references unknown clouds "
-                    f"{sorted(unknown_clouds)}"
-                )
         return cls(
             path,
             role,
@@ -85,14 +76,6 @@ class LwdConfig:
             coordination,
             api=api if api is not None else LwdAPIConfig(),
         )
-
-    def skips_module(self, path: str) -> bool:
-        """Whether this role replaces a model component with a placeholder."""
-        if self.role == "edge":
-            return path == "model.norm" or path.endswith(".model.norm")
-        if self.role == "cloud":
-            return path == "visual" or path.endswith(".visual")
-        return False
 
     @property
     def instance(self) -> LwdInstance:

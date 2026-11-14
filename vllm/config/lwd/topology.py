@@ -45,6 +45,14 @@ def _validate_http_url(value: str | None) -> None:
             raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
 
 
+def _validate_control_url_map(value: dict[int, str]) -> dict[int, str]:
+    for cloud_id, url in value.items():
+        if cloud_id < 0:
+            raise ValueError("[LWD] control_url_map keys must be non-negative")
+        _validate_http_url(url)
+    return value
+
+
 class _UniqueKeyLoader(yaml.SafeLoader):
     """Reject duplicate mapping keys instead of silently replacing values."""
 
@@ -203,11 +211,7 @@ class LwdCoordination:
     @field_validator("control_url_map")
     @classmethod
     def validate_url_map(cls, value: dict[int, str]) -> dict[int, str]:
-        for cloud_id, url in value.items():
-            if cloud_id < 0:
-                raise ValueError("[LWD] control_url_map keys must be non-negative")
-            _validate_http_url(url)
-        return value
+        return _validate_control_url_map(value)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -352,6 +356,7 @@ class LwdTopology:
                     "[LWD] ctrl_port is required on clouds and omitted on edges"
                 )
         self._validate_scene()
+        self._validate_coordination()
         if len({len(instance.dp) for instance in (*self.edges, *self.clouds)}) != 1:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
@@ -403,6 +408,19 @@ class LwdTopology:
         for addr, ports in by_addr.items():
             if len(ports) != len(set(ports)):
                 raise ValueError(f"[LWD] duplicate data_port on {addr}")
+
+    def _validate_coordination(self) -> None:
+        """Validate the cloud ids every coordination block refers to."""
+        cloud_ids = {cloud.id for cloud in self.clouds}
+        for instance in (*self.edges, *self.clouds):
+            coordination = instance.coordination
+            if coordination is None:
+                continue
+            unknown = set(coordination.control_url_map) - cloud_ids
+            if unknown:
+                raise ValueError(
+                    f"[LWD] control_url_map references unknown clouds {sorted(unknown)}"
+                )
 
     def _validate_ranks(self) -> None:
         if self.deployment.data_plane_host is not None:
@@ -477,7 +495,7 @@ class LwdTopology:
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
         if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
             raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
-        if scene == "lwd_cluster" and (edge_count < 1 or cloud_count < 2):
+        if scene == "lwd_cluster" and cloud_count < 2:
             raise ValueError("[LWD] lwd_cluster requires at least two clouds")
         # Coordination may be enabled explicitly in every scene. Shared and
         # multi-cloud scenes require it for every instance.
@@ -485,13 +503,13 @@ class LwdTopology:
             for edge in self.edges:
                 if edge.coordination is None or not edge.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each edge instance to have "
+                        f"[LWD] {scene} requires each edge instance to have "
                         "an enabled coordination block"
                     )
             for cloud in self.clouds:
                 if cloud.coordination is None or not cloud.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each cloud instance to have "
+                        f"[LWD] {scene} requires each cloud instance to have "
                         "an enabled coordination block"
                     )
         if scene == "edge_share":

@@ -59,8 +59,6 @@ logger = init_lwd_logger(__name__)
 
 # Upper bound of IO thread latency for hello retries and shutdown.
 _LWD_IO_POLL_TICK_MS = 100
-# Retry period of a payload held back by a full link.
-_LWD_HOLD_RETRY_TICK_MS = 10
 _LWD_STARTUP_TIMEOUT_S = 30.0
 _LWD_SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 # The inproc pipe capacity is SNDHWM + RCVHWM, so the IO side stays minimal
@@ -191,9 +189,6 @@ class _LwdRegisteredPeers:
     def __contains__(self, peer: object) -> bool:
         return peer in self._peers
 
-    def snapshot(self) -> frozenset[LwdPeer]:
-        return self._peers
-
 
 class LwdControlSender:
     """Engine-side handle for outbound payloads, bound to its creating thread."""
@@ -274,10 +269,6 @@ class LwdControlPlane(ABC):
         self._num_dropped: dict[LwdPeer, int] = {}
         self._held: dict[LwdPeer, deque[bytes]] = {}
         self._held_since: dict[LwdPeer, float] = {}
-
-    @property
-    def registered_peers(self) -> frozenset[LwdPeer]:
-        return self._registered_peers.snapshot()
 
     def start(self, listener: LwdControlListener) -> LwdControlSender:
         """Open the link on a new IO thread and return the outbound handle.
@@ -526,9 +517,6 @@ class LwdControlPlane(ABC):
         logger.warning(
             "[LWD][control-plane] %s: peer %s down: %s", self._label, peer, reason
         )
-        callback = getattr(self._listener, "on_peer_down", None)
-        if callback is not None:
-            callback(peer)
 
     def _register_peer(self, peer: LwdPeer) -> None:
         self._registered_peers.add(peer)
@@ -562,6 +550,8 @@ class LwdControlPlane(ABC):
         """Routing identity of `peer` for outbound frames."""
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
+        # Static deployments use startup handshake and explicit socket errors;
+        # idle periods never invalidate an established peer.
         return None
 
 
@@ -856,11 +846,6 @@ class LwdCloudControlPlane(LwdControlPlane):
     def _on_peer_unreachable(self, peer: LwdPeer) -> None:
         if self._handshake.drop_peer(peer) is not None:
             self._unregister_peer(peer, "ROUTER reported the DEALER unreachable")
-
-    def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
-        # Static deployments use startup handshake and explicit socket errors;
-        # idle periods never invalidate an established peer.
-        return None
 
     def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
         identity = self._handshake.identity_of(peer)
