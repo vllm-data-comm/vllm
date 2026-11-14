@@ -11,6 +11,7 @@ hold of full links and the startup failure when a cloud is missing.
 from __future__ import annotations
 
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -75,7 +76,7 @@ def _drain(recorders: list[_Recorder], count: int, timeout_s: float) -> None:
         time.sleep(0.05)
 
 
-def test_edge_serves_every_cloud_dp_rank() -> None:
+def test_edge_serves_every_cloud_dp_rank(monkeypatch: pytest.MonkeyPatch) -> None:
     ports = _LWD_TEST_PORTS[:2]
     clouds = [_cloud(0, ports[0], 2), _cloud(1, ports[1], 2)]
     recorders = [_Recorder(), _Recorder()]
@@ -85,17 +86,31 @@ def test_edge_serves_every_cloud_dp_rank() -> None:
     edge_sender = edge.start(edge_recorder)
     try:
         peers = edge.wait_until_ready(_LWD_WAIT_S)
-        assert sorted(peers) == [0, 1]
+        connections = tuple(sorted(peers))
+        assert [connection.dp_rank for connection in connections] == [0, 1]
         assert [r.peers for r in recorders] == [[p] for p in peers.values()]
 
+        cloud_touch = []
+        for cloud in clouds:
+            touch = Mock(wraps=cloud._handshake.touch)
+            monkeypatch.setattr(cloud._handshake, "touch", touch)
+            cloud_touch.append(touch)
+        edge_touch = {}
+        for connection in connections:
+            handshake = edge._handshakes[connection]
+            touch = Mock(wraps=handshake.touch)
+            monkeypatch.setattr(handshake, "touch", touch)
+            edge_touch[connection] = touch
+
         # Directed sends reach only the addressed cloud DP rank.
-        assert edge_sender.send(peers[0], b"to-dp0")
-        assert edge_sender.send(peers[1], b"to-dp1")
+        assert edge_sender.send(peers[connections[0]], b"to-dp0")
+        assert edge_sender.send(peers[connections[1]], b"to-dp1")
         _drain(recorders, 2, _LWD_WAIT_S)
         assert [p for _peer, p in recorders[0].payloads] == [b"to-dp0"]
         assert [p for _peer, p in recorders[1].payloads] == [b"to-dp1"]
+        assert all(touch.call_count >= 1 for touch in cloud_touch)
 
-        # Inbound payloads attribute to the link's peer.
+        # Inbound payloads attribute to the link's peer and refresh liveness.
         assert senders[0].send(recorders[0].peers[0], b"from-dp0")
         assert senders[1].send(recorders[1].peers[0], b"from-dp1")
         _drain([edge_recorder], 2, _LWD_WAIT_S)
@@ -103,6 +118,7 @@ def test_edge_serves_every_cloud_dp_rank() -> None:
             0: b"from-dp0",
             1: b"from-dp1",
         }
+        assert all(touch.call_count == 1 for touch in edge_touch.values())
         assert not edge_recorder.fatal
         assert all(not r.fatal for r in recorders)
     finally:

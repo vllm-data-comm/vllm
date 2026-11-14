@@ -18,13 +18,14 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Protocol
 
 import msgspec
 import zmq
 
-from vllm.config.lwd.topology import LwdControlPlaneConfig
+from vllm.config.lwd.topology import LwdConnectionId, LwdControlPlaneConfig
 from vllm.lwd_logger import init_lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_handshake import (
     LwdCloudHandshake,
@@ -58,8 +59,6 @@ logger = init_lwd_logger(__name__)
 
 # Upper bound of IO thread latency for hello retries and shutdown.
 _LWD_IO_POLL_TICK_MS = 100
-# Retry period of a payload held back by a full link.
-_LWD_HOLD_RETRY_TICK_MS = 10
 _LWD_STARTUP_TIMEOUT_S = 30.0
 _LWD_SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 # The inproc pipe capacity is SNDHWM + RCVHWM, so the IO side stays minimal
@@ -118,19 +117,43 @@ class LwdControlPlaneSpec:
 class LwdCloudControlPlaneSpec(LwdControlPlaneSpec):
     bind_endpoint: str
     """Endpoint the cloud listens on, e.g. "tcp://0.0.0.0:5550"."""
+    expected_edge_ids: tuple[int, ...] = ()
+    """Topology-declared edges; empty disables the allowlist for unit tests."""
 
 
 @dataclass(frozen=True, kw_only=True)
 class LwdEdgeControlPlaneSpec(LwdControlPlaneSpec):
     cloud_endpoints: tuple[str, ...]
-    """Endpoints of the cloud DP ranks this engine serves, by dp_idx order;
-    e.g. ("tcp://10.1.0.1:5550", "tcp://10.1.0.1:5551"). Link i connects to
-    the cloud DP rank i and registers as that link's dp_rank."""
+    """Cloud DP endpoints, ordered by their parallel `connection_ids`."""
+    connection_ids: tuple[LwdConnectionId, ...] = ()
+    cloud_dp_sizes: tuple[int, ...] = ()
+    """DP size of each remote cloud, not the total number of connections."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if not self.cloud_endpoints:
             raise ValueError("[LWD] edge control plane needs a cloud endpoint")
+        if not self.connection_ids:
+            object.__setattr__(
+                self,
+                "connection_ids",
+                tuple(
+                    LwdConnectionId(self.instance_id, 0, dp_idx)
+                    for dp_idx in range(len(self.cloud_endpoints))
+                ),
+            )
+        if not self.cloud_dp_sizes:
+            object.__setattr__(
+                self,
+                "cloud_dp_sizes",
+                (len(self.cloud_endpoints),) * len(self.cloud_endpoints),
+            )
+        if not (
+            len(self.cloud_endpoints)
+            == len(self.connection_ids)
+            == len(self.cloud_dp_sizes)
+        ):
+            raise ValueError("[LWD] cloud endpoint identity/size arrays must align")
         if self.dp_rank != 0:
             raise ValueError(
                 f"[LWD] one edge process serves every DP connection; its "
@@ -155,15 +178,16 @@ class _LwdRegisteredPeers:
         with self._write_lock:
             self._peers = self._peers | {peer}
 
+    def discard(self, peer: LwdPeer) -> None:
+        with self._write_lock:
+            self._peers = self._peers - {peer}
+
     def clear(self) -> None:
         with self._write_lock:
             self._peers = frozenset()
 
     def __contains__(self, peer: object) -> bool:
         return peer in self._peers
-
-    def snapshot(self) -> frozenset[LwdPeer]:
-        return self._peers
 
 
 class LwdControlSender:
@@ -239,15 +263,12 @@ class LwdControlPlane(ABC):
         self._thread: threading.Thread | None = None
         self._sender: LwdControlSender | None = None
         self._is_shut_down = False
-        # IO thread only. One held payload per peer, so a full link holds
-        # only its own payloads and the other links keep flowing.
+        # IO thread only. Each peer has an independent bounded FIFO. A full
+        # FIFO applies backpressure through the shared inproc socket rather
+        # than dropping an already-accepted payload; inbound IO stays live.
         self._num_dropped: dict[LwdPeer, int] = {}
-        self._held: dict[LwdPeer, bytes] = {}
+        self._held: dict[LwdPeer, deque[bytes]] = {}
         self._held_since: dict[LwdPeer, float] = {}
-
-    @property
-    def registered_peers(self) -> frozenset[LwdPeer]:
-        return self._registered_peers.snapshot()
 
     def start(self, listener: LwdControlListener) -> LwdControlSender:
         """Open the link on a new IO thread and return the outbound handle.
@@ -301,7 +322,7 @@ class LwdControlPlane(ABC):
             self._sender.close()
         if self._thread is not None and self._thread.is_alive():
             logger.error(
-                "control plane %s: IO thread still alive after %.1fs; "
+                "[LWD][control-plane] %s: IO thread still alive after %.1fs; "
                 "destroying its context",
                 self._label,
                 join_timeout_s,
@@ -309,7 +330,7 @@ class LwdControlPlane(ABC):
             self._ctx.destroy(linger=0)
             return
         self._ctx.term()
-        logger.info("control plane %s shut down", self._label)
+        logger.info("[LWD][control-plane] %s shut down", self._label)
 
     # ---------------------------------------------------------------- IO thread
 
@@ -321,11 +342,11 @@ class LwdControlPlane(ABC):
             self._opened.set()
             return
         self._opened.set()
-        logger.info("control plane %s opened %s", self._label, self.endpoint)
+        logger.info("[LWD][control-plane] %s opened %s", self._label, self.endpoint)
         try:
             self._io_loop(transport, outbound)
         except Exception as e:
-            logger.exception("control plane %s: IO thread crashed", self._label)
+            logger.exception("[LWD][control-plane] %s: IO thread crashed", self._label)
             self._on_io_crash(f"IO thread crashed: {e!r}")
         finally:
             transport.close()
@@ -348,21 +369,11 @@ class LwdControlPlane(ABC):
         poller = zmq.Poller()
         for socket in transport.sockets:
             poller.register(socket, zmq.POLLIN)
-        outbound_polled = False
+        poller.register(outbound, zmq.POLLIN)
         while not self._stop.is_set():
-            # While every readable peer's payload is held the outbound queue
-            # is not read, so polling it would spin; held payloads are
-            # retried on a tick.
-            should_poll_outbound = not self._held
-            if should_poll_outbound != outbound_polled:
-                if should_poll_outbound:
-                    poller.register(outbound, zmq.POLLIN)
-                else:
-                    poller.unregister(outbound)
-                outbound_polled = should_poll_outbound
-            poller.poll(
-                _LWD_IO_POLL_TICK_MS if outbound_polled else _LWD_HOLD_RETRY_TICK_MS
-            )
+            # Drain the inproc queue while peer FIFOs have room. Blocked peers
+            # retain their FIFOs; inbound traffic continues to be processed.
+            poller.poll(_LWD_IO_POLL_TICK_MS)
             self._drain_inbound(transport)
             if self._stop.is_set():
                 return
@@ -385,7 +396,7 @@ class LwdControlPlane(ABC):
             msg = lwd_decode_link_message(body)
         except (msgspec.DecodeError, msgspec.ValidationError) as e:
             logger.warning(
-                "control plane %s: dropped malformed link frame from %r: %s",
+                "[LWD][control-plane] %s: dropped malformed link frame from %r: %s",
                 self._label,
                 identity,
                 e,
@@ -401,7 +412,7 @@ class LwdControlPlane(ABC):
         peer = self._inbound_peer(identity if link is None else str(link).encode())
         if peer is None:
             logger.warning(
-                "control plane %s: dropped payload from unregistered %r",
+                "[LWD][control-plane] %s: dropped payload from unregistered %r",
                 self._label,
                 identity,
             )
@@ -413,38 +424,51 @@ class LwdControlPlane(ABC):
         self, transport: LwdControlTransport, outbound: zmq.Socket
     ) -> None:
         while True:
-            if not self._held:
-                try:
-                    peer_frame, payload = outbound.recv_multipart(zmq.NOBLOCK)
-                except zmq.Again:
-                    return
-                peer = lwd_decode_peer(peer_frame)
-                self._held[peer] = payload
-            # Retry every held payload; one full link holds only its own.
-            for peer, payload in list(self._held.items()):
-                if self._deliver(transport, peer, payload):
+            # Once any peer FIFO reaches its bound, leave further messages in
+            # the inproc PULL socket. This applies backpressure to senders
+            # instead of acknowledging a message here and silently dropping it
+            # later. Inbound traffic and already-held peers are still drained.
+            if any(
+                len(queue) >= self.spec.config.send_queue_max
+                for queue in self._held.values()
+            ):
+                break
+            try:
+                peer_frame, payload = outbound.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            peer = lwd_decode_peer(peer_frame)
+            self._held.setdefault(peer, deque()).append(payload)
+
+        # Retry only each FIFO's head, preserving per-peer ordering while
+        # allowing every other peer to make progress.
+        for peer, queue in list(self._held.items()):
+            if not queue:
+                self._release_held(peer)
+                continue
+            if self._deliver(transport, peer, queue[0]):
+                queue.popleft()
+                if not queue:
                     self._release_held(peer)
-                else:
-                    self._note_held(peer)
-            if self._held:
-                return  # At least one link is full; retry on the next tick.
+            else:
+                self._note_held(peer)
 
     def _note_held(self, peer: LwdPeer) -> None:
         if peer not in self._held_since:
             self._held_since[peer] = time.monotonic()
             logger.warning(
-                "control plane %s: link to %s is full or not connected; "
+                "[LWD][control-plane] %s: link to %s is full or not connected; "
                 "holding outbound payloads",
                 self._label,
                 peer,
             )
 
     def _release_held(self, peer: LwdPeer) -> None:
-        del self._held[peer]
+        self._held.pop(peer, None)
         held_since = self._held_since.pop(peer, None)
         if held_since is not None:
             logger.info(
-                "control plane %s: link to %s drained after %.1fs",
+                "[LWD][control-plane] %s: link to %s drained after %.1fs",
                 self._label,
                 peer,
                 time.monotonic() - held_since,
@@ -460,13 +484,12 @@ class LwdControlPlane(ABC):
             if not transport.send(LwdFrameKind.PAYLOAD, payload, identity):
                 return False
         except LwdPeerUnreachableError as e:
-            # TODO(lwd): report the peer as lost once heartbeats detect it,
-            # issue #8.
+            self._on_peer_unreachable(peer)
             num_dropped = self._num_dropped.get(peer, 0) + 1
             self._num_dropped[peer] = num_dropped
             if num_dropped == 1:
                 logger.error(
-                    "control plane %s: %s unreachable (%s); dropping payloads "
+                    "[LWD][control-plane] %s: %s unreachable (%s); dropping payloads "
                     "to it until it is reachable again",
                     self._label,
                     peer,
@@ -476,12 +499,24 @@ class LwdControlPlane(ABC):
         num_dropped = self._num_dropped.pop(peer, 0)
         if num_dropped:
             logger.warning(
-                "control plane %s: %s reachable again; %d payloads were dropped",
+                "[LWD][control-plane] %s: %s reachable again; %d payloads were dropped",
                 self._label,
                 peer,
                 num_dropped,
             )
         return True
+
+    def _on_peer_unreachable(self, peer: LwdPeer) -> None:
+        """Role hook for immediate ROUTER disconnect notification."""
+        return None
+
+    def _unregister_peer(self, peer: LwdPeer, reason: str) -> None:
+        self._registered_peers.discard(peer)
+        self._held.pop(peer, None)
+        self._held_since.pop(peer, None)
+        logger.warning(
+            "[LWD][control-plane] %s: peer %s down: %s", self._label, peer, reason
+        )
 
     def _register_peer(self, peer: LwdPeer) -> None:
         self._registered_peers.add(peer)
@@ -515,6 +550,8 @@ class LwdControlPlane(ABC):
         """Routing identity of `peer` for outbound frames."""
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
+        # Static deployments use startup handshake and explicit socket errors;
+        # idle periods never invalidate an established peer.
         return None
 
 
@@ -533,26 +570,28 @@ class LwdEdgeControlPlane(LwdControlPlane):
     def __init__(self, spec: LwdEdgeControlPlaneSpec) -> None:
         super().__init__(spec, spec.cloud_endpoints[0])
         self._endpoints = spec.cloud_endpoints
+        self._connection_ids = spec.connection_ids
+        self._link_indices = {
+            connection_id: index
+            for index, connection_id in enumerate(self._connection_ids)
+        }
         session_id = uuid.uuid4().hex
-        # Link i registers with cloud DP rank i: the hello reports the link's
-        # dp_rank (the cloud DP it serves), not the edge's own vLLM dp rank,
-        # which is 0 for the one process serving every connection.
-        self._handshakes: dict[int, LwdEdgeHandshake] = {
-            dp_rank: LwdEdgeHandshake(
+        # Each DEALER registers with one explicit (edge, cloud, engine) link.
+        self._handshakes: dict[LwdConnectionId, LwdEdgeHandshake] = {
+            connection_id: LwdEdgeHandshake(
                 LwdLinkHello(
                     link_version=LWD_LINK_PROTOCOL_VERSION,
                     message_version=LWD_MESSAGE_VERSION,
-                    instance_id=spec.instance_id,
-                    dp_rank=dp_rank,
-                    # The link speaks the cloud deployment's DP size (the
-                    # number of links), which the cloud cross-checks; the
-                    # edge's own vLLM DP size is 1 and stays out of the link.
-                    dp_size=len(spec.cloud_endpoints),
+                    instance_id=connection_id.edge_id,
+                    dp_rank=connection_id.dp_idx,
+                    dp_size=cloud_dp_size,
                     session_id=session_id,
                 ),
                 spec.config.hello_retry_interval_s,
             )
-            for dp_rank in range(len(spec.cloud_endpoints))
+            for connection_id, cloud_dp_size in zip(
+                self._connection_ids, spec.cloud_dp_sizes, strict=True
+            )
         }
         self._settled = threading.Event()  # Every handshake settled, or a failure.
         self._handshake_error: str | None = None
@@ -561,17 +600,19 @@ class LwdEdgeControlPlane(LwdControlPlane):
     def _create_transport(self) -> LwdControlTransport:
         identities = tuple(
             lwd_edge_identity(
-                self.spec.instance_id,
-                dp_rank,
-                self._handshakes[dp_rank].hello.session_id,
+                connection_id.edge_id,
+                connection_id.dp_idx,
+                self._handshakes[connection_id].hello.session_id,
             )
-            for dp_rank in range(len(self._endpoints))
+            for connection_id in self._connection_ids
         )
         return LwdEdgeTransport(self._endpoints, identities)
 
     # ------------------------------------------------------------ ready check
 
-    def wait_until_ready(self, timeout_s: float | None = None) -> dict[int, LwdPeer]:
+    def wait_until_ready(
+        self, timeout_s: float | None = None
+    ) -> dict[LwdConnectionId, LwdPeer]:
         """Block until every cloud DP rank accepted; shuts down on failure.
 
         Must run on the thread that called `start()`.
@@ -593,23 +634,23 @@ class LwdEdgeControlPlane(LwdControlPlane):
             raise LwdHandshakeError(
                 f"{len(missing)} of {len(self._handshakes)} cloud DP ranks "
                 f"did not accept within {timeout_s}s "
-                f"({self._num_hellos_sent} hellos delivered); missing dp_ranks "
+                f"({self._num_hellos_sent} hellos delivered); missing connections "
                 f"{sorted(missing)}"
             )
         if self._handshake_error is not None:
             self.shutdown()
             raise LwdHandshakeError(self._handshake_error)
-        clouds: dict[int, LwdPeer] = {}
-        for handshake in self._handshakes.values():
+        clouds: dict[LwdConnectionId, LwdPeer] = {}
+        for connection_id, handshake in self._handshakes.items():
             cloud = handshake.cloud
             assert cloud is not None, "settled without every cloud accepted"
-            clouds[cloud.dp_rank] = cloud
+            clouds[connection_id] = cloud
         return clouds
 
-    def _missing_handshakes(self) -> set[int]:
+    def _missing_handshakes(self) -> set[LwdConnectionId]:
         return {
-            handshake.hello.dp_rank
-            for handshake in self._handshakes.values()
+            connection_id
+            for connection_id, handshake in self._handshakes.items()
             if handshake.cloud is None
         }
 
@@ -624,8 +665,15 @@ class LwdEdgeControlPlane(LwdControlPlane):
         # A reply names the dp_rank it answers; only that link's handshake
         # consumes it. Other shapes fall through to every handshake, which
         # rejects them and fails the plane.
-        if isinstance(msg, LwdLinkAccept) and msg.dp_rank in self._handshakes:
-            consumers = [self._handshakes[msg.dp_rank]]
+        if isinstance(msg, LwdLinkAccept):
+            consumers = [
+                handshake
+                for connection_id, handshake in self._handshakes.items()
+                if (connection_id.cloud_id, connection_id.dp_idx)
+                == (msg.instance_id, msg.dp_rank)
+            ]
+            if not consumers:
+                consumers = list(self._handshakes.values())
         else:
             consumers = list(self._handshakes.values())
         for handshake in consumers:
@@ -634,7 +682,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             except LwdHandshakeError as e:
                 if handshake.completed:
                     logger.error(
-                        "control plane %s: ignored link message after the "
+                        "[LWD][control-plane] %s: ignored link message after the "
                         "handshake: %s",
                         self._label,
                         e,
@@ -652,7 +700,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             if cloud is None or cloud in self._registered_peers:
                 continue
             logger.info(
-                "control plane %s: accepted by cloud %s, session %s",
+                "[LWD][control-plane] %s: accepted by cloud %s, session %s",
                 self._label,
                 cloud,
                 handshake.hello.session_id,
@@ -660,7 +708,9 @@ class LwdEdgeControlPlane(LwdControlPlane):
             self._register_peer(cloud)
 
     def _fail_handshake(self, reason: str) -> None:
-        logger.error("control plane %s: handshake failed: %s", self._label, reason)
+        logger.error(
+            "[LWD][control-plane] %s: handshake failed: %s", self._label, reason
+        )
         self._handshake_error = reason
         self._settled.set()
         self._stop.set()
@@ -670,27 +720,46 @@ class LwdEdgeControlPlane(LwdControlPlane):
         DEALER; the link index is the dp_rank it registered as."""
         if identity is None:
             return None
-        handshake = self._handshakes.get(int(identity))
+        try:
+            connection_id = self._connection_ids[int(identity)]
+        except (ValueError, IndexError):
+            return None
+        handshake = self._handshakes.get(connection_id)
         if handshake is None:
             return None
-        return handshake.cloud
+        cloud = handshake.cloud
+        if cloud is not None:
+            # Any authenticated frame proves the peer is alive, not only Accept.
+            handshake.touch()
+        return cloud
 
     def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
         """The link index of the DEALER that reaches `peer`."""
-        return str(peer.dp_rank).encode()
+        connection_id = next(
+            (
+                candidate
+                for candidate in self._connection_ids
+                if (candidate.cloud_id, candidate.dp_idx)
+                == (peer.instance_id, peer.dp_rank)
+            ),
+            None,
+        )
+        index = self._link_indices.get(connection_id)
+        return None if index is None else str(index).encode()
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
-        for dp_rank, handshake in self._handshakes.items():
-            if not handshake.should_send_hello(now):
+        for connection_id, handshake in self._handshakes.items():
+            if handshake.completed or not handshake.should_send_hello(now):
                 continue
             hello = lwd_encode_link_message(handshake.hello)
-            if not transport.send(LwdFrameKind.LINK, hello, str(dp_rank).encode()):
+            link_index = self._link_indices[connection_id]
+            if not transport.send(LwdFrameKind.LINK, hello, str(link_index).encode()):
                 continue  # Cloud not connected yet; retried on the next tick.
             handshake.on_hello_sent(now)
             self._num_hellos_sent += 1
             if self._num_hellos_sent == 1:
                 logger.info(
-                    "control plane %s: hello sent to %s",
+                    "[LWD][control-plane] %s: hello sent to %s",
                     self._label,
                     self._endpoints,
                 )
@@ -710,7 +779,7 @@ class LwdCloudControlPlane(LwdControlPlane):
     def __init__(self, spec: LwdCloudControlPlaneSpec) -> None:
         super().__init__(spec, spec.bind_endpoint)
         self._handshake = LwdCloudHandshake(
-            spec.instance_id, spec.dp_rank, spec.dp_size
+            spec.instance_id, spec.dp_rank, spec.dp_size, spec.expected_edge_ids
         )
 
     def _create_transport(self) -> LwdControlTransport:
@@ -724,7 +793,7 @@ class LwdCloudControlPlane(LwdControlPlane):
     ) -> None:
         if identity is None or not isinstance(msg, LwdLinkHello):
             logger.warning(
-                "control plane %s: dropped unexpected %s from %r",
+                "[LWD][control-plane] %s: dropped unexpected %s from %r",
                 self._label,
                 type(msg).__name__,
                 identity,
@@ -734,7 +803,7 @@ class LwdCloudControlPlane(LwdControlPlane):
         self._reply(transport, identity, decision)
         if decision.registered is not None:
             logger.info(
-                "control plane %s: registered edge %s, session %s",
+                "[LWD][control-plane] %s: registered edge %s, session %s",
                 self._label,
                 decision.registered,
                 msg.session_id,
@@ -750,7 +819,7 @@ class LwdCloudControlPlane(LwdControlPlane):
         reply = decision.reply
         if isinstance(reply, LwdLinkReject):
             logger.error(
-                "control plane %s: rejected hello from %r: %s",
+                "[LWD][control-plane] %s: rejected hello from %r: %s",
                 self._label,
                 identity,
                 reply.reason,
@@ -763,7 +832,7 @@ class LwdCloudControlPlane(LwdControlPlane):
             sent = False
         if not sent:
             logger.warning(
-                "control plane %s: cannot answer %r; the edge resends its hello",
+                "[LWD][control-plane] %s: cannot answer %r; the edge resends its hello",
                 self._label,
                 identity,
             )
@@ -771,7 +840,12 @@ class LwdCloudControlPlane(LwdControlPlane):
     def _inbound_peer(self, identity: bytes | None) -> LwdPeer | None:
         if identity is None:
             return None
+        self._handshake.touch(identity)
         return self._handshake.peer_of(identity)
+
+    def _on_peer_unreachable(self, peer: LwdPeer) -> None:
+        if self._handshake.drop_peer(peer) is not None:
+            self._unregister_peer(peer, "ROUTER reported the DEALER unreachable")
 
     def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
         identity = self._handshake.identity_of(peer)

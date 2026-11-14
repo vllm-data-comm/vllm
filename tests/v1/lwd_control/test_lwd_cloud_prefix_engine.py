@@ -7,25 +7,34 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCoreMixin,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
+    LwdCloudLedger,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRequestNotify
 from vllm.v1.request import RequestStatus
+
+_CONNECTION = LwdConnectionId(0, 0, 0)
 
 
 def _cloud_engine() -> LwdCloudEngineCoreMixin:
     engine = object.__new__(LwdCloudEngineCoreMixin)
     engine._lwd_prefix_enabled = True
     engine.scheduler = SimpleNamespace()
+    engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
     engine._lwd_send_prefix_ready = Mock()
     return engine
 
 
-def test_add_request_reserves_before_native_add_then_replies(monkeypatch) -> None:
+def test_add_request_reserves_before_native_add_then_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     engine = _cloud_engine()
     reservations = Mock()
     reservations.reserve.return_value = 32
@@ -45,7 +54,9 @@ def test_add_request_reserves_before_native_add_then_replies(monkeypatch) -> Non
     engine._lwd_send_prefix_ready.assert_called_once_with("r", 32, 7)
 
 
-def test_reserve_failure_replies_error_without_native_add(monkeypatch) -> None:
+def test_reserve_failure_replies_error_without_native_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     engine = _cloud_engine()
     reservations = Mock()
     reservations.reserve.side_effect = RuntimeError("no blocks")
@@ -62,7 +73,9 @@ def test_reserve_failure_replies_error_without_native_add(monkeypatch) -> None:
     engine._lwd_send_prefix_ready.assert_called_once_with("r", 0, 7, error="no blocks")
 
 
-def test_active_duplicate_replies_error_without_native_add(monkeypatch) -> None:
+def test_active_duplicate_replies_error_without_native_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     engine = _cloud_engine()
     engine.scheduler.requests = {"r": object()}
     engine.scheduler.lwd_prefix_reservations = Mock()
@@ -105,6 +118,43 @@ def test_request_build_adopts_wire_hashes_and_skip_reading() -> None:
     assert request.lwd_wire_hashes_adopted
     assert request.lwd_prefix_nonce == 7
     assert request.skip_reading_prefix_cache
+
+
+@pytest.mark.parametrize("wire_hashes", [[], [b"h0"]])
+def test_request_build_never_hashes_meta_embeds_on_wire_chain_mismatch(
+    wire_hashes: list[bytes],
+) -> None:
+    """A missing/partial edge chain must not fall back to local hashing.
+
+    The cloud request owns a meta prompt-embeds placeholder, so the local
+    hasher raises ``Cannot copy out of meta tensor`` (seen under concurrent
+    gateway/probe requests whose chain length differs from the cloud block
+    count).  Admission must fail closed through ``lwd_wire_hashes_adopted``
+    instead.
+    """
+    engine = object.__new__(LwdCloudEngineCoreMixin)
+    engine.request_block_hasher = Mock(
+        side_effect=AssertionError("local hasher read placeholder input")
+    )
+    engine._lwd_hash_block_size = 2
+    engine.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_hidden_size=lambda: 8,
+            dtype=torch.float32,
+        )
+    )
+    notify = LwdRequestNotify(
+        "r",
+        4,
+        block_hashes=wire_hashes,
+        prefix_nonce=7,
+    )
+
+    request = engine._lwd_build_request(notify)
+
+    assert request.block_hashes == wire_hashes
+    assert not request.lwd_wire_hashes_adopted
+    engine.request_block_hasher.assert_not_called()
 
 
 @pytest.mark.parametrize("prompt_tokens", [3, 4])
@@ -206,24 +256,26 @@ def test_async_output_update_never_hashes_or_caches_output_blocks(
 @pytest.mark.parametrize(
     ("done", "expected_args"),
     [
-        (("refill_done", "r"), ("r",)),
+        (("refill_done", "r", 0), ("r", 0)),
         (("refill_done", "r", 7), ("r", 7)),
     ],
 )
 def test_refill_done_bypasses_watermark_recording(
-    monkeypatch, done, expected_args
+    monkeypatch: pytest.MonkeyPatch,
+    done: tuple[object, ...],
+    expected_args: tuple[object, ...],
 ) -> None:
     class DoneMq:
         def __init__(self) -> None:
             self.items = [done]
 
-        def dequeue(self, timeout: int):
+        def dequeue(self, timeout: int) -> tuple[object, ...]:
             if self.items:
                 return self.items.pop(0)
             raise TimeoutError
 
     engine = object.__new__(LwdCloudEngineCoreMixin)
-    engine._lwd_done_mq = DoneMq()
+    engine._lwd_done_mqs = {_CONNECTION: DoneMq()}
     engine.scheduler = SimpleNamespace(lwd_refill_done=Mock())
     from vllm_ascend.worker.lwd_cloud_model import lwd_pre_recv
 
@@ -238,13 +290,15 @@ def test_refill_done_bypasses_watermark_recording(
 
 def test_send_refill_carries_generation() -> None:
     engine = object.__new__(LwdCloudEngineCoreMixin)
-    engine._lwd_edge = object()
+    peer = object()
+    engine._lwd_ledger = LwdCloudLedger(SimpleNamespace())
+    engine._lwd_ledger.request_routes = {"r": peer}
     engine._lwd_send_until_queued = Mock()
 
     engine._lwd_send_refill("r", 16, 32, 7)
 
-    peer, notify = engine._lwd_send_until_queued.call_args.args
-    assert peer is engine._lwd_edge
+    actual_peer, notify = engine._lwd_send_until_queued.call_args.args
+    assert actual_peer is peer
     assert (notify.request_id, notify.prefix_nonce) == ("r", 7)
 
 

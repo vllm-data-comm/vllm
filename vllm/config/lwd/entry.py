@@ -43,11 +43,24 @@ class LwdConfig:
             )
         entry = TypeAdapter(_LwdEntry).validate_python(raw)
         path, role, identity = entry["path"], entry["role"], entry["instance_id"]
-        topology = LwdTopology.from_file(path)
-        topology.instance(role, identity)
+        return cls.from_topology(
+            path, role, identity, LwdTopology.from_file(path), api=api
+        )
+
+    @classmethod
+    def from_topology(
+        cls,
+        path: str,
+        role: str,
+        identity: int,
+        topology: LwdTopology,
+        *,
+        api: LwdAPIConfig | None = None,
+    ) -> "LwdConfig":
+        """Build an entry around an already parsed in-memory topology."""
+        instance = topology.instance(role, identity)
         coordination = None
         # coordination is embedded in each instance, not at the top level.
-        instance = topology.instance(role, identity)
         if instance.coordination is not None:
             coord_dict = asdict(instance.coordination)
             coordination = LwdCoordinationConfig.from_dict(
@@ -70,4 +83,13 @@ class LwdConfig:
 
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:
+        if self.role == "edge" and self.topology.deployment.scene == "edge_share":
+            # All logical frontends share this one physical engine. It owns
+            # every logical edge -> cloud connection, while attach-only API
+            # processes never create a second engine or HCCL world.
+            return tuple(
+                connection
+                for edge in self.topology.edges
+                for connection in self.topology.connections("edge", edge.id)
+            )
         return self.topology.connections(self.role, self.instance_id)

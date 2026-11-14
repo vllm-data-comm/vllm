@@ -3,7 +3,9 @@
 
 """File schema for LWD, independent of devices and distributed initialization."""
 
+import json
 from collections.abc import Hashable
+from dataclasses import asdict
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
@@ -19,6 +21,7 @@ from pydantic import (
     StrictStr,
     TypeAdapter,
     field_validator,
+    model_validator,
 )
 from pydantic.dataclasses import dataclass
 
@@ -33,6 +36,21 @@ def _address(value: str) -> str:
     if address.is_unspecified or address.is_multicast:
         raise ValueError("[LWD] addr must be a unicast endpoint IP")
     return str(address)
+
+
+def _validate_http_url(value: str | None) -> None:
+    if value is not None:
+        url = urlsplit(value)
+        if url.scheme not in ("http", "https") or not url.hostname:
+            raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+
+
+def _validate_control_url_map(value: dict[int, str]) -> dict[int, str]:
+    for cloud_id, url in value.items():
+        if cloud_id < 0:
+            raise ValueError("[LWD] control_url_map keys must be non-negative")
+        _validate_http_url(url)
+    return value
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -157,6 +175,8 @@ class LwdCoordination:
     enabled: StrictBool = False
     # Edge-side fields
     control_url: LwdString | None = None
+    control_url_map: dict[int, LwdString] = Field(default_factory=dict)
+    placement_only: StrictBool = False
     tenant_key_file: LwdString | None = None
     consumer_id: LwdString | None = None
     # Cloud-side fields
@@ -166,15 +186,32 @@ class LwdCoordination:
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0
     )
+    probe_timeout: Annotated[float, Field(strict=True, gt=5.0, allow_inf_nan=False)] = (
+        25.0
+    )
+    enforce_mm_abi_match: StrictBool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_control_url(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict) or not isinstance(raw.get("control_url"), dict):
+            return raw
+        if raw.get("control_url_map"):
+            raise ValueError(
+                "[LWD] control_url map and control_url_map are mutually exclusive"
+            )
+        return {**raw, "control_url": None, "control_url_map": raw["control_url"]}
 
     @field_validator("control_url")
     @classmethod
     def validate_url(cls, value: str | None) -> str | None:
-        if value is not None:
-            url = urlsplit(value)
-            if url.scheme not in ("http", "https") or not url.hostname:
-                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+        _validate_http_url(value)
         return value
+
+    @field_validator("control_url_map")
+    @classmethod
+    def validate_url_map(cls, value: dict[int, str]) -> dict[int, str]:
+        return _validate_control_url_map(value)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -209,13 +246,20 @@ class LwdLink:
     cloud: LwdId
 
 
-@dataclass(frozen=True)
-class LwdDPConnection:
-    """One explicit instance link expanded at matching DP indices."""
+@dataclass(frozen=True, order=True)
+class LwdConnectionId:
+    """Stable identity of one edge -> cloud DP/engine connection."""
 
     edge_id: int
     cloud_id: int
     dp_idx: int
+
+
+@dataclass(frozen=True)
+class LwdDPConnection:
+    """One explicit instance link expanded at matching DP indices."""
+
+    connection_id: LwdConnectionId
     edge: LwdDP
     cloud: LwdDP
 
@@ -240,17 +284,14 @@ class LwdTopology:
     qos: LwdQoS | None = None
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
-    """First 16 hex characters of the source file digest; empty for from_dict."""
+    """First 16 hex characters of the canonical topology SHA-256 digest."""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
         try:
             file_bytes = Path(path).read_bytes()
             raw = yaml.load(file_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
-            topology = cls.from_dict(raw)
-            # The digest belongs to the loaded snapshot, not to YAML input.
-            object.__setattr__(topology, "digest", sha256(file_bytes).hexdigest()[:16])
-            return topology
+            return cls.from_dict(raw)
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
             raise ValueError(f"[LWD] Invalid topology file {path!r}: {exc}") from exc
 
@@ -258,6 +299,22 @@ class LwdTopology:
     def from_dict(cls, raw: Any) -> "LwdTopology":
         topology = TypeAdapter(cls).validate_python(raw)
         topology.validate_layout()
+        # Hash the validated semantic snapshot, never YAML spelling/layout.
+        # Exclude the derived digest field itself from the canonical payload.
+        canonical = asdict(topology)
+        canonical.pop("digest", None)
+        canonical["instance_links"] = sorted(
+            canonical["instance_links"],
+            key=lambda link: (link["edge"], link["cloud"]),
+        )
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        object.__setattr__(topology, "digest", sha256(encoded).hexdigest()[:16])
         return topology
 
     @property
@@ -299,6 +356,7 @@ class LwdTopology:
                     "[LWD] ctrl_port is required on clouds and omitted on edges"
                 )
         self._validate_scene()
+        self._validate_coordination()
         if len({len(instance.dp) for instance in (*self.edges, *self.clouds)}) != 1:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
@@ -350,6 +408,19 @@ class LwdTopology:
         for addr, ports in by_addr.items():
             if len(ports) != len(set(ports)):
                 raise ValueError(f"[LWD] duplicate data_port on {addr}")
+
+    def _validate_coordination(self) -> None:
+        """Validate the cloud ids every coordination block refers to."""
+        cloud_ids = {cloud.id for cloud in self.clouds}
+        for instance in (*self.edges, *self.clouds):
+            coordination = instance.coordination
+            if coordination is None:
+                continue
+            unknown = set(coordination.control_url_map) - cloud_ids
+            if unknown:
+                raise ValueError(
+                    f"[LWD] control_url_map references unknown clouds {sorted(unknown)}"
+                )
 
     def _validate_ranks(self) -> None:
         if self.deployment.data_plane_host is not None:
@@ -405,21 +476,11 @@ class LwdTopology:
             )
 
     def _validate_control_ports(self) -> None:
+        # Every cloud DP binds its ctrl_port on all interfaces, so two DPs on
+        # the same address must not share a port. Ports may repeat across
+        # addresses (their namespaces are independent), which also covers
+        # edge_share clouds hosted on distinct machines.
         dps = [dp for cloud in self.clouds for dp in cloud.dp]
-        if self.deployment.scene == "edge_share":
-            # These are shared per-DP channel references, not cloud bind addresses.
-            ports: dict[int, int | None] = {}
-            for dp in dps:
-                if ports.setdefault(dp.dp_idx, dp.ctrl_port) != dp.ctrl_port:
-                    raise ValueError(
-                        "[LWD] edge_share requires the same ctrl_port for "
-                        "the same DP across all cloud instances"
-                    )
-            if len(set(ports.values())) != len(ports):
-                raise ValueError(
-                    "[LWD] edge_share requires different ctrl_port values per DP"
-                )
-            return
         if len({(dp.addr, dp.ctrl_port) for dp in dps}) != len(dps):
             raise ValueError(
                 "[LWD] Cloud DPs on the same address must use "
@@ -434,28 +495,22 @@ class LwdTopology:
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
         if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
             raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
-        if scene == "lwd_cluster" and (edge_count < 2 or cloud_count < 2):
-            raise ValueError("[LWD] lwd_cluster requires multiple edges and clouds")
-        # coordination only exists for cloud_share, embedded in each instance
-        if scene == "cloud_share":
+        if scene == "lwd_cluster" and cloud_count < 2:
+            raise ValueError("[LWD] lwd_cluster requires at least two clouds")
+        # Coordination may be enabled explicitly in every scene. Shared and
+        # multi-cloud scenes require it for every instance.
+        if scene in ("cloud_share", "lwd_cluster"):
             for edge in self.edges:
                 if edge.coordination is None or not edge.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each edge instance to have "
+                        f"[LWD] {scene} requires each edge instance to have "
                         "an enabled coordination block"
                     )
             for cloud in self.clouds:
                 if cloud.coordination is None or not cloud.coordination.enabled:
                     raise ValueError(
-                        "[LWD] cloud_share requires each cloud instance to have "
+                        f"[LWD] {scene} requires each cloud instance to have "
                         "an enabled coordination block"
-                    )
-        else:
-            for instance in (*self.edges, *self.clouds):
-                if instance.coordination is not None:
-                    raise ValueError(
-                        f"[LWD] coordination is only allowed in cloud_share scene, "
-                        f"got scene={scene}"
                     )
         if scene == "edge_share":
             if edge_count != cloud_count or cloud_count < 2:
@@ -489,9 +544,7 @@ class LwdTopology:
             ):
                 result.append(
                     LwdDPConnection(
-                        link.edge,
-                        link.cloud,
-                        edge_dp.dp_idx,
+                        LwdConnectionId(link.edge, link.cloud, edge_dp.dp_idx),
                         edge_dp,
                         cloud_dp,
                     )
