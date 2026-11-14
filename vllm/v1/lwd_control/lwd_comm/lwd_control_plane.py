@@ -526,9 +526,6 @@ class LwdControlPlane(ABC):
         logger.warning(
             "[LWD][control-plane] %s: peer %s down: %s", self._label, peer, reason
         )
-        callback = getattr(self._listener, "on_peer_down", None)
-        if callback is not None:
-            callback(peer)
 
     def _register_peer(self, peer: LwdPeer) -> None:
         self._registered_peers.add(peer)
