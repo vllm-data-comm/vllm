@@ -48,8 +48,8 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
 
 LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
-"""Finished ModelRunnerOutput.lwd_down_carrier harvested by the executor
-output thread."""
+"""Finished entry of ModelRunnerOutput.lwd_down_carriers harvested by the
+executor output thread."""
 
 
 @dataclass
@@ -464,14 +464,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self._lwd_append_carrier_c2e(
                     carrier[:4], engine_core_outputs, nonce_snapshot
                 )
-        else:
-            carrier = getattr(model_runner_output, "lwd_down_carrier", None)
-            if carrier is not None:
-                self._lwd_append_carrier_c2e(
-                    carrier, engine_core_outputs, nonce_snapshot
-                )
-            elif LwdControlDiag.disable_down_enabled():
-                self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
+        elif LwdControlDiag.disable_down_enabled():
+            self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
         return engine_core_outputs
 
     def _lwd_cleanup_arrivals(

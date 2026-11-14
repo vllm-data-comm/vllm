@@ -986,55 +986,15 @@ class WorkerProc:
         converted to a FAILURE response.
         """
         inner = getattr(output, "_model_runner_output", output)
-        ready_event = getattr(inner, "lwd_meta_ready_event", None)
-        if ready_event is not None:
-            delattr(inner, "lwd_meta_ready_event")
         ready_events = getattr(inner, "lwd_meta_ready_events", None)
         if ready_events is not None:
             delattr(inner, "lwd_meta_ready_events")
         carriers = getattr(inner, "lwd_down_carriers", None)
         if carriers:
-            harvested = [
+            inner.lwd_down_carriers = [
                 self._lwd_harvest_connection_carrier(carrier, ready_events)
                 for carrier in carriers
             ]
-            inner.lwd_down_carriers = harvested
-            inner.lwd_down_carrier = harvested[0][:4]
-        carrier = getattr(inner, "lwd_down_carrier", None)
-        if carrier is not None and len(carrier) == 5:
-            if ready_event is None:
-                raise RuntimeError("LWD DOWN carrier is missing its ready event")
-            meta_dev, seg_lens_host, req_ids, hidden_numel, seqno = carrier
-            stream = getattr(self, "_lwd_harvest_stream", None)
-            if stream is None:
-                stream = self._lwd_harvest_stream = torch.npu.Stream()
-            n_dev = meta_dev.numel()
-            n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
-            n_meta = n_dev + n_seg
-            buf = getattr(self, "_lwd_harvest_pinned", None)
-            if buf is None or buf.numel() < n_meta:
-                buf = torch.empty(max(n_meta, 4096), dtype=torch.int32, pin_memory=True)
-                self._lwd_harvest_pinned = buf
-            started = time.monotonic()
-            with torch.npu.stream(stream):
-                stream.wait_event(ready_event)
-                buf[:n_dev].copy_(meta_dev, non_blocking=True)
-                done = torch.npu.Event()
-                done.record()
-            done.synchronize()
-            if n_seg:
-                buf.numpy()[n_dev:n_meta] = seg_lens_host
-            inner.lwd_down_carrier = (
-                buf[:n_meta],
-                req_ids,
-                hidden_numel,
-                seqno,
-            )
-            lwd_logger.info(
-                "[Lwd][perf] meta-harvest dur=%.2fms ts=%.3f",
-                (time.monotonic() - started) * 1000,
-                time.monotonic(),
-            )
 
         if isinstance(output, AsyncModelRunnerOutput):
             try:

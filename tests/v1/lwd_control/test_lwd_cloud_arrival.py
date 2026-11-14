@@ -709,7 +709,7 @@ def test_update_c2e_preserves_nonce_after_finish_and_abort(
     monkeypatch.setattr(LwdControlDiag, "disable_down_rows", lambda outputs: {"p": []})
 
     scheduler.update_from_output(
-        SchedulerOutput.make_empty(), SimpleNamespace(lwd_down_carrier=None)
+        SchedulerOutput.make_empty(), SimpleNamespace(lwd_down_carriers=None)
     )
 
     assert scheduler.requests == {}
