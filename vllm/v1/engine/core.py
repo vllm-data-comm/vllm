@@ -1334,14 +1334,18 @@ class EngineCoreProc(EngineCore):
                 # configs are rebuilt from the reset object afterwards. The
                 # rule is the same for the host and device data planes.
                 lwd_dp_size = parallel_config.data_parallel_size
-                lwd_dp_count = len(lwd.instance.dp)
+                lwd_plan = lwd.plan
+                lwd_dp_count = lwd_plan.dp_count
                 if lwd.role == "edge" and lwd_dp_size > 1:
                     raise ValueError(
                         "[LWD] one edge process serves every DP "
                         "connection; start the edge with data parallel "
                         f"size 1, got {lwd_dp_size}"
                     )
-                if lwd.role == "cloud" and lwd_dp_size != lwd_dp_count:
+                if (
+                    lwd.role == "cloud"
+                    and lwd_dp_size != lwd_plan.expectation.data_parallel_size
+                ):
                     raise ValueError(
                         "[LWD] one cloud engine runs per DP: this topology "
                         f"declares {lwd_dp_count} cloud DPs, start the cloud "

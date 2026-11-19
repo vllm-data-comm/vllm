@@ -47,11 +47,13 @@ def lwd_create_control_plane(
 
 def _lwd_validate_dp(lwd_config: LwdConfig, dp_rank: int, dp_size: int) -> None:
     """The edge runs one process per instance; the cloud one engine per DP."""
-    topology_dp_size = len(lwd_config.instance.dp)
+    plan = lwd_config.plan
+    topology_dp_size = plan.dp_count
+    expected_dp_size = plan.expectation.data_parallel_size
     if lwd_config.role == "edge":
         # One edge process serves every DP connection, so its vLLM DP size
         # is 1 and its dp_rank is 0.
-        if dp_size != 1 or dp_rank != 0:
+        if dp_size != expected_dp_size or dp_rank != 0:
             raise ValueError(
                 f"[LWD] edge instance {lwd_config.instance_id} runs one engine "
                 f"for its {topology_dp_size} DP connections; start it with "
@@ -60,7 +62,7 @@ def _lwd_validate_dp(lwd_config: LwdConfig, dp_rank: int, dp_size: int) -> None:
         if topology_dp_size < 1:
             raise ValueError("[LWD] instance must have at least one DP")
         return
-    if dp_size != topology_dp_size:
+    if dp_size != expected_dp_size:
         raise ValueError(
             f"[LWD] vLLM data parallel size {dp_size} != topology DP count "
             f"{topology_dp_size} of cloud instance {lwd_config.instance_id}"

@@ -167,7 +167,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     Raises:
         NotImplementedError: A parallel feature or the topology is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance, or a host edge enables tensor parallelism.
+            of the local instance, or a feature switch is invalid.
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
@@ -201,17 +201,10 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     # reject a valid launch. The engine dispatch and the control plane enforce
     # the rule with the captured launch size instead; both are transport
     # agnostic.
-    if lwd_config.topology.is_host_comm:
-        # Host comm has no shared HCCL world and no topology ranks, so the
-        # rank-allocation checks below do not apply.
-        return
-    # Raises for topologies the shared HCCL world cannot host.
-    LwdParallelGroupsSpec.from_topology(lwd_config.topology)
-    # The topology gives every DP of an instance the same rank count.
-    dp_ranks = lwd_config.instance.dp[0].ranks
-    if parallel_config.tensor_parallel_size != len(dp_ranks):
-        raise ValueError(
-            f"[LWD] tensor parallel size {parallel_config.tensor_parallel_size} "
-            f"!= {len(dp_ranks)} ranks per DP of {lwd_config.role} instance "
-            f"{lwd_config.instance_id}"
-        )
+    #
+    # Everything below reads the plan: the facts and the expected sizes live
+    # there, and the plane object owns the rules only it can decide.
+    plan = lwd_config.plan
+    plan.check_parallel(parallel_config)
+    plan.check_features(vllm_config)
+    plan.plane.validate_launch(vllm_config)

@@ -122,9 +122,9 @@ class LwdDeployment:
     hccl_world_size: LwdCount | None = None
     data_plane_comm: Literal["device", "host"] = "device"
     data_plane_host: LwdHostDataPlane | None = None
-    """Host-comm settings block, required when ``data_plane_comm: host``
-    and omitted otherwise — the extension point for future host-plane
-    properties."""
+    """Host-comm settings block; optional even when ``data_plane_comm: host``
+    and omitted otherwise — every field has a default, so the block is the
+    extension point for future host-plane properties."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -169,6 +169,8 @@ class LwdScramble:
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdFeatures:
     enable_early_recv: StrictBool = False
+    """Reserved: parsed and kept for schema stability, but no component reads
+    it today (early receive is wired unconditionally)."""
     scramble: LwdScramble = Field(default_factory=LwdScramble)
 
 
@@ -390,53 +392,13 @@ class LwdTopology:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
-        if self.is_host_comm:
-            # No shared HCCL world: the host-specific layout rules apply
-            # instead of the rank-allocation ones.
-            self._validate_host_layout()
-        else:
-            self._validate_ranks()
+        # The plane decides which layout rules apply (ranks and the shared
+        # world on device, ports and no ranks on host). Imported here because
+        # the layout module builds on this one.
+        from .layout import lwd_plane_of
+
+        lwd_plane_of(self)
         self._validate_control_ports()
-
-    def _validate_host_layout(self) -> None:
-        """Layout rules of data_plane_comm=host (no global comm domain).
-
-        Ranks are meaningless and must be omitted everywhere; the cloud
-        is the only listener (one shared listener per cloud DP, edges
-        connect out), so data_port is cloud-only.
-        """
-        for instance in (*self.edges, *self.clouds):
-            if any(dp.ranks for dp in instance.dp):
-                raise ValueError(
-                    "[LWD] ranks must be omitted when "
-                    "data_plane_comm=host (no global comm domain; "
-                    "links are established from addr/data_port)"
-                )
-        if self.deployment.hccl_world_size is not None:
-            raise ValueError(
-                "[LWD] hccl_world_size must be omitted when "
-                "data_plane_comm=host (the edge and cloud are "
-                "separate worlds; their sizes come from their own "
-                "launches)"
-            )
-        for instance in self.edges:
-            if any(dp.data_port is not None for dp in instance.dp):
-                raise ValueError(
-                    "[LWD] data_port is cloud-only (edges connect out and never listen)"
-                )
-        by_addr: dict[str, list[int]] = {}
-        for instance in self.clouds:
-            for dp in instance.dp:
-                if dp.data_port is None:
-                    raise ValueError(
-                        "[LWD] data_port is required on every cloud DP "
-                        "when data_plane_comm=host (ctrl_port is "
-                        "control-plane only)"
-                    )
-                by_addr.setdefault(dp.addr, []).append(dp.data_port)
-        for addr, ports in by_addr.items():
-            if len(ports) != len(set(ports)):
-                raise ValueError(f"[LWD] duplicate data_port on {addr}")
 
     def _validate_coordination(self) -> None:
         """Require a complete advertised endpoint on every coordinated cloud DP."""
@@ -465,59 +427,6 @@ class LwdTopology:
                     "[LWD] enabled edge coordination requires coord_port "
                     "on every linked cloud DP"
                 )
-
-    def _validate_ranks(self) -> None:
-        if self.deployment.data_plane_host is not None:
-            raise ValueError(
-                "[LWD] data_plane_host is host-comm-only and must be "
-                "omitted when data_plane_comm=device"
-            )
-        if self.deployment.hccl_world_size is None:
-            raise ValueError(
-                "[LWD] hccl_world_size is required when "
-                "data_plane_comm=device (the edge and cloud share one world)"
-            )
-        for instance in (*self.edges, *self.clouds):
-            for dp in instance.dp:
-                if not dp.ranks:
-                    raise ValueError(
-                        "[LWD] ranks are required on every DP when "
-                        "data_plane_comm=device"
-                    )
-        for edge in self.edges:
-            if len({(dp.addr, dp.ranks) for dp in edge.dp}) != 1:
-                raise ValueError(
-                    "[LWD] Edge DPs must share their instance's ranks/address"
-                )
-        for cloud in self.clouds:
-            if len({len(dp.ranks) for dp in cloud.dp}) != 1:
-                raise ValueError(
-                    "[LWD] Cloud instance must split its ranks equally among DPs"
-                )
-        # Edge DPs reuse an allocation; edge_share also reuses it across instances.
-        edges = self.edges
-        if self.deployment.scene == "edge_share":
-            if len({(edge.dp[0].addr, edge.dp[0].ranks) for edge in edges}) != 1:
-                raise ValueError(
-                    "[LWD] edge_share instances must share edge ranks/address"
-                )
-            edges = edges[:1]
-        allocations = [edge.dp[0] for edge in edges]
-        allocations.extend(dp for cloud in self.clouds for dp in cloud.dp)
-        ranks: set[int] = set()
-        for dp in allocations:
-            if len(set(dp.ranks)) != len(dp.ranks) or ranks.intersection(dp.ranks):
-                raise ValueError(
-                    "[LWD] Separate allocations require distinct ranks; "
-                    "duplicate or overlapping ranks"
-                )
-            ranks.update(dp.ranks)
-        world_size = self.deployment.hccl_world_size
-        assert world_size is not None  # checked above
-        if ranks != set(range(world_size)):
-            raise ValueError(
-                "[LWD] Unique ranks must cover [0, hccl_world_size) without gaps"
-            )
 
     def _validate_control_ports(self) -> None:
         # Every cloud DP binds its ctrl_port on all interfaces, so two DPs on

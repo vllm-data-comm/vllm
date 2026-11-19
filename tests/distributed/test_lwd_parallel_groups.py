@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from vllm.config.lwd import LwdConfig, LwdConnectionId, LwdTopology
+from vllm.config.lwd.layout import LwdHostPlane
 from vllm.distributed.lwd import (
     LwdChannelEndpoints,
     LwdParallelGroupsSpec,
@@ -329,3 +331,140 @@ def test_control_plane_dp_rule_follows_the_role(host_comm: bool) -> None:
         _lwd_validate_dp(edge, dp_rank=0, dp_size=2)
     with pytest.raises(ValueError, match="data parallel size 1"):
         _lwd_validate_dp(cloud, dp_rank=0, dp_size=1)
+
+
+def _plan_config(topology: LwdTopology, role: str, tp: int = 1) -> Any:
+    return SimpleNamespace(
+        lwd_config=LwdConfig.from_topology("plan_topology.yaml", role, 0, topology),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_elastic_ep=False,
+            data_parallel_size=1,
+            tensor_parallel_size=tp,
+        ),
+        engram_config=None,
+    )
+
+
+def test_plan_projects_the_device_plane() -> None:
+    """Device: world size, per-DP rank blocks and the TP expectation."""
+    edge = _device_config("edge", dp_count=2, dp_size=1).lwd_config.plan
+    assert not edge.is_host
+    assert edge.dp_count == 2
+    assert edge.world_size == 3
+    assert edge.rank_blocks == ((0,), (0,))
+    assert edge.expectation.data_parallel_size == 1
+    assert edge.expectation.tensor_parallel_size == 1
+
+    cloud = _device_config("cloud", dp_count=2, dp_size=2).lwd_config.plan
+    assert cloud.rank_blocks == ((1,), (2,))
+    assert cloud.expectation.data_parallel_size == 2
+
+
+def test_plan_projects_the_host_plane() -> None:
+    """Host: endpoints per connection and no rank facts."""
+    plan = _host_config("cloud", 4, dp_count=2, dp_size=2).lwd_config.plan
+    assert plan.is_host
+    assert isinstance(plan.plane, LwdHostPlane)
+    assert plan.world_size is None
+    assert plan.rank_blocks is None
+    assert plan.expectation.data_parallel_size == 2
+    assert plan.expectation.tensor_parallel_size is None
+    endpoint = plan.plane.endpoint_of(LwdConnectionId(0, 0, 1))
+    assert (endpoint.addr, endpoint.data_port) == ("10.1.0.1", 7001)
+
+
+def test_device_plan_checks_the_tp_against_the_rank_block() -> None:
+    config = _device_config("cloud", dp_count=1, dp_size=1)
+    config.parallel_config.tensor_parallel_size = 4
+    with pytest.raises(
+        ValueError,
+        match="tensor parallel size 4 != 1 ranks per DP of cloud instance 0",
+    ):
+        lwd_check_parallel_config(config)
+
+
+def test_host_plan_leaves_the_tp_to_the_launch() -> None:
+    """The host plane derives no rank block, so it constrains no TP size."""
+    lwd_check_parallel_config(_host_config("cloud", 4, dp_count=1, dp_size=1))
+
+
+def test_device_plane_warns_about_host_only_qos(caplog) -> None:
+    """qos.data_plane is host-only: warn instead of rejecting the topology."""
+    topology = LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "single_instance",
+                "edges_num": 1,
+                "clouds_num": 1,
+                "hccl_world_size": 2,
+            },
+            "feature_ctrl": {"enable_early_recv": False},
+            "edges": [_instance(0, [[0]], cloud=False)],
+            "clouds": [_instance(0, [[1]], cloud=True)],
+            "instance_links": [{"edge": 0, "cloud": 0}],
+            "qos": {"data_plane": {"traffic_class": 106}},
+        }
+    )
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        lwd_check_parallel_config(_plan_config(topology, "edge"))
+    assert "qos.data_plane is host-comm-only" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("enable", "device_id", "custom_factor"),
+    [
+        (True, None, None),
+        (True, "dev", None),
+        (True, None, "factor"),
+        (False, None, None),
+    ],
+)
+def test_check_features_requires_the_scramble_factors(
+    enable: bool, device_id: str | None, custom_factor: str | None
+) -> None:
+    topology = LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "single_instance",
+                "edges_num": 1,
+                "clouds_num": 1,
+                "data_plane_comm": "host",
+            },
+            "feature_ctrl": {
+                "scramble": {
+                    "enable": enable,
+                    "device_id": device_id,
+                    "custom_factor": custom_factor,
+                }
+            },
+            "edges": [{"id": 0, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]}],
+            "clouds": [
+                {
+                    "id": 0,
+                    "dp": [
+                        {
+                            "dp_idx": 0,
+                            "addr": "10.1.0.1",
+                            "ctrl_port": 5550,
+                            "data_port": 7000,
+                        }
+                    ],
+                }
+            ],
+            "instance_links": [{"edge": 0, "cloud": 0}],
+        }
+    )
+    config = _plan_config(topology, "cloud")
+    if enable and not (device_id and custom_factor):
+        with pytest.raises(
+            ValueError,
+            match="scramble.enable requires both device_id and custom_factor",
+        ):
+            lwd_check_parallel_config(config)
+    else:
+        lwd_check_parallel_config(config)

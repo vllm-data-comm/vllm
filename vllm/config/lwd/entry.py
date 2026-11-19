@@ -3,6 +3,7 @@
 """Original path/role/instance entry, without parallel or model projection."""
 
 from dataclasses import asdict, dataclass, field
+from functools import cached_property
 from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter, with_config
@@ -10,6 +11,7 @@ from typing_extensions import TypedDict
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
+from .layout import LwdInstancePlan
 from .topology import LwdDPConnection, LwdId, LwdInstance, LwdString, LwdTopology
 
 
@@ -80,6 +82,11 @@ class LwdConfig:
     @property
     def instance(self) -> LwdInstance:
         return self.topology.instance(self.role, self.instance_id)
+
+    @cached_property
+    def plan(self) -> LwdInstancePlan:
+        """The facts and launch expectations this instance derives once."""
+        return LwdInstancePlan.from_config(self)
 
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:

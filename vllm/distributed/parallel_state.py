@@ -1794,7 +1794,7 @@ def init_distributed_environment(
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if config is not None and config.lwd_config is not None:
-        if not config.lwd_config.topology.is_host_comm:
+        if not config.lwd_config.plan.is_host:
             world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
         # Host comm: keep the native world args computed above (the edge
         # and cloud are separate launches with no shared LWD world).
@@ -2025,7 +2025,7 @@ def initialize_model_parallel(
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
-    if config.lwd_config is not None and not config.lwd_config.topology.is_host_comm:
+    if config.lwd_config is not None and not config.lwd_config.plan.is_host:
         _lwd_initialize_model_parallel(config, tensor_model_parallel_size, backend)
         return
     # Host comm (data_plane_comm=host): no shared cross-side world, so the
@@ -2313,11 +2313,12 @@ def _lwd_world_args(vllm_config: "VllmConfig", rank: int) -> tuple[int, int, str
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
     parallel_config = vllm_config.parallel_config
-    dp_ranks = lwd_config.instance.dp[parallel_config.data_parallel_index].ranks
+    plan = lwd_config.plan
+    dp_ranks = plan.rank_blocks[parallel_config.data_parallel_index]
     distributed_init_method = get_distributed_init_method(
         parallel_config.master_addr, parallel_config.master_port
     )
-    world_size = lwd_config.topology.deployment.hccl_world_size
+    world_size = plan.world_size
     if world_size is None:
         raise ValueError("[LWD] hccl_world_size is required for LWD device comm")
     return (world_size, dp_ranks[rank], distributed_init_method)
