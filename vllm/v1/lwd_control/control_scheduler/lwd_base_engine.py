@@ -12,6 +12,7 @@ from typing import Any
 
 import msgspec
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
@@ -56,9 +57,11 @@ class _LwdEngineListener:
             (EngineCoreRequestType.WAKEUP, _LwdPeerUp(peer))
         )
 
-    def on_message(self, peer: LwdPeer, payload: bytes) -> None:
+    def on_message(
+        self, peer: LwdPeer, payload: bytes, connection: LwdConnectionId | None = None
+    ) -> None:
         try:
-            self._engine._lwd_on_payload(peer, payload)
+            self._engine._lwd_on_payload(peer, payload, connection)
         except Exception as e:
             # Keep the IO thread alive; the engine fails on its own thread.
             lwd_logger.exception("[comm] handling a payload from %s failed", peer)
@@ -123,10 +126,15 @@ class LwdBaseEngineCore(EngineCoreProc):
         )
         return plane
 
-    def _lwd_send(self, peer: LwdPeer, message: LwdMessage) -> bool:
-        """Queue `message` for `peer`; False when the outbound queue is full."""
+    def _lwd_send(
+        self, peer: LwdPeer, message: LwdMessage, link: int | None = None
+    ) -> bool:
+        """Queue `message` for `peer`; False when the outbound queue is full.
+
+        `link` pins the exact DEALER when one peer owns several links.
+        """
         assert self._lwd_sender is not None, "control plane not started"
-        return self._lwd_sender.send(peer, lwd_encode_message(message))
+        return self._lwd_sender.send(peer, lwd_encode_message(message), link)
 
     def _lwd_fail(self, reason: str) -> None:
         """Any thread: fail the engine on the engine thread, where
@@ -138,7 +146,12 @@ class LwdBaseEngineCore(EngineCoreProc):
     # ------------------------------------------------------------------ #
     # IO thread message entry                                            #
     # ------------------------------------------------------------------ #
-    def _lwd_on_payload(self, peer: LwdPeer, payload: bytes) -> None:
+    def _lwd_on_payload(
+        self,
+        peer: LwdPeer,
+        payload: bytes,
+        connection: LwdConnectionId | None = None,
+    ) -> None:
         """Common entry of received payloads: `_lwd_dispatch_message` handles
         them; malformed payloads and unknown types are dropped here with a
         warning."""
@@ -147,7 +160,7 @@ class LwdBaseEngineCore(EngineCoreProc):
         except (msgspec.DecodeError, msgspec.ValidationError) as e:
             lwd_logger.warning("[comm] drop malformed payload from %s: %s", peer, e)
             return
-        if not self._lwd_dispatch_message(peer, msg):
+        if not self._lwd_dispatch_message(peer, msg, connection):
             lwd_logger.warning(
                 "[comm] drop unexpected frame %r from %s", type(msg), peer
             )
@@ -156,8 +169,17 @@ class LwdBaseEngineCore(EngineCoreProc):
         """Decode a payload sent by the peer role."""
         raise NotImplementedError
 
-    def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
-        """IO thread; must not block. True = handled, False = unknown."""
+    def _lwd_dispatch_message(
+        self,
+        peer: LwdPeer,
+        msg: LwdMessage,
+        connection: LwdConnectionId | None = None,
+    ) -> bool:
+        """IO thread; must not block. True = handled, False = unknown.
+
+        `connection` is the DP connection that delivered the payload when the
+        engine keeps several links to one peer, else None.
+        """
         raise NotImplementedError
 
     def _lwd_handle_peer_registered(self, peer: LwdPeer) -> None:

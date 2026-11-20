@@ -120,7 +120,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_instance_id = lwd_config.instance_id
-        self._lwd_edge_share = lwd_config.topology.deployment.scene == "edge_share"
+        # One engine, several logical frontends: edge_share, or a host
+        # api.attach. Their identity is the attach client_index.
+        self._lwd_edge_share = (
+            len(lwd_config.topology.engine_members("edge", lwd_config.instance_id)) > 1
+        )
         connections = tuple(sorted(c.connection_id for c in lwd_config.connections))
         self._lwd_connections = connections
         self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {

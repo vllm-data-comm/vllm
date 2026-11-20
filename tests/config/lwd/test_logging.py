@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 import yaml
-from lwd_config_under_test import LwdAPIConfig, LwdConfig, log_lwd_config
+from lwd_config_under_test import LwdConfig, log_lwd_config
 from sample_topologies import topology_payload
 
 
@@ -88,25 +88,28 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     assert result["selected_instance"]["id"] == identity
     assert "lwd_api_config" not in result
     assert actual["api"] == {
-        "api_server_rpc_port": None,
-        "api_server_attach": None,
+        "rpc_port": None,
+        "attach": None,
+        "primary": None,
     }
     assert "local-key-content-must-not-be-logged" not in line
 
 
-@pytest.mark.parametrize(
-    "identity,field", [(0, "api_server_rpc_port"), (1, "api_server_attach")]
-)
+@pytest.mark.parametrize("identity,field", [(0, "rpc_port"), (1, "attach")])
 def test_log_includes_multi_instance_api_endpoint(
-    lwd_yaml_dir: Path, caplog: pytest.LogCaptureFixture, identity: int, field: str
+    lwd_yaml_dir: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    identity: int,
+    field: str,
 ) -> None:
+    payload = yaml.safe_load((lwd_yaml_dir / "s2_edge_share_2dp.yaml").read_text())
+    payload["edges"][0]["api"] = {"rpc_port": "10.0.0.1:25100"}
+    payload["edges"][1]["api"] = {"attach": "10.0.0.1:25100"}
+    path = tmp_path / "topology.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     config = LwdConfig.from_dict(
-        {
-            "path": str(lwd_yaml_dir / "s2_edge_share_2dp.yaml"),
-            "role": "edge",
-            "instance_id": identity,
-        },
-        api=LwdAPIConfig(**{field: "10.0.0.1:25100"}),
+        {"path": str(path), "role": "edge", "instance_id": identity}
     )
     with caplog.at_level(logging.INFO):
         log_lwd_config(logging.getLogger("test.lwd-config"), config)

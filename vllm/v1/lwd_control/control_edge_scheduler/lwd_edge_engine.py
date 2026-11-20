@@ -117,10 +117,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         assert isinstance(plane, LwdEdgeControlPlane)
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
         deadline = time.monotonic() + handshake_timeout_s
-        self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = plane.wait_until_ready(
-            handshake_timeout_s
-        )
-        expected = len(self._lwd_clouds)
+        accepted = plane.wait_until_ready(handshake_timeout_s)
+        # One control link per cloud DP rank, but requests route by connection:
+        # keep the DP's peer under every connection this engine serves and
+        # count DP ranks (a shared engine serves several connections per DP).
+        peers_by_dp = {
+            (connection_id.cloud_id, connection_id.dp_idx): peer
+            for connection_id, peer in accepted.items()
+        }
+        self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = {
+            connection.connection_id: peers_by_dp[
+                (connection.connection_id.cloud_id, connection.connection_id.dp_idx)
+            ]
+            for connection in self.lwd_config.connections
+        }
+        expected = len(peers_by_dp)
         while len(self._lwd_cloud_params) < expected:
             if not self._lwd_cloud_params_received.wait(
                 max(0.0, deadline - time.monotonic())
@@ -210,6 +221,25 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_cloud_to_edge(payload)
 
+    def _lwd_connections_of(
+        self, connection_id: LwdConnectionId
+    ) -> tuple[LwdConnectionId, ...]:
+        """Every connection this engine serves to the same cloud DP rank."""
+        return tuple(
+            connection.connection_id
+            for connection in sorted(
+                self.lwd_config.connections, key=lambda c: c.connection_id
+            )
+            if (
+                connection.connection_id.cloud_id,
+                connection.connection_id.dp_idx,
+            )
+            == (connection_id.cloud_id, connection_id.dp_idx)
+        )
+
+    def _lwd_representative_of(self, connection_id: LwdConnectionId) -> LwdConnectionId:
+        return self._lwd_connections_of(connection_id)[0]
+
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
         return next(
             connection
@@ -218,20 +248,28 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             == (peer.instance_id, peer.dp_rank)
         ).connection_id
 
-    def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
+    def _lwd_dispatch_message(
+        self,
+        peer: LwdPeer,
+        msg: LwdMessage,
+        connection: LwdConnectionId | None = None,
+    ) -> bool:
         """Cloud limits -> record and wake the startup wait; c2e -> scheduler
         notify queue + WAKEUP; anything else is unknown."""
         if isinstance(msg, LwdCloudParamsNotify):
-            connection = self._lwd_connection_of(peer)
-            self._lwd_cloud_params[connection] = msg
-            self.scheduler.lwd_update_cloud_params(connection, msg)
+            params_connection = connection or self._lwd_connection_of(peer)
+            # Scheduling limits belong to the cloud DP rank, so hold one entry
+            # per DP and apply it to every connection that DP serves.
+            self._lwd_cloud_params[self._lwd_representative_of(params_connection)] = msg
+            for member in self._lwd_connections_of(params_connection):
+                self.scheduler.lwd_update_cloud_params(member, msg)
             self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             return True
         if isinstance(msg, LwdC2eNotify):
-            connection_id = self._lwd_connection_of(peer)
+            connection_id = connection or self._lwd_connection_of(peer)
             lwd_logger.info(
                 "[edge] c2e received from %s reqs=%d hidden_numel=%d",
                 connection_id,
@@ -267,8 +305,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         """Send to one cloud DP rank, retrying a full outbound queue; raises
         once the retries run out instead of losing the message."""
         cloud = self._lwd_clouds[dp_idx]
+        link = self._lwd_control_plane.link_of(dp_idx)
         for attempt in range(_LWD_SEND_RETRY_STEPS):
-            if self._lwd_send(cloud, message):
+            if self._lwd_send(cloud, message, link):
                 return
             time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(

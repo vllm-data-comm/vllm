@@ -6,11 +6,11 @@ output grouping).
 
 Covers the behavioral seams of the frontend-attach plan:
 
-* A - scene validation (``LwdAPIConfig.validate_topology``):
-  ``edge_share`` keeps the one-to-one primary/non-primary pairing and is
-  the only scene that accepts attach metadata; ``client_index`` stays a
-  frontend grouping key (the attach frontend's non-primary edge instance
-  id), never a topology identity;
+* A - attach endpoints declared by the topology (``edges[].api``) and
+  projected by ``LwdAPIConfig.validate_topology``: the same flat block
+  serves both data planes, device comm requires ``edge_share``, and
+  ``client_index`` stays a frontend grouping key (the member edge
+  instance id), never a topology identity;
 * B - the edge scheduler's ``_lwd_req_id_to_client`` pin table and the
   per-client output grouping in ``update_from_output`` (added with the
   grouping commit).
@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 
-from vllm.config.lwd import LwdAPIConfig, LwdConfig, LwdTopology
+from vllm.config.lwd import LwdConfig, LwdTopology
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VLLM_DIR = REPO_ROOT / "vllm"
@@ -51,8 +51,8 @@ LWD_CLUSTER = ("lwd_cluster", 2, 2)
 SINGLE_INSTANCE = ("single_instance", 1, 1)
 
 
-def _topology(shape: tuple[str, int, int]) -> LwdTopology:
-    """Valid typed topology for a scene.
+def _payload(shape: tuple[str, int, int], api: dict[int, dict] | None = None) -> dict:
+    """Topology payload for a scene, with optional per-edge ``api`` blocks.
 
     edge_share instances share one edge allocation (one physical engine
     group); every other scene gives each instance its own rank. Cloud DPs
@@ -61,8 +61,10 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
     """
     scene, edges, clouds = shape
     shared_edge = scene == "edge_share"
-    edge_entries = [
-        {
+    needs_coordination = scene in ("cloud_share", "lwd_cluster")
+    edge_entries = []
+    for edge_id in range(edges):
+        entry: dict = {
             "id": edge_id,
             "dp": [
                 {
@@ -72,8 +74,11 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
                 }
             ],
         }
-        for edge_id in range(edges)
-    ]
+        if needs_coordination:
+            entry["coordination"] = {"enabled": True, "placement_only": True}
+        if api is not None and edge_id in api:
+            entry["api"] = api[edge_id]
+        edge_entries.append(entry)
     cloud_base = 1 if shared_edge else edges
     cloud_entries = [
         {
@@ -84,8 +89,21 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
                     "addr": "127.0.0.1",
                     "ranks": [cloud_base + cloud_id],
                     "ctrl_port": 5550 + cloud_id,
+                    **(
+                        {
+                            "coord_port": 8100 + cloud_id,
+                            "coord_url": f"http://127.0.0.1:{8100 + cloud_id}",
+                        }
+                        if needs_coordination
+                        else {}
+                    ),
                 }
             ],
+            **(
+                {"coordination": {"enabled": True, "listen_host": "0.0.0.0"}}
+                if needs_coordination
+                else {}
+            ),
         }
         for cloud_id in range(clouds)
     ]
@@ -93,92 +111,95 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
         links = [{"edge": i, "cloud": i} for i in range(edges)]
     else:
         links = [{"edge": i, "cloud": j} for i in range(edges) for j in range(clouds)]
-    return LwdTopology.from_dict(
-        {
-            "deployment": {
-                "mode": 0,
-                "scene": scene,
-                "hccl_world_size": cloud_base + clouds,
-                "edges_num": edges,
-                "clouds_num": clouds,
-            },
-            "feature_ctrl": {"enable_early_recv": False},
-            "edges": edge_entries,
-            "clouds": cloud_entries,
-            "instance_links": links,
-        }
-    )
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": scene,
+            "hccl_world_size": cloud_base + clouds,
+            "edges_num": edges,
+            "clouds_num": clouds,
+        },
+        "feature_ctrl": {"enable_early_recv": False},
+        "edges": edge_entries,
+        "clouds": cloud_entries,
+        "instance_links": links,
+    }
+
+
+def _topology(
+    shape: tuple[str, int, int], api: dict[int, dict] | None = None
+) -> LwdTopology:
+    """Valid typed topology for a scene (``api`` is validated on the way in)."""
+    return LwdTopology.from_dict(_payload(shape, api))
 
 
 def _lwd(
-    shape: tuple[str, int, int], role: str, instance_id: int, **api: str
+    shape: tuple[str, int, int],
+    role: str,
+    instance_id: int,
+    api: dict[int, dict] | None = None,
 ) -> LwdConfig:
-    """LWD identity with attach API metadata; construction itself runs
-    ``LwdAPIConfig.validate_topology`` (raises on any violated rule)."""
-    return LwdConfig(
-        path="",
-        role=role,
-        instance_id=instance_id,
-        topology=_topology(shape),
-        api=LwdAPIConfig(**api),
-    )
+    """LWD identity whose attach endpoints come from the topology; the
+    construction itself runs ``LwdAPIConfig.validate_topology`` (raises on
+    any violated rule)."""
+    return LwdConfig.from_topology("", role, instance_id, _topology(shape, api))
 
 
 class TestAttachSceneValidation:
-    """A: scene rules of the attach metadata validation."""
+    """A: attach endpoints are declared by the topology for both data planes."""
 
-    ATTACH = "10.0.0.1:9700"
-    RPC = "10.0.0.1:9701"
+    ENDPOINT = "127.0.0.1:9700"
+    PAIR = {0: {"rpc_port": ENDPOINT}, 1: {"attach": ENDPOINT}}
 
-    def test_edge_share_attach_requires_non_primary_edge(self) -> None:
+    def test_edge_share_pairs_primary_and_members(self) -> None:
         # Legacy one-to-one pairing: frontend i is edge instance i's
-        # frontend; instance 0's frontend belongs to the main command.
-        _lwd(EDGE_SHARE, "edge", 1, api_server_attach=self.ATTACH)
-        with pytest.raises(ValueError, match="non-primary"):
-            _lwd(EDGE_SHARE, "edge", 0, api_server_attach=self.ATTACH)
+        # frontend; instance 0 owns the engine and the registration endpoint.
+        assert _lwd(EDGE_SHARE, "edge", 0, self.PAIR).api.rpc_port == self.ENDPOINT
+        member = _lwd(EDGE_SHARE, "edge", 1, self.PAIR)
+        assert member.api.attach == self.ENDPOINT
+        assert member.api.primary == 0
 
     def test_edge_share_rpc_port_requires_primary_edge(self) -> None:
-        _lwd(EDGE_SHARE, "edge", 0, api_server_rpc_port=self.RPC)
-        with pytest.raises(ValueError, match="instance_id=0"):
-            _lwd(EDGE_SHARE, "edge", 1, api_server_rpc_port=self.RPC)
-
-    def test_decoupled_scenes_reject_attach(self) -> None:
-        # Attachment remains an edge_share feature; cloud_share and
-        # lwd_cluster do not acquire frontend pairing semantics.
-        for shape in (CLOUD_SHARE, LWD_CLUSTER):
-            with pytest.raises(ValueError, match="scene=edge_share"):
-                _lwd(shape, "edge", 1, api_server_attach=self.ATTACH)
-
-    def test_decoupled_scenes_keep_primary_rules(self) -> None:
-        with pytest.raises(ValueError, match="non-primary"):
-            _lwd(CLOUD_SHARE, "edge", 0, api_server_attach=self.ATTACH)
-        with pytest.raises(ValueError, match="scene=edge_share"):
-            _lwd(CLOUD_SHARE, "edge", 0, api_server_rpc_port=self.RPC)
-        with pytest.raises(ValueError, match="instance_id=0"):
-            _lwd(LWD_CLUSTER, "edge", 1, api_server_rpc_port=self.RPC)
-
-    def test_single_instance_scene_rejects_attach(self) -> None:
-        with pytest.raises(ValueError, match="scene=edge_share"):
-            _lwd(SINGLE_INSTANCE, "edge", 0, api_server_attach=self.ATTACH)
-
-    def test_cloud_role_rejects_attach(self) -> None:
-        with pytest.raises(ValueError, match="edge instances only"):
-            _lwd(EDGE_SHARE, "cloud", 0, api_server_attach=self.ATTACH)
-
-    def test_rpc_port_and_attach_are_mutually_exclusive(self) -> None:
-        with pytest.raises(ValueError, match="mutually exclusive"):
+        with pytest.raises(ValueError, match="engine primary instance 0"):
             _lwd(
                 EDGE_SHARE,
                 "edge",
-                0,
-                api_server_rpc_port=self.RPC,
-                api_server_attach=self.ATTACH,
+                1,
+                {
+                    0: {"rpc_port": self.ENDPOINT},
+                    1: {"rpc_port": "127.0.0.1:9702"},
+                },
+            )
+
+    def test_independent_engines_reject_attach(self) -> None:
+        # Device comm shares an engine only through edge_share; host comm
+        # scenes otherwise need a pairing to have several frontends.
+        for shape in (CLOUD_SHARE, LWD_CLUSTER, SINGLE_INSTANCE):
+            with pytest.raises(ValueError, match="edge_share"):
+                _lwd(shape, "edge", 0, {0: {"rpc_port": self.ENDPOINT}})
+
+    def test_cloud_cannot_declare_api(self) -> None:
+        payload = _payload(EDGE_SHARE, self.PAIR)
+        payload["clouds"][0]["api"] = {"rpc_port": "127.0.0.1:9702"}
+
+        with pytest.raises(ValueError, match="edge instances only"):
+            LwdTopology.from_dict(payload)
+
+    def test_attach_endpoint_must_be_declared(self) -> None:
+        with pytest.raises(ValueError, match="no edge declares"):
+            _topology(EDGE_SHARE, {1: {"attach": self.ENDPOINT}})
+
+    def test_one_endpoint_per_instance(self) -> None:
+        with pytest.raises(ValueError, match="exactly one of rpc_port or attach"):
+            _topology(
+                EDGE_SHARE,
+                {0: {"rpc_port": self.ENDPOINT, "attach": self.ENDPOINT}},
             )
 
     def test_unrequested_api_config_accepts_any_identity(self) -> None:
-        # No API options: validation is inert (single-instance identity
-        # without attach flags must construct cleanly).
-        _lwd(SINGLE_INSTANCE, "edge", 0)
+        # No api block: validation is inert (a scene without a shared
+        # engine must construct cleanly).
+        assert not _lwd(SINGLE_INSTANCE, "edge", 0).api.requested
 
 
 def _load_attach_fn(fn_name: str, **dependencies: Any) -> Any:
@@ -197,7 +218,7 @@ def _load_attach_fn(fn_name: str, **dependencies: Any) -> Any:
 _LWD_IDENTITIES: dict[int, NS] = {}
 
 
-def _stub_lwd_identity(additional_config: dict[str, Any], *, api: LwdAPIConfig) -> NS:
+def _stub_lwd_identity(additional_config: dict[str, Any]) -> NS:
     """Identity stub keyed by the additional-config mapping."""
     return _LWD_IDENTITIES[id(additional_config)]
 
@@ -211,15 +232,14 @@ class TestFrontendCountDecoupling:
         additional_config = {"marker": object()}
         args = NS(
             api_server_count=count,
-            api_server_rpc_port=self.RPC,
-            api_server_attach=None,
             additional_config=additional_config,
         )
         _LWD_IDENTITIES[id(additional_config)] = NS(
             instance_id=0,
+            api=NS(rpc_port=self.RPC, attach=None, requested=True),
             topology=NS(
                 digest="topology-digest",
-                edges=[None] * edges,
+                engine_members=lambda role, instance: [None] * edges,
             ),
         )
         return args
@@ -228,7 +248,6 @@ class TestFrontendCountDecoupling:
         args = self._args(edges, count)
         resolve = _load_attach_fn(
             "resolve_attach_plan",
-            LwdAPIConfig=LwdAPIConfig,
             envs=NS(VLLM_USE_RUST_FRONTEND=False),
             resolve_lwd_config=_stub_lwd_identity,
             _additional_config_dict=lambda value: value.additional_config,
@@ -244,7 +263,7 @@ class TestFrontendCountDecoupling:
         assert self._resolve(2, 2) == 2
 
     def test_explicit_count_must_pair_one_to_one(self) -> None:
-        with pytest.raises(ValueError, match="edge_share"):
+        with pytest.raises(ValueError, match="shared edge frontend count"):
             self._resolve(3, 2)
 
     def test_prepare_attach_mode_uses_resolved_count(self) -> None:
