@@ -47,6 +47,9 @@ from vllm.v1.engine import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_dp_account import (
     LwdCloudDpAccount,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_health import (
+    lwd_rotate_targets,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
     lwd_grammar_ready,
@@ -92,6 +95,25 @@ def lwd_edge_scheduler_config(vllm_config: VllmConfig) -> VllmConfig:
     return scheduler_config
 
 
+def _lwd_first_connection(
+    connections: tuple[LwdConnectionId, ...], edge_id: int
+) -> int:
+    """Index of the connection of the edge's staggered first DP."""
+    pairs = tuple(
+        (connection_id.cloud_id, connection_id.dp_idx)
+        for connection_id in connections
+    )
+    rotated = lwd_rotate_targets(pairs, edge_id)
+    if not rotated:
+        return 0
+    first = rotated[0]
+    return next(
+        index
+        for index, connection_id in enumerate(connections)
+        if (connection_id.cloud_id, connection_id.dp_idx) == first
+    )
+
+
 class LwdEdgeScheduler(LwdBaseScheduler):
     """Per-cloud-DP routing/gating + chunked prefill scheduling +
     control-plane egress (RangeNotify/seqno)."""
@@ -132,7 +154,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         }
         self._lwd_route: dict[str, LwdConnectionId] = {}
         """Request id -> full connection, pinned at admission."""
-        self._lwd_last_engine = -1
+        self._lwd_last_engine = (
+            _lwd_first_connection(connections, lwd_config.instance_id) - 1
+        )
         """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
