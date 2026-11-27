@@ -82,8 +82,18 @@ class LwdControlListener(Protocol):
     def on_peer_up(self, peer: LwdPeer) -> None:
         """`peer` is registered; sending to it is now allowed."""
 
-    def on_message(self, peer: LwdPeer, payload: bytes) -> None:
-        """A business payload from `peer`, in the order it was sent."""
+    def on_message(
+        self,
+        peer: LwdPeer,
+        payload: bytes,
+        connection: LwdConnectionId | None = None,
+    ) -> None:
+        """A business payload from `peer`, in the order it was sent.
+
+        `connection` names the DP connection that delivered it when the role
+        keeps one link per connection (an engine serving several logical
+        edges); it is None when `peer` already identifies the link.
+        """
 
     def on_fatal(self, reason: str) -> None:
         """The IO thread crashed; the plane has stopped."""
@@ -208,7 +218,7 @@ class LwdControlSender:
         sock.connect(outbound_path)
         self._socket: zmq.Socket | None = sock
 
-    def send(self, peer: LwdPeer, payload: bytes) -> bool:
+    def send(self, peer: LwdPeer, payload: bytes, link: int | None = None) -> bool:
         """Queue `payload` for `peer` without blocking.
 
         Returns:
@@ -229,7 +239,14 @@ class LwdControlSender:
                 f"[LWD] {peer} has not completed the handshake"
             )
         try:
-            self._socket.send_multipart((lwd_encode_peer(peer), payload), zmq.NOBLOCK)
+            self._socket.send_multipart(
+                (
+                    lwd_encode_peer(peer),
+                    b"" if link is None else str(link).encode(),
+                    payload,
+                ),
+                zmq.NOBLOCK,
+            )
         except zmq.Again:
             return False
         return True
@@ -383,14 +400,20 @@ class LwdControlPlane(ABC):
     def _drain_inbound(self, transport: LwdControlTransport) -> None:
         for frame in transport.recv_all():
             if frame.kind is LwdFrameKind.LINK:
-                self._handle_link_frame(transport, frame.identity, frame.body)
+                self._handle_link_frame(
+                    transport, frame.identity, frame.body, frame.link
+                )
             else:
                 self._handle_payload(frame.identity, frame.body, frame.link)
             if self._stop.is_set():
                 return
 
     def _handle_link_frame(
-        self, transport: LwdControlTransport, identity: bytes | None, body: bytes
+        self,
+        transport: LwdControlTransport,
+        identity: bytes | None,
+        body: bytes,
+        link: int | None = None,
     ) -> None:
         try:
             msg = lwd_decode_link_message(body)
@@ -402,7 +425,7 @@ class LwdControlPlane(ABC):
                 e,
             )
             return
-        self._on_link_message(transport, identity, msg)
+        self._on_link_message(transport, identity, msg, link)
 
     def _handle_payload(
         self, identity: bytes | None, payload: bytes, link: int | None = None
@@ -418,7 +441,9 @@ class LwdControlPlane(ABC):
             )
             return
         assert self._listener is not None
-        self._listener.on_message(peer, payload)
+        self._listener.on_message(
+            peer, payload, self._inbound_connection(identity, link)
+        )
 
     def _drain_outbound(
         self, transport: LwdControlTransport, outbound: zmq.Socket
@@ -434,11 +459,12 @@ class LwdControlPlane(ABC):
             ):
                 break
             try:
-                peer_frame, payload = outbound.recv_multipart(zmq.NOBLOCK)
+                parts = outbound.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
                 break
-            peer = lwd_decode_peer(peer_frame)
-            self._held.setdefault(peer, deque()).append(payload)
+            peer = lwd_decode_peer(parts[0])
+            link = int(parts[1]) if parts[1] else None
+            self._held.setdefault(peer, deque()).append((link, parts[2]))
 
         # Retry only each FIFO's head, preserving per-peer ordering while
         # allowing every other peer to make progress.
@@ -475,12 +501,16 @@ class LwdControlPlane(ABC):
             )
 
     def _deliver(
-        self, transport: LwdControlTransport, peer: LwdPeer, payload: bytes
+        self,
+        transport: LwdControlTransport,
+        peer: LwdPeer,
+        item: tuple[int | None, bytes],
     ) -> bool:
-        """Send or drop `payload`; False when the link is full and it must be
+        """Send or drop `item`; False when the link is full and it must be
         retried."""
+        link, payload = item
         try:
-            identity = self._outbound_identity(peer)
+            identity = self._outbound_identity(peer, link)
             if not transport.send(LwdFrameKind.PAYLOAD, payload, identity):
                 return False
         except LwdPeerUnreachableError as e:
@@ -539,15 +569,34 @@ class LwdControlPlane(ABC):
         transport: LwdControlTransport,
         identity: bytes | None,
         msg: LwdLinkMessage,
+        link: int | None = None,
     ) -> None: ...
+
+    def _inbound_connection(
+        self, identity: bytes | None, link: int | None
+    ) -> LwdConnectionId | None:
+        """DP connection that delivered the frame, None when `identity` names it."""
+        return None
+
+    def link_of(self, connection_id: LwdConnectionId) -> int | None:
+        """Outbound link carrying `connection_id`; None when the role
+        addresses peers by identity instead of by connection."""
+        return None
 
     @abstractmethod
     def _inbound_peer(self, identity: bytes | None) -> LwdPeer | None:
         """The registered peer behind `identity`, or None."""
 
     @abstractmethod
-    def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
-        """Routing identity of `peer` for outbound frames."""
+    def _outbound_identity(
+        self, peer: LwdPeer, link: int | None = None
+    ) -> bytes | None:
+        """Routing identity of `peer` for outbound frames.
+
+        `link` names the exact link when the caller already knows which
+        connection the payload belongs to (a shared engine serving several
+        logical edges over one control plane).
+        """
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
         # Static deployments use startup handshake and explicit socket errors;
@@ -656,24 +705,30 @@ class LwdEdgeControlPlane(LwdControlPlane):
 
     # ---------------------------------------------------------- link handling
 
+    def _inbound_connection(
+        self, identity: bytes | None, link: int | None
+    ) -> LwdConnectionId | None:
+        if link is None or not 0 <= link < len(self._connection_ids):
+            return None
+        return self._connection_ids[link]
+
+    def link_of(self, connection_id: LwdConnectionId) -> int | None:
+        return self._link_indices.get(connection_id)
+
     def _on_link_message(
         self,
         transport: LwdControlTransport,
         identity: bytes | None,
         msg: LwdLinkMessage,
+        link: int | None = None,
     ) -> None:
-        # A reply names the dp_rank it answers; only that link's handshake
-        # consumes it. Other shapes fall through to every handshake, which
-        # rejects them and fails the plane.
-        if isinstance(msg, LwdLinkAccept):
-            consumers = [
-                handshake
-                for connection_id, handshake in self._handshakes.items()
-                if (connection_id.cloud_id, connection_id.dp_idx)
-                == (msg.instance_id, msg.dp_rank)
-            ]
-            if not consumers:
-                consumers = list(self._handshakes.values())
+        # A reply answers the link it arrived on. A reply's (cloud, dp) cannot
+        # tell two connections to the same cloud DP apart (shared engine), so
+        # it must never complete more than one handshake. Other shapes fall
+        # through to every handshake, which rejects them and fails the plane.
+        connection_id = self._inbound_connection(identity, link)
+        if isinstance(msg, LwdLinkAccept) and connection_id is not None:
+            consumers = [self._handshakes[connection_id]]
         else:
             consumers = list(self._handshakes.values())
         for handshake in consumers:
@@ -733,8 +788,17 @@ class LwdEdgeControlPlane(LwdControlPlane):
             handshake.touch()
         return cloud
 
-    def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
-        """The link index of the DEALER that reaches `peer`."""
+    def _outbound_identity(
+        self, peer: LwdPeer, link: int | None = None
+    ) -> bytes | None:
+        """The link index of the DEALER that reaches `peer`.
+
+        `link` pins the exact connection's DEALER: a shared engine serves
+        several connections over one control plane, and the peer alone cannot
+        tell them apart. Without it the first connection to that DP is used.
+        """
+        if link is not None and 0 <= link < len(self._connection_ids):
+            return str(link).encode()
         connection_id = next(
             (
                 candidate
@@ -790,6 +854,7 @@ class LwdCloudControlPlane(LwdControlPlane):
         transport: LwdControlTransport,
         identity: bytes | None,
         msg: LwdLinkMessage,
+        link: int | None = None,
     ) -> None:
         if identity is None or not isinstance(msg, LwdLinkHello):
             logger.warning(
@@ -847,7 +912,9 @@ class LwdCloudControlPlane(LwdControlPlane):
         if self._handshake.drop_peer(peer) is not None:
             self._unregister_peer(peer, "ROUTER reported the DEALER unreachable")
 
-    def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
+    def _outbound_identity(
+        self, peer: LwdPeer, link: int | None = None
+    ) -> bytes | None:
         identity = self._handshake.identity_of(peer)
         if identity is None:
             raise LwdPeerUnreachableError(f"{peer} is not registered")

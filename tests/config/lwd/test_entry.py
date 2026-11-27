@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import argparse
 import ast
 import copy
 import pickle
@@ -14,7 +13,6 @@ from unittest.mock import Mock
 import pytest
 import yaml
 from lwd_config_under_test import (
-    LwdAPIConfig,
     LwdConfig,
     LwdCoordinationConfig,
     resolve_lwd_config,
@@ -51,7 +49,6 @@ def _startup_entry(param: tuple[str, str, str]) -> StartupEntry:
         "logger": Mock(),
         "log_lwd_config": Mock(),
         "resolve_lwd_config": resolver,
-        "LwdAPIConfig": LwdAPIConfig,
         "current_platform": SimpleNamespace(pre_register_and_update=stop),
     }
     exec(compile(module, str(source), "exec"), scope)
@@ -128,16 +125,6 @@ def test_explicit_invalid_lwd_startup_is_not_treated_as_centralized(
     resolver.assert_called_once()
 
 
-def test_api_attachment_without_lwd_still_fails(
-    engine_startup_entry: StartupEntry,
-) -> None:
-    run, args, resolver = engine_startup_entry
-    args.api_server_attach = "10.0.0.1:25100"
-    with pytest.raises(ValueError, match="require lwd_config.path"):
-        run()
-    resolver.assert_not_called()
-
-
 def test_snapshot_survives_handoff_without_yaml_or_key_access(
     tmp_path: Path, lwd_yaml_dir: Path
 ) -> None:
@@ -172,9 +159,6 @@ def test_snapshot_survives_handoff_without_yaml_or_key_access(
 @pytest.mark.parametrize("raw", [{}, {"enable_cpu_binding": True}, None])
 def test_absent_lwd_leaves_centralized_configuration_empty(raw: object) -> None:
     assert resolve_lwd_config(raw) is None
-    assert resolve_lwd_config(raw, api=LwdAPIConfig()) is None
-    with pytest.raises(ValueError, match="require lwd_config.path"):
-        resolve_lwd_config(raw, api=LwdAPIConfig(api_server_rpc_port="10.0.0.1:25100"))
 
 
 @pytest.mark.parametrize(
@@ -327,35 +311,3 @@ def test_legacy_coordination_config_fields_are_rejected(field: str) -> None:
         value = {0: "http://127.0.0.1:8100"}
     with pytest.raises(ValueError, match="coord_port/coord_url"):
         LwdCoordinationConfig.from_dict({"enabled": True, field: value})
-
-
-@pytest.mark.parametrize(
-    "identity,flag", [(0, "--api-server-rpc-port"), (1, "--api-server-attach")]
-)
-def test_api_cli_metadata_survives_snapshot_handoff(
-    tmp_path: Path, identity: int, flag: str, lwd_yaml_dir: Path
-) -> None:
-    parser = argparse.ArgumentParser()
-    LwdAPIConfig.add_cli_args(parser)
-    args = parser.parse_args([flag, "10.0.0.1:25100"])
-    path = tmp_path / "topology.yaml"
-    args.additional_config = {
-        "lwd_config": {
-            "path": str(path),
-            "role": "edge",
-            "instance_id": identity,
-        }
-    }
-    # Capturing CLI options does not read YAML; snapshot construction owns that read.
-    api = LwdAPIConfig.from_namespace(args)
-    path.write_bytes((lwd_yaml_dir / "s2_edge_share_2dp.yaml").read_bytes())
-    original = copy.deepcopy(args.additional_config)
-    entry = resolve_lwd_config(args.additional_config, api=api)
-    path.unlink()
-    # Only round-trip our own objects, never externally supplied pickle data.
-    received_entry = pickle.loads(pickle.dumps(entry))
-    assert received_entry.api == api
-    assert received_entry.coordination is None
-    assert [c.connection_id.dp_idx for c in received_entry.connections] == [0, 1, 0, 1]
-    assert received_entry.instance_id == identity
-    assert args.additional_config == original

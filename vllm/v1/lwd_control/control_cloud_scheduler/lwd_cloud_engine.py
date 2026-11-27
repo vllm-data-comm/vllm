@@ -463,7 +463,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "[LWD][pre-recv] hint MQ missing: pre-recv gate will never open"
             )
 
-    def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
+    def _lwd_dispatch_message(
+        self,
+        peer: LwdPeer,
+        msg: LwdMessage,
+        connection: LwdConnectionId | None = None,
+    ) -> bool:
         """IO thread: preserve order and hand business messages to the engine."""
         if not isinstance(
             msg,

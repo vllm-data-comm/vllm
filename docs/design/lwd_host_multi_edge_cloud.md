@@ -316,3 +316,81 @@ need_mb(E, up, down) = E * 4 * (up + down)
 3. cloud 首个 prefill 是否 `KeyError: ConnectionId(...)`？检查 `_lwd_up_src_ranks` 是否为空。
 4. `host memory plan` 的 `links` 是否等于 `2 × 本地连接数`？
 5. edge TP>1：本期不在启动期拦截，误用表现为首个 UP 报 `no host ... IO`（预期内）。
+
+## 引擎共享：`api` 端点
+
+同一张卡上起多个边实例时，可以只保留一个引擎：一个实例声明 `api.rpc_port`（它是 primary，起引擎并接受前端注册），其余实例声明 `api.attach` 指向该端点（只起 API 前端，不再起第二个引擎）。两个字段都写在拓扑里：`--api-server-rpc-port` / `--api-server-attach` 已删除，两种数据面统一从 yaml 读取。
+
+```yaml
+edges:
+- id: 0
+  api: {rpc_port: "135.130.1.2:8100"}   # primary：起引擎并注册端点
+  dp: [{dp_idx: 0, addr: 135.130.1.2}]
+- id: 1
+  api: {attach: "135.130.1.2:8100"}     # 前端挂到 0 号实例的引擎
+  dp: [{dp_idx: 0, addr: 135.130.1.2}]
+- id: 2
+  dp: [{dp_idx: 0, addr: 135.130.1.2}]  # 两者都不写 = 独立引擎
+```
+
+| 角色 | 拓扑声明 | 行为 |
+| --- | --- | --- |
+| primary | `api.rpc_port` | 起引擎，接受成员前端注册，`api_server_count` = 引擎成员数 |
+| 成员 | `api.attach` | 只起 API 前端，注册到 primary，`client_index` = 自身 instance_id |
+| 其他 | 都不写 | 独立引擎，行为与不带该特性时一致 |
+
+device（HCCL）与 host 走同一份声明：device 下只有 `scene: edge_share` 能声明 `api`（引擎归属由相同 ranks 固定为 edge 0），host 下可自由配对。命令行不再提供端点参数，两个数据面都只读 yaml。
+
+启动（两侧都只给 `lwd_config`）：
+
+```bash
+vllm serve ... --additional-config '{"lwd_config":{"path":"/home/topology.yaml","role":"edge","instance_id":0}}'
+vllm serve ... --additional-config '{"lwd_config":{"path":"/home/topology.yaml","role":"edge","instance_id":1}}'
+```
+
+校验（`_validate_api`）：
+
+- 只能在 edge 上声明；device 数据面仅允许 `scene: edge_share`（其它场景每个实例独占引擎，声明也无从共享）；
+- 同一实例只能二选一，不能既 `rpc_port` 又 `attach`；
+- `rpc_port` 的 IP 必须等于该实例 `dp[0].addr`，且端点不能被两个实例声明；
+- `attach` 必须等于某个实例的 `rpc_port`（拼错在启动期直接失败），不能指向自己；
+- `edge_share` 下 `rpc_port` 必须由 edge 0 声明（该场景的引擎归属固定为 0），其余边声明 `attach` 指向它。
+
+控制面语义（共享引擎的关键）：
+
+```mermaid
+flowchart LR
+  E0["edge 0 引擎"] -->|"link 0（identity lwd-edge0）"| C0["cloud 0 dp 0"]
+  E0 -->|"link 2（identity lwd-edge1）"| C0
+  E0 -->|"link 1"| C1["cloud 1 dp 0"]
+  E0 -->|"link 3"| C1
+  F1["edge 1 API 前端"] -. "api.attach" .-> E0
+```
+
+- 每条 connection 一条控制链路，DEALER identity 由 `(edge_id, dp_rank, session)` 生成；
+- 云端按 `LwdPeer(edge_id, dp_rank)` 记账，所以同一个引擎的两条连接在云侧是**两个 peer**；
+- 握手回复只作用于**收到它的那条链路**，不能按 cloud DP 扇出；
+- 云端调度参数按**云 DP** 记账，并广播给该 DP 下的所有 connection；
+- 发送时按 connection 选链路（`link_of`），否则实例 1 的请求会从 `lwd-edge0-*` 的 DEALER 发出，被云端记成 edge 0。
+
+### 一卡多引擎 vs 一卡多实例共享引擎
+
+host 数据面下，同一张卡既可以跑多个**独立引擎**（默认形态：不写 `api`），也可以让一个引擎服务多个实例（`api.rpc_port` + `api.attach`）。两者都是合法配置，取舍如下：
+
+| 维度 | 一卡多引擎（不写 `api`） | 一卡多实例共享引擎（`api`） |
+| --- | --- | --- |
+| 权重/显存 | 每进程一份（含上下文、workspace） | 共用一份 |
+| 进程数 | N 个引擎进程 + N 个前端 | 1 个引擎进程 + N 个轻量前端 |
+| 故障域 | 相互独立，可单独重启 | 共享，引擎退出则全部不可用 |
+| 启动开销 | 每个引擎各自加载/初始化 | 只加载一次 |
+| 隔离性 | 强（独立显存配额、独立日志/端口） | 弱（同一引擎内排队） |
+| 适用 | 显存充足、需要隔离或独立扩缩 | 显存紧张、实例多、想省进程与启动时间 |
+| device（HCCL）可行吗 | 不可：同一全局 rank 不能被两个引擎各起一次 | 只能靠 `edge_share`（相同 ranks、1:1 链路） |
+
+选型提示：
+
+- 一卡多引擎时，每个进程的 `--gpu-memory-utilization` 要按"卡内进程数"分摊（例如同卡两个引擎各 0.4~0.45），否则第二个进程会按整卡可用显存估算而超分；
+- `--enable-cpu-binding` 按 NUMA 绑核，同卡多进程会绑到同一批核，出现争用（不影响正确性）；
+- 边侧只加载 embed/unembed、没有 KV cache，单引擎显存占用很小，所以"卡内进程数"通常受权重份数与启动开销限制，而不是 KV 容量。
+
+排障特征：成员实例的请求在云侧显示成 `e0-…`；或握手阶段之后静默不动。

@@ -32,7 +32,7 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
-from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
+from vllm.config.lwd import resolve_lwd_config
 from vllm.config.lwd.api import parse_endpoint
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, get_tcp_uri, make_zmq_socket
@@ -55,8 +55,6 @@ _ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
         "port",
         "uds",
         "api_server_count",
-        "api_server_rpc_port",
-        "api_server_attach",
         "additional_config",
         "master_addr",
         "master_port",
@@ -135,22 +133,23 @@ def _additional_config_dict(args: Any) -> dict[str, Any]:
 
 def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
     """Resolve frontend index/count from the same topology used by engines."""
-    api = LwdAPIConfig.from_namespace(args)
+    lwd = resolve_lwd_config(_additional_config_dict(args))
+    if lwd is None:
+        return None
+    api = lwd.api
     if not api.requested:
         return None
     if envs.VLLM_USE_RUST_FRONTEND:
         raise ValueError("[LWD] API attachment supports Python HTTP frontends only")
-    lwd = resolve_lwd_config(_additional_config_dict(args), api=api)
-    assert lwd is not None
-    count = len(lwd.topology.edges)
+    count = len(lwd.topology.engine_members("edge", lwd.instance_id))
     requested_count = getattr(args, "api_server_count", None)
     if requested_count is not None and requested_count != count:
         raise ValueError(
             f"[LWD] --api-server-count ({requested_count}) must equal the "
-            f"edge_share frontend count ({count})"
+            f"shared edge frontend count ({count})"
         )
-    mode = "primary" if api.api_server_rpc_port is not None else "attach"
-    endpoint = api.api_server_rpc_port or api.api_server_attach
+    mode = "primary" if api.rpc_port is not None else "attach"
+    endpoint = api.rpc_port or api.attach
     assert endpoint is not None
     return FrontendAttachPlan(
         mode=mode,
@@ -644,7 +643,8 @@ def lwd_dispatch_attach_frontend(args: Any) -> bool:
 def prepare_attach_mode(
     args: Any, num_api_servers: int, is_ray_dp: bool
 ) -> tuple[bool, int, FrontendAttachServer | None]:
-    if getattr(args, "api_server_rpc_port", None) is None:
+    plan = resolve_attach_plan(args)
+    if plan is None or plan.mode != "primary":
         return False, num_api_servers, None
     if is_ray_dp:
         raise ValueError("[LWD] API attachment does not support the Ray DP backend")
