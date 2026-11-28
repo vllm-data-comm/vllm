@@ -496,9 +496,29 @@ def test_range_notify_posts_only_extended_hint(monkeypatch: pytest.MonkeyPatch) 
     }
 
 
-def test_range_notify_without_prompt_length_fails_fast() -> None:
+def test_orphan_range_notify_on_fresh_stream_is_dropped() -> None:
+    """Regression for the cloud-restart crash: after a process replacement
+    the first RangeNotify may carry a request id from the dead incarnation.
+    The fresh cloud has no prompt-length record, but raising through the
+    control-plane ingest kills the new EngineCore. Drop that orphan frame
+    instead, leaving the ledger untouched so the new stream (seqno from 0)
+    can be tracked normally.
+    """
     engine = _engine()
     notify = LwdRangeNotify(7, [LwdRangeItem("a", 0, 3)])
+
+    engine._lwd_handle_range_notify(_CONNECTION, notify)  # must not raise
+
+    assert _CONNECTION not in engine._lwd_ledger.latest_seqnos
+    assert engine._lwd_ledger.prompt_lens == {}
+
+
+def test_orphan_range_notify_after_stream_started_fails_fast() -> None:
+    """Once the new stream has tracked a valid range, a missing prompt
+    length is a real protocol error: keep the original fail-fast."""
+    engine = _engine({"a": 8})
+    engine._lwd_ledger.latest_seqnos[_CONNECTION] = 3
+    notify = LwdRangeNotify(9, [LwdRangeItem("orphan", 0, 3)])
 
     with pytest.raises(RuntimeError, match="before RequestNotify"):
         engine._lwd_handle_range_notify(_CONNECTION, notify)

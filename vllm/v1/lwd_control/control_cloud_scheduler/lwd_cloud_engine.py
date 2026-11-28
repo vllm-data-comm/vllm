@@ -833,6 +833,23 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             for request_id in request_ids
         ]
         if any(prompt_len <= 0 for prompt_len in prompt_lens):
+            if latest < 0:
+                # No valid range has been tracked for this connection yet:
+                # the cloud process was just replaced and a RangeNotify from
+                # the dead incarnation was buffered in flight. Dropping it
+                # keeps the fresh EngineCore alive; the edge resets its
+                # seqno ledger on replacement and re-announces from zero.
+                # Once track_range has run, a missing prompt length is a
+                # real protocol error again, so fail-fast is preserved.
+                lwd_logger.error(
+                    "[LWD][cloud] drop orphan RangeNotify seqno=%d from %s: "
+                    "request(s) %s have no prompt lengths recorded "
+                    "(peer process replaced?)",
+                    notify.seqno,
+                    connection_id,
+                    request_ids,
+                )
+                return
             raise RuntimeError(
                 f"[LWD] RangeNotify seqno={notify.seqno} arrived before "
                 "RequestNotify prompt lengths were recorded"

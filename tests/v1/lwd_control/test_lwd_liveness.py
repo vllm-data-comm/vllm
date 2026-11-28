@@ -496,9 +496,11 @@ def test_abort_skips_the_cloud_notify_for_silent_connections(
     its notify."""
     from types import SimpleNamespace
 
-    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
+        LwdBaseEngineCore,
+    )
 
-    monkeypatch.setattr(EngineCoreProc, "abort_requests", lambda self, ids: None)
+    monkeypatch.setattr(LwdBaseEngineCore, "abort_requests", lambda self, ids: None)
     engine: Any = object.__new__(LwdEdgeEngineCore)
     engine._lwd_probe_manager = SimpleNamespace(abort=lambda request_id: None)
     engine._lwd_probe_chains = {}
@@ -515,8 +517,74 @@ def test_abort_skips_the_cloud_notify_for_silent_connections(
     monkeypatch.setattr(
         engine, "_lwd_send_to_cloud", lambda dp_idx, message: sent.append(dp_idx)
     )
+    errors: list = []
+    monkeypatch.setattr(
+        engine,
+        "_send_error_outputs_to_client",
+        lambda ids, client_index: errors.append((ids, client_index)),
+    )
     engine.abort_requests(["e0-r1", "e0-r2"])
     assert sent == [CONNECTION_E1]
+    assert errors == []  # default abort path keeps the native ABORT finish
+
+
+def test_containment_fails_silent_requests_with_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request hanging on a cloud declared silent must get an explicit
+    ERROR finish at containment time, not a native ABORT/cancelled finish.
+
+    Regression for the 1e1c case where killing the cloud leaves the
+    request hanging until the 10s silence verdict tears the links down:
+    the containment must surface a visible failure, and must not emit a
+    second ABORT finish for the same request.
+    """
+    from types import SimpleNamespace
+
+    from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
+        LwdBaseEngineCore,
+    )
+    from vllm.v1.lwd_control.lwd_exceptions import LwdTransferFailedError
+
+    native_aborts: list[list[str]] = []
+    monkeypatch.setattr(
+        LwdBaseEngineCore,
+        "abort_requests",
+        lambda self, ids: native_aborts.append(ids),
+    )
+    engine: Any = object.__new__(LwdEdgeEngineCore)
+    engine._lwd_probe_manager = SimpleNamespace(abort=lambda request_id: None)
+    engine._lwd_probe_chains = {}
+    engine._lwd_heartbeat = LwdHeartbeatMonitor(10.0, 1.0)
+    engine._lwd_heartbeat._silent = {CONNECTION}
+    errors: list[tuple[list[str], int]] = []
+    finished: list[tuple[list[str], object]] = []
+    monkeypatch.setattr(
+        engine,
+        "_send_error_outputs_to_client",
+        lambda ids, client_index: errors.append((ids, client_index)),
+    )
+    monkeypatch.setattr(engine, "_lwd_send_to_cloud", lambda dp_idx, message: None)
+    engine.scheduler = SimpleNamespace(
+        lwd_edge_abort=lambda ids: [(CONNECTION, "e0-r1")],
+        requests={
+            "e0-r1": SimpleNamespace(
+                client_index=0,
+                lwd_prefix_nonce=0,
+                is_finished=lambda: False,
+            )
+        },
+        finish_requests=lambda ids, status: finished.append((ids, status)),
+    )
+    result = engine._lwd_contain_transfer_failure(
+        LwdTransferFailedError(CONNECTION, [199], req_ids=["e0-r1"])
+    )
+    assert errors == [(["e0-r1"], 0)]
+    assert len(finished) == 1 and finished[0][0] == ["e0-r1"]
+    # The silent request must be settled exactly once and kept out of the
+    # native ABORT path (no double finish).
+    assert all("e0-r1" not in ids for ids in native_aborts)
+    assert result == ({}, False)
 
 
 def test_registry_fires_every_hook_and_survives_exceptions() -> None:

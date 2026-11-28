@@ -213,6 +213,42 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
         account.prefix_alignment_required = params.prefix_alignment_required
 
+    def lwd_edge_reset_connection(self, connection_id: LwdConnectionId) -> list[str]:
+        """Reset one cloud DP's seqno ledger after the cloud process is
+        replaced.
+
+        A fresh cloud starts with an empty prompt-length ledger, so the
+        edge's seqno stream must restart from zero and every booking from
+        the dead incarnation must be dropped. Otherwise the first
+        RangeNotify of the new stream carries a request id the cloud never
+        received a RequestNotify for, and its fail-fast ingest kills the
+        fresh EngineCore. Returns the request ids whose routing entry was
+        dropped so the engine can finish them instead of leaving them
+        orphaned. Idempotent.
+        """
+        account = self._lwd_accounts.get(connection_id)
+        if account is not None:
+            account.seqno = 0
+            account.pending_batches.clear()
+        self._lwd_announced_refills = {
+            pair for pair in self._lwd_announced_refills if pair[0] != connection_id
+        }
+        orphaned = [
+            request_id
+            for request_id, target in self._lwd_route.items()
+            if target == connection_id
+        ]
+        for request_id in orphaned:
+            self._lwd_route.pop(request_id, None)
+        self._lwd_aborted_req_ids[connection_id] = []
+        lwd_logger.error(
+            "[LWD][edge] cloud %s replaced: seqno ledger reset, %d "
+            "in-flight request(s) orphaned",
+            connection_id,
+            len(orphaned),
+        )
+        return orphaned
+
     def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
         """Seed a runtime-added connection's bookkeeping BEFORE its link
         opens: the cloud's limits can arrive on the IO thread within one
