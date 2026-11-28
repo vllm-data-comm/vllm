@@ -3,10 +3,10 @@
 """LWD scheme-3.1 tokenizer obfuscation: vLLM-side startup bridge.
 
 Optional bridge for the independently packaged `mixed_tokenizer` scheme-3.1
-obfuscation feature ported onto the LWD main line. The native default
-configuration never imports the optional package; deployment policy and
-artifact loading live in that package. This module only identifies
-configurations that need its startup hooks.
+obfuscation feature ported onto the LWD main line. Native configurations,
+including reasoning, tool and structured-output options, never import the
+optional package; deployment policy and artifact loading live in that
+package. This module only identifies deployments that select obfuscation.
 
 The user-facing options travel in a `tokenizer_obfuscation` block of the
 native `--additional-config` argument (inline JSON or a YAML file via
@@ -19,40 +19,22 @@ from importlib import import_module
 from typing import Any
 
 
-def _get(value: Any, key: str, default: Any = None) -> Any:
-    return (
-        value.get(key, default)
-        if isinstance(value, dict)
-        else getattr(value, key, default)
-    )
-
-
 def needs_obfuscation_hook(args: Any) -> bool:
-    """Recognize explicitly configured capabilities, excluding native auto."""
+    """Recognize explicit obfuscation deployment markers only.
+
+    Capability flags such as reasoning or tool parsers and an explicit
+    structured-output backend are valid native configurations; they do not
+    force the optional bridge. The `mixed_tokenizer` package is imported
+    only when the deployment itself selects the obfuscated tokenizer.
+    """
     if getattr(args, "_tokenizer_obfuscation_preparing", False):
         # The trusted builder must first resolve the unmodified native config.
         # This private in-process marker is intentionally absent from the CLI.
         return False
-    structured = getattr(args, "structured_outputs_config", None)
-    reasoning = getattr(args, "reasoning_config", None)
     return bool(
         getattr(args, "enable_tokenizer_obfuscation", False)
         or getattr(args, "tokenizer_obfuscation_artifacts", None)
         or getattr(args, "tokenizer_mode", None) == "mixed_bytes"
-        or getattr(args, "reasoning_parser", None)
-        or getattr(args, "reasoning_parser_plugin", None)
-        or getattr(args, "enable_auto_tool_choice", False)
-        or getattr(args, "tool_call_parser", None)
-        or getattr(args, "tool_strict_level", "auto") not in (None, "auto")
-        or _get(structured, "backend", "auto") != "auto"
-        or _get(structured, "reasoning_parser", "")
-        or _get(structured, "reasoning_parser_plugin", "")
-        or _get(structured, "enable_in_reasoning", False)
-        or _get(structured, "disable_any_whitespace", False)
-        or _get(structured, "disable_additional_properties", False)
-        or _get(reasoning, "reasoning_parser", "")
-        or _get(reasoning, "reasoning_start_str", "")
-        or _get(reasoning, "reasoning_end_str", "")
     )
 
 
