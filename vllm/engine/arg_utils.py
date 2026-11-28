@@ -90,7 +90,11 @@ from vllm.config.kernel import (
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.logging import LogLevel
 from vllm.config.lora import MaxLoRARanks
-from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
+from vllm.config.lwd import (
+    LwdAPIConfig,
+    apply_obfuscation_additional_config,
+    resolve_lwd_config,
+)
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
     ConvertOption,
@@ -498,6 +502,10 @@ class EngineArgs:
     skip_tokenizer_init: bool = ModelConfig.skip_tokenizer_init
     enable_prompt_embeds: bool = ModelConfig.enable_prompt_embeds
     tokenizer_mode: TokenizerMode | str = ModelConfig.tokenizer_mode
+    # Resolved from the `tokenizer_obfuscation` block of --additional-config
+    # by apply_obfuscation_additional_config; not exposed as CLI flags.
+    enable_tokenizer_obfuscation: bool | None = None
+    tokenizer_obfuscation_artifacts: str | None = None
     trust_remote_code: bool = ModelConfig.trust_remote_code
     allowed_local_media_path: str = ModelConfig.allowed_local_media_path
     allowed_media_domains: list[str] | None = ModelConfig.allowed_media_domains
@@ -878,6 +886,9 @@ class EngineArgs:
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
+        # Programmatic (non-CLI) startup reads the same --additional-config
+        # block; from_cli_args already lifted it for the serve path.
+        apply_obfuscation_additional_config(self)
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.attention_config, dict):
@@ -1968,6 +1979,14 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        from vllm.tokenizers.lwd_tokenizer_obfuscation import run_obfuscation_hook
+
+        # Obfuscation options arrive inside --additional-config; lift them
+        # before the hook so configure_server_args sees the resolved fields.
+        apply_obfuscation_additional_config(args)
+        # Frontend-only tool and middleware settings must be resolved before
+        # copying the engine fields and before API workers are spawned.
+        run_obfuscation_hook("configure_server_args", args)
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
 
@@ -1975,6 +1994,11 @@ class EngineArgs:
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
+        # Preserve only this bridge's private binding state. It includes the
+        # original frontend options needed to validate the deployed manifest.
+        for name, value in vars(args).items():
+            if name.startswith("_tokenizer_obfuscation_"):
+                setattr(engine_args, name, value)
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
@@ -2284,6 +2308,11 @@ class EngineArgs:
                 )
             )
 
+        from vllm.tokenizers.lwd_tokenizer_obfuscation import run_obfuscation_hook
+
+        # Bind the tokenizer before ModelConfig/ReasoningConfig can initialize
+        # tokenizers. The final hook below checks native resolved defaults.
+        run_obfuscation_hook("configure_engine_args", self)
         model_config = self.create_model_config()
         self.model = model_config.model
         self.model_weights = model_config.model_weights
@@ -2936,6 +2965,7 @@ class EngineArgs:
             shutdown_timeout=self.shutdown_timeout,
         )
 
+        run_obfuscation_hook("validate_engine_config", self, config)
         return config
 
     def _check_feature_supported(self):

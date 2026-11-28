@@ -169,6 +169,13 @@ class GuidanceBackend(StructuredOutputBackend):
             self.vllm_config.structured_outputs_config.disable_additional_properties
         )
 
+        if callable(
+            init_tokenizer := getattr(self.tokenizer, "init_guidance_tokenizer", None)
+        ):
+            # Transport tokenizers may expose carrier strings to HF. Use their
+            # actual grammar bytes while retaining native Guidance matching.
+            self.ll_tokenizer = init_tokenizer(self.vocab_size)
+            return
         if not self.is_tokenizer_supported(self.tokenizer):
             raise ValueError(
                 "Only fast tokenizers are supported."

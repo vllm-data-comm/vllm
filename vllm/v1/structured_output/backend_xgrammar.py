@@ -45,8 +45,19 @@ class XgrammarBackend(StructuredOutputBackend):
             model_config is not None and model_config.hf_config.model_type == "plamo3"
         )
 
+        self.num_speculative_tokens = 0
+        if self.vllm_config.speculative_config is not None:
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+            )
+        self._init_tokenizer_backend_adapter()
+
         full_vocab_tokenizer_info = None
-        if is_mistral_tokenizer(self.tokenizer):
+        if self.tokenizer_backend_adapter is not None:
+            # The adapter supplies RAW TokenizerInfo and applies its own
+            # admission policy; native special-token filtering is bypassed.
+            tokenizer_info = self.tokenizer_backend_adapter.tokenizer_info
+        elif is_mistral_tokenizer(self.tokenizer):
             # NOTE: ideally, xgrammar should handle this accordingly.
             # refer to https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98
             stop_token_ids = [self.tokenizer.eos_token_id]
@@ -91,7 +102,7 @@ class XgrammarBackend(StructuredOutputBackend):
         # At the same time json must NOT accept any special tokens
         # Currently xgrammar does not properly handle all the cases
         # So, we have to implement additional logic on our side
-        # We maintain TWO compilers for different structural output types
+        # We maintain TWO compilers for different structured output types
         # If in future xgrammar will fix this problem,
         # then we can consider to remove this
         # Also, note that other backends like guidance
@@ -111,11 +122,44 @@ class XgrammarBackend(StructuredOutputBackend):
             else self._create_compiler(full_vocab_tokenizer_info)
         )
 
-        self.num_speculative_tokens = 0
-        if self.vllm_config.speculative_config is not None:
-            self.num_speculative_tokens = (
-                self.vllm_config.speculative_config.num_speculative_tokens
+    def _init_tokenizer_backend_adapter(self) -> None:
+        """Bind the custom-tokenizer adapter exposed for this backend.
+
+        A custom tokenizer may expose transport characters instead of its
+        actual token bytes. Its adapter supplies RAW TokenizerInfo and applies
+        the admission policy before a Matcher is published.
+        """
+        init_backend = getattr(self.tokenizer, "init_xgrammar_backend", None)
+        self.tokenizer_backend_adapter = (
+            init_backend(
+                self.vocab_size,
+                disable_any_whitespace=self.disable_any_whitespace,
+                num_speculative_tokens=self.num_speculative_tokens,
             )
+            if callable(init_backend)
+            else None
+        )
+
+    def _create_compiler(
+        self, tokenizer_info: "xgr.TokenizerInfo"
+    ) -> "xgr.GrammarCompiler":
+        if self.tokenizer_backend_adapter is not None:
+            create_compiler = getattr(
+                self.tokenizer_backend_adapter, "create_compiler", None
+            )
+            if callable(create_compiler):
+                # The adapter creates the compiler from its privately validated
+                # TI, so returned artifacts carry provenance without rescanning
+                # vocab.
+                return create_compiler()
+            compiler_options = self.tokenizer_backend_adapter.compiler_options
+        else:
+            compiler_options = {
+                "max_threads": 8,
+                "cache_enabled": True,
+                "cache_limit_bytes": vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
+            }
+        return xgr.GrammarCompiler(tokenizer_info, **compiler_options)
 
     def compile_grammar(
         self,
@@ -142,7 +186,19 @@ class XgrammarBackend(StructuredOutputBackend):
         # and will be available in next release.
         # So, remove this comment once xgrammar updates to v0.2.9
         separators = (",", ":") if self.disable_any_whitespace else None
-        if request_type == StructuredOutputOptions.JSON:
+        cached_ctx = None
+        get_admitted = getattr(
+            self.tokenizer_backend_adapter, "get_admitted_compiled", None
+        )
+        if callable(get_admitted):
+            cached_ctx = get_admitted(
+                request_type.name.lower(), grammar_spec, stop_token_ids
+            )
+        if cached_ctx is not None:
+            # The lookup checked current evidence and retained artifact identity.
+            # Only ctx is shared; Matcher below remains private to this request.
+            ctx = cached_ctx
+        elif request_type == StructuredOutputOptions.JSON:
             ctx = self.compiler.compile_json_schema(
                 grammar_spec,
                 any_whitespace=not self.disable_any_whitespace,
@@ -195,6 +251,11 @@ class XgrammarBackend(StructuredOutputBackend):
                 f"grammar is not of valid supported types. ({request_type!s})"
             )
 
+        if self.tokenizer_backend_adapter is not None and cached_ctx is None:
+            self.tokenizer_backend_adapter.admit_compiled(
+                request_type.name.lower(), grammar_spec, ctx, stop_token_ids
+            )
+
         return XgrammarGrammar(
             matcher=xgr.GrammarMatcher(
                 ctx,
@@ -211,17 +272,6 @@ class XgrammarBackend(StructuredOutputBackend):
     def destroy(self):
         del self.compiler
         del self.full_vocab_compiler
-
-    @staticmethod
-    def _create_compiler(
-        tokenizer_info: "xgr.TokenizerInfo",
-    ) -> "xgr.GrammarCompiler":
-        return xgr.GrammarCompiler(
-            tokenizer_info,
-            max_threads=8,
-            cache_enabled=True,
-            cache_limit_bytes=vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
-        )
 
     @staticmethod
     def _filter_special_tokens(

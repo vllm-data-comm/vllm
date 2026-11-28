@@ -8,6 +8,7 @@ from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
 from .logging import log_lwd_config
+from .tokenizer_obfuscation import apply_obfuscation_additional_config
 from .topology import (
     LwdConnectionId,
     LwdGateway,
@@ -26,6 +27,7 @@ __all__ = [
     "LwdTopology",
     "LwdTopologyIncrement",
     "LwdTopologyUpdateRejected",
+    "apply_obfuscation_additional_config",
     "diff_topology",
     "log_lwd_config",
     "resolve_lwd_config",
