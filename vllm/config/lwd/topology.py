@@ -327,11 +327,53 @@ class LwdDP:
         return self
 
 
+def parse_endpoint(value: str, flag: str) -> tuple[str, int]:
+    """Return the concrete IP and port from an LWD API endpoint."""
+    if not isinstance(value, str):
+        raise ValueError(f"[LWD] {flag} requires IP:port")
+    host, sep, port = value.rpartition(":")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    elif ":" in host:
+        raise ValueError(f"[LWD] {flag}: IPv6 must use [IP]:port")
+    if not sep or not port.isascii() or not port.isdecimal():
+        raise ValueError(f"[LWD] {flag} requires IP:port")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError(f"[LWD] {flag}: port must be in [1, 65535]")
+    try:
+        addr = ip_address(host)
+    except ValueError as exc:
+        raise ValueError(f"[LWD] {flag}: invalid IP {host!r}") from exc
+    if addr.is_unspecified or addr.is_multicast:
+        raise ValueError(f"[LWD] {flag}: use a concrete unicast IP")
+    return host, int(port)
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdApi:
+    """Frontend attach endpoints of one edge instance.
+
+    Exactly one field may be set: ``rpc_port`` on the engine primary that
+    accepts non-primary frontends, ``attach`` on the instance whose frontend
+    registers with it. Omitting the whole block makes this instance run its
+    own independent engine.
+    """
+
+    rpc_port: LwdString | None = None
+    attach: LwdString | None = None
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdInstance:
     id: LwdId
     dp: Annotated[tuple[LwdDP, ...], Field(min_length=1)]
     coordination: LwdCoordination | None = None
+    api: LwdApi | None = None
+    """Frontend attach endpoints of this instance. ``rpc_port`` makes this
+    instance the engine primary that accepts the frontends of the instances
+    whose ``attach`` equals that endpoint; ``attach`` sends this instance's
+    frontend to that primary instead of launching a second engine. Omitted =
+    no attachment, i.e. an independent engine."""
 
     @field_validator("dp")
     @classmethod
@@ -489,6 +531,48 @@ class LwdTopology:
         """True when ``data_plane_comm`` is host: edge and cloud are separate worlds."""
         return self.deployment.data_plane_comm == "host"
 
+    def rpc_port_owner(self, endpoint: str) -> int | None:
+        """Edge instance that declares `endpoint` as its `api.rpc_port`."""
+        for edge in self.edges:
+            if edge.api is not None and edge.api.rpc_port == endpoint:
+                return edge.id
+        return None
+
+    def engine_primary(self, role: str, identity: int) -> int:
+        """Instance that hosts the engine serving this one.
+
+        ``edge_share`` keeps its meaning: every logical edge is a frontend of
+        one edge engine whose primary is edge 0. Otherwise an ``api.attach``
+        names the primary explicitly; instances without an ``api`` block are
+        their own independent engine.
+        """
+        instance = self.instance(role, identity)
+        if (
+            role == "edge"
+            and instance.api is not None
+            and instance.api.attach is not None
+        ):
+            owner = self.rpc_port_owner(instance.api.attach)
+            if owner is None:
+                raise ValueError(
+                    f"[LWD] edge {identity} attaches to "
+                    f"{instance.api.attach}, which no edge declares as "
+                    "api.rpc_port"
+                )
+            return owner
+        if role == "edge" and self.deployment.scene == "edge_share":
+            return 0
+        return identity
+
+    def engine_members(self, role: str, identity: int) -> tuple[int, ...]:
+        """Instance ids served by the engine that serves this instance."""
+        primary = self.engine_primary(role, identity)
+        return tuple(
+            instance.id
+            for instance in (self.edges if role == "edge" else self.clouds)
+            if self.engine_primary(role, instance.id) == primary
+        )
+
     @field_validator("edges", "clouds")
     @classmethod
     def order_instances(
@@ -537,6 +621,7 @@ class LwdTopology:
         self._validate_scene()
         self._validate_coordination()
         self._validate_gateway()
+        self._validate_api()
         if len({len(instance.dp) for instance in (*self.edges, *self.clouds)}) != 1:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
@@ -725,6 +810,55 @@ class LwdTopology:
                 raise ValueError(
                     f"[LWD] coord_port conflicts with {conflict} on {dp.addr}"
                 )
+
+    def _validate_api(self) -> None:
+        """Frontend attach endpoints declared in ``edges[].api``.
+
+        Edge-only, one owner per endpoint, and every ``attach`` must resolve
+        to a declared ``rpc_port``. Both data planes may declare them; device
+        comm shares an engine only through ``edge_share``, so its endpoints
+        just name where the extra frontends rendezvous.
+        """
+        if any(cloud.api is not None for cloud in self.clouds):
+            raise ValueError("[LWD] api applies to edge instances only")
+        declaring = [edge for edge in self.edges if edge.api is not None]
+        if not declaring:
+            return
+        if not self.is_host_comm and self.deployment.scene != "edge_share":
+            raise ValueError(
+                "[LWD] api applies to data_plane_comm=host or scene edge_share"
+            )
+        owners: dict[str, int] = {}
+        for edge in declaring:
+            api = edge.api
+            assert api is not None
+            if (api.rpc_port is None) == (api.attach is None):
+                raise ValueError(
+                    f"[LWD] edge {edge.id} api needs exactly one of rpc_port or attach"
+                )
+            if api.rpc_port is not None:
+                host, _ = parse_endpoint(api.rpc_port, f"edge {edge.id} api.rpc_port")
+                if host != edge.dp[0].addr:
+                    raise ValueError(
+                        f"[LWD] edge {edge.id} api.rpc_port must use its own "
+                        f"address {edge.dp[0].addr}"
+                    )
+                if api.rpc_port in owners:
+                    raise ValueError(
+                        f"[LWD] api.rpc_port {api.rpc_port} is declared by "
+                        f"both edge {owners[api.rpc_port]} and edge {edge.id}"
+                    )
+                owners[api.rpc_port] = edge.id
+        for edge in declaring:
+            api = edge.api
+            assert api is not None
+            if api.attach is not None:
+                parse_endpoint(api.attach, f"edge {edge.id} api.attach")
+                if api.attach not in owners:
+                    raise ValueError(
+                        f"[LWD] edge {edge.id} attaches to {api.attach}, "
+                        "which no edge declares as api.rpc_port"
+                    )
 
     def _validate_scene(self) -> None:
         """Validate logical instance shape, independently of physical host count."""

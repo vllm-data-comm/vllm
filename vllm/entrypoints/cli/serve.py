@@ -160,8 +160,8 @@ class ServeSubcommand(CLISubcommand):
             or rust_frontend_path
             # An LWD attach primary must run the attach pipeline (its
             # registration server) even with a single planned frontend;
-            # the single in-process path leaves --api-server-rpc-port
-            # unbound and attach frontends hang on it.
+            # the single in-process path leaves the attach registration
+            # endpoint unbound and attach frontends hang on it.
             or getattr(args, "lwd_attach_primary", False)
         ):
             run_multi_api_server(args)

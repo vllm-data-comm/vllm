@@ -34,8 +34,6 @@ __all__ = [
 
 def resolve_lwd_config(
     additional_config: Any,
-    *,
-    api: LwdAPIConfig | None = None,
 ) -> LwdConfig | None:
     """Parse once into the VllmConfig snapshot forwarded to engines/workers."""
     if not isinstance(additional_config, dict):
@@ -48,10 +46,8 @@ def resolve_lwd_config(
             "move it into lwd_config.coordination"
         )
     lwd = (
-        LwdConfig.from_dict(additional_config["lwd_config"], api=api)
+        LwdConfig.from_dict(additional_config["lwd_config"])
         if "lwd_config" in additional_config
         else None
     )
-    if lwd is None and api is not None:
-        api.validate_topology(None)
     return lwd

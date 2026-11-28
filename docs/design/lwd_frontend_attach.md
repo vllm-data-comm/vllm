@@ -1,11 +1,35 @@
 # LWD Frontend Attachment
 
-`vllm/entrypoints/openai/lwd/frontend_attach.py` gives every edge in an
-`edge_share` topology its own API frontend while sharing the primary edge's
-native engine group. The primary edge is client index 0 and is the only command
-that launches engines. Each other edge runs one API-server child and attaches
-to the primary with `--api-server-attach`; the primary listens with
-`--api-server-rpc-port`.
+`vllm/entrypoints/openai/lwd/frontend_attach.py` gives several edge instances
+their own API frontends while sharing one engine. The attachment is declared
+entirely in the topology yaml: there is no command-line form
+(`--api-server-rpc-port` / `--api-server-attach` are retired).
+
+```yaml
+edges:
+  - id: 0
+    api: {rpc_port: "135.130.1.2:8100"}   # primary: launches the engine and
+                                          # accepts the other frontends
+    dp: [{dp_idx: 0, addr: 135.130.1.2}]
+  - id: 1
+    api: {attach: "135.130.1.2:8100"}     # frontend attaches to edge 0's engine
+    dp: [{dp_idx: 0, addr: 135.130.1.2}]
+  - id: 2
+    dp: [{dp_idx: 0, addr: 135.130.1.2}]  # no api block = independent engine
+```
+
+`edges[].api.rpc_port` makes that instance the engine primary: it accepts the
+frontends of every edge whose `api.attach` equals that endpoint, and its
+engine owns all of their connections. `api.attach` sends this instance's
+frontend to that primary instead of launching a second engine. Omitting the
+whole block keeps an independent engine. Exactly one of the two fields may be
+set, `api` is edge-only, every `rpc_port` has one owner and every `attach`
+must resolve to a declared `rpc_port` (`LwdTopology._validate_api`).
+
+The primary edge is client index 0 and is the only command that launches
+engines. Each attached edge runs one API-server child and registers with the
+primary. The `edge_share` scene keeps its previous meaning on both data
+planes; on device comm an `api` block is only allowed in that scene.
 
 ## Handshake
 
@@ -27,7 +51,8 @@ It carries msgpack dictionaries over a ZMQ ROUTER/DEALER connection:
    `LWD_FRONTEND_BARRIER`. Errors at any stage use `LWD_FRONTEND_ERROR`.
 
 The client index and count come from the resolved LWD topology, not process
-start order. `--api-server-count` must equal the number of topology edges.
+start order. `--api-server-count` must equal the number of instances served by
+that shared engine.
 
 ## Startup barrier
 

@@ -39,6 +39,12 @@ qos:
   ctrl_plane: {dscp: 26}                    # optional; defaults to 48
 ```
 
+Frontend sharing is also declared in the topology, with an optional
+`edges[].api` block (`rpc_port` on the engine primary, `attach` on the edges
+whose frontends join it, omitted for an independent engine). See
+[`lwd_frontend_attach.md`](lwd_frontend_attach.md) for the schema and a
+multi-edge example.
+
 | Field | Meaning |
 | --- | --- |
 | `deployment.data_plane_comm` | Transport family; `host` selects this document |

@@ -308,7 +308,9 @@ def test_registration_rejects_a_listen_port_inside_the_band() -> None:
     assert _handle(server, _attach_message(pid=111))["type"] == "LWD_FRONTEND_ACCEPT"
 
 
-def _one_pair_edge_share_yaml(path: Any, *, host_comm: bool) -> None:
+def _one_pair_edge_share_yaml(
+    path: Any, *, host_comm: bool, api: dict[str, str] | None = None
+) -> None:
     """A single-pair edge_share topology; device comm adds the rank
     allocations host comm does not use."""
     deployment: dict[str, Any] = {
@@ -326,6 +328,9 @@ def _one_pair_edge_share_yaml(path: Any, *, host_comm: bool) -> None:
         deployment["hccl_world_size"] = 2
         edge_dp["ranks"] = [0]
         cloud_dp["ranks"] = [1]
+    edge: dict[str, Any] = {"id": 0, "dp": [edge_dp]}
+    if api is not None:
+        edge["api"] = api
     path.write_text(
         yaml.safe_dump(
             {
@@ -338,7 +343,7 @@ def _one_pair_edge_share_yaml(path: Any, *, host_comm: bool) -> None:
                         "custom_factor": None,
                     },
                 },
-                "edges": [{"id": 0, "dp": [edge_dp]}],
+                "edges": [edge],
                 "clouds": [{"id": 0, "dp": [cloud_dp]}],
                 "instance_links": [{"edge": 0, "cloud": 0}],
             },
@@ -355,11 +360,15 @@ def test_one_frontend_primary_flags_the_multi_server_path_by_comm(
     capacity on host comm -- api_server_count carries the band capacity,
     so frontends beyond the yaml plan attach without a primary restart
     and the serve dispatch reaches run_multi_api_server (whose
-    registration server is the only thing that ever binds
-    --api-server-rpc-port). Device comm keeps the plan count and the
+    registration server is the only thing that ever binds the
+    api.rpc_port endpoint). Device comm keeps the plan count and the
     native single-server path."""
     yaml_path = tmp_path / "edge_share.yaml"
-    _one_pair_edge_share_yaml(yaml_path, host_comm=host_comm)
+    _one_pair_edge_share_yaml(
+        yaml_path,
+        host_comm=host_comm,
+        api={"rpc_port": "135.150.2.2:23657"},
+    )
     args = argparse.Namespace(
         additional_config={
             "lwd_config": {
@@ -368,8 +377,6 @@ def test_one_frontend_primary_flags_the_multi_server_path_by_comm(
                 "instance_id": 0,
             }
         },
-        api_server_rpc_port="127.0.0.1:23657",
-        api_server_attach=None,
         api_server_count=None,
     )
     assert lwd_dispatch_attach_frontend(args) is False

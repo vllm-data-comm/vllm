@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import argparse
 import ast
 import copy
 import pickle
@@ -19,6 +18,7 @@ from lwd_config_under_test import (
     LwdCoordinationConfig,
     resolve_lwd_config,
 )
+from sample_topologies import host_cluster_payload
 
 FIXTURE_NAME = "s3_cloud_share_2dp.yaml"
 StartupEntry = tuple[Callable[[], None], SimpleNamespace, Mock]
@@ -80,11 +80,6 @@ def startup_entry(request: pytest.FixtureRequest) -> StartupEntry:
     return _startup_entry(request.param)
 
 
-@pytest.fixture
-def engine_startup_entry() -> StartupEntry:
-    return _startup_entry(("engine/arg_utils.py", "EngineArgs", "create_engine_config"))
-
-
 @pytest.mark.parametrize("raw", [{}, {"enable_cpu_binding": True}, object()])
 def test_centralized_startup_does_not_call_lwd_parser(
     startup_entry: StartupEntry, raw: object
@@ -128,14 +123,24 @@ def test_explicit_invalid_lwd_startup_is_not_treated_as_centralized(
     resolver.assert_called_once()
 
 
-def test_api_attachment_without_lwd_still_fails(
-    engine_startup_entry: StartupEntry,
-) -> None:
-    run, args, resolver = engine_startup_entry
-    args.api_server_attach = "10.0.0.1:25100"
-    with pytest.raises(ValueError, match="require lwd_config.path"):
-        run()
-    resolver.assert_not_called()
+def test_no_frontend_cli_flags_remain() -> None:
+    """The frontend endpoints live in the topology yaml: EngineArgs no
+    longer carries the retired --api-server-* command-line fields."""
+    source = (
+        Path(__file__).resolve().parents[3] / "vllm" / "engine" / "arg_utils.py"
+    ).read_text(encoding="utf-8")
+    cls = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.ClassDef) and node.name == "EngineArgs"
+    )
+    fields = {
+        node.target.id
+        for node in cls.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert "api_server_rpc_port" not in fields
+    assert "api_server_attach" not in fields
 
 
 def test_snapshot_survives_handoff_without_yaml_or_key_access(
@@ -172,9 +177,6 @@ def test_snapshot_survives_handoff_without_yaml_or_key_access(
 @pytest.mark.parametrize("raw", [{}, {"enable_cpu_binding": True}, None])
 def test_absent_lwd_leaves_centralized_configuration_empty(raw: object) -> None:
     assert resolve_lwd_config(raw) is None
-    assert resolve_lwd_config(raw, api=LwdAPIConfig()) is None
-    with pytest.raises(ValueError, match="require lwd_config.path"):
-        resolve_lwd_config(raw, api=LwdAPIConfig(api_server_rpc_port="10.0.0.1:25100"))
 
 
 @pytest.mark.parametrize(
@@ -329,33 +331,41 @@ def test_legacy_coordination_config_fields_are_rejected(field: str) -> None:
         LwdCoordinationConfig.from_dict({"enabled": True, field: value})
 
 
-@pytest.mark.parametrize(
-    "identity,flag", [(0, "--api-server-rpc-port"), (1, "--api-server-attach")]
-)
-def test_api_cli_metadata_survives_snapshot_handoff(
-    tmp_path: Path, identity: int, flag: str, lwd_yaml_dir: Path
+@pytest.mark.parametrize("identity", [0, 1])
+def test_api_from_topology_survives_snapshot_handoff(
+    tmp_path: Path, identity: int
 ) -> None:
-    parser = argparse.ArgumentParser()
-    LwdAPIConfig.add_cli_args(parser)
-    args = parser.parse_args([flag, "10.0.0.1:25100"])
+    """The api view is derived from the topology, not from CLI flags, and
+    survives the pickle handoff to engines/workers unchanged."""
+    endpoint = "10.0.0.1:8100"
     path = tmp_path / "topology.yaml"
-    args.additional_config = {
+    path.write_text(
+        yaml.safe_dump(
+            host_cluster_payload({0: {"rpc_port": endpoint}, 1: {"attach": endpoint}})
+        ),
+        encoding="utf-8",
+    )
+    raw = {
         "lwd_config": {
             "path": str(path),
             "role": "edge",
             "instance_id": identity,
         }
     }
-    # Capturing CLI options does not read YAML; snapshot construction owns that read.
-    api = LwdAPIConfig.from_namespace(args)
-    path.write_bytes((lwd_yaml_dir / "s2_edge_share_2dp.yaml").read_bytes())
-    original = copy.deepcopy(args.additional_config)
-    entry = resolve_lwd_config(args.additional_config, api=api)
+    original = copy.deepcopy(raw)
+    entry = resolve_lwd_config(raw)
+    assert entry is not None
     path.unlink()
     # Only round-trip our own objects, never externally supplied pickle data.
-    received_entry = pickle.loads(pickle.dumps(entry))
-    assert received_entry.api == api
-    assert received_entry.coordination is None
-    assert [c.connection_id.dp_idx for c in received_entry.connections] == [0, 1, 0, 1]
-    assert received_entry.instance_id == identity
-    assert args.additional_config == original
+    received = pickle.loads(pickle.dumps(entry))
+    assert received.api.requested
+    assert received.api.primary == 0
+    if identity == 0:
+        assert received.api.rpc_port == endpoint
+        assert received.api.attach is None
+    else:
+        assert received.api.attach == endpoint
+        assert received.api.rpc_port is None
+    assert received.instance_id == identity
+    assert len(received.connections) == 4  # shared engine owns both edges x 2 clouds
+    assert raw == original

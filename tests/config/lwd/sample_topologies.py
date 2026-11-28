@@ -181,3 +181,63 @@ PAYLOADS: dict[str, dict[str, Any]] = {
 
 def topology_payload(name: str) -> dict[str, Any]:
     return deepcopy(PAYLOADS[name])
+
+
+def host_cluster_payload(
+    api: dict[int, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Host-comm cluster whose edges may declare frontend attach endpoints.
+
+    ``api`` maps an edge id to its ``api`` block; edges left out have no
+    ``api`` block and therefore own an independent engine.
+    """
+    addr = "10.0.0.1"
+    edges: list[dict[str, Any]] = []
+    for identity in range(3):
+        edge: dict[str, Any] = {
+            "id": identity,
+            "dp": [{"dp_idx": 0, "addr": addr}],
+            "coordination": {"enabled": True, "placement_only": True},
+        }
+        if api and identity in api:
+            edge["api"] = api[identity]
+        edges.append(edge)
+    clouds = [
+        {
+            "id": identity,
+            "dp": [
+                {
+                    "dp_idx": 0,
+                    "addr": f"10.1.0.{identity + 1}",
+                    "ctrl_port": 5558,
+                    "data_port": 7000,
+                    "coord_port": 8100 + identity,
+                    "coord_url": f"http://10.1.0.{identity + 1}:{8100 + identity}",
+                }
+            ],
+            "coordination": {"enabled": True, "listen_host": "0.0.0.0"},
+        }
+        for identity in range(2)
+    ]
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": "lwd_cluster",
+            "edges_num": 3,
+            "clouds_num": 2,
+            "data_plane_comm": "host",
+            "data_plane_host": {"down_buffer_size": 32},
+        },
+        "feature_ctrl": {"enable_early_recv": False},
+        "edges": edges,
+        "clouds": clouds,
+        "instance_links": [
+            {"edge": edge, "cloud": cloud} for edge in range(3) for cloud in range(2)
+        ],
+    }
+
+
+def shared_payload() -> dict[str, Any]:
+    return host_cluster_payload(
+        {0: {"rpc_port": "10.0.0.1:8100"}, 1: {"attach": "10.0.0.1:8100"}}
+    )

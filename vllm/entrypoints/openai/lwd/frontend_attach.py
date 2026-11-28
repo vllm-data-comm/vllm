@@ -36,11 +36,11 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
-from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
-from vllm.config.lwd.api import parse_endpoint
+from vllm.config.lwd import resolve_lwd_config
 from vllm.config.lwd.topology import (
     LWD_API_BIND_BASE_PORT_DEFAULT,
     LWD_API_MAX_FRONTENDS,
+    parse_endpoint,
 )
 from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
@@ -85,8 +85,6 @@ _ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
         "port",
         "uds",
         "api_server_count",
-        "api_server_rpc_port",
-        "api_server_attach",
         "additional_config",
         "master_addr",
         "master_port",
@@ -176,14 +174,15 @@ def _additional_config_dict(args: Any) -> dict[str, Any]:
 
 def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
     """Resolve frontend index/count from the same topology used by engines."""
-    api = LwdAPIConfig.from_namespace(args)
+    lwd = resolve_lwd_config(_additional_config_dict(args))
+    if lwd is None:
+        return None
+    api = lwd.api
     if not api.requested:
         return None
     if envs.VLLM_USE_RUST_FRONTEND:
         raise ValueError("[LWD] API attachment supports Python HTTP frontends only")
-    lwd = resolve_lwd_config(_additional_config_dict(args), api=api)
-    assert lwd is not None
-    count = len(lwd.topology.edges)
+    count = len(lwd.topology.engine_members("edge", lwd.instance_id))
     requested_count = getattr(args, "api_server_count", None)
     # The host-comm primary sets the reserved band capacity
     # programmatically (lwd_dispatch_attach_frontend): that value is
@@ -195,10 +194,10 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
     if requested_count is not None and requested_count != count and not capacity_value:
         raise ValueError(
             f"[LWD] --api-server-count ({requested_count}) must equal "
-            f"the edge_share frontend count ({count})"
+            f"the shared edge frontend count ({count})"
         )
-    mode = "primary" if api.api_server_rpc_port is not None else "attach"
-    endpoint = api.api_server_rpc_port or api.api_server_attach
+    mode = "primary" if api.rpc_port is not None else "attach"
+    endpoint = api.rpc_port or api.attach
     assert endpoint is not None
     return FrontendAttachPlan(
         mode=mode,
@@ -329,7 +328,7 @@ def engine_io_addresses(
             f"(deployment.api_bind_base_port={base_port} holds at most "
             f"{LWD_API_MAX_FRONTENDS} frontends)"
         )
-    bind_ip = get_route_ip(parse_endpoint(endpoint, "--api-server-attach")[0])
+    bind_ip = get_route_ip(parse_endpoint(endpoint, "api endpoint")[0])
     engine_io_base = base_port + 2 * client_index
     return (
         get_tcp_uri(bind_ip, engine_io_base),
@@ -398,7 +397,7 @@ class FrontendAttachServer:
         api_bind_base_port: int = LWD_API_BIND_BASE_PORT_DEFAULT,
         expected_attaches: int | None = None,
     ) -> None:
-        host, port = parse_endpoint(endpoint, "--api-server-rpc-port")
+        host, port = parse_endpoint(endpoint, "api endpoint")
         self.endpoint = get_tcp_uri(host, port)
         # Raw "host:port" form: the elastic pre-seed derives every attach
         # frontend's deterministic engine IO addresses from it.
@@ -746,7 +745,7 @@ class FrontendAttachClient:
     """Non-primary frontend's half of the native endpoint barrier."""
 
     def __init__(self, endpoint: str, recv_timeout_s: float | None = None) -> None:
-        host, port = parse_endpoint(endpoint, "--api-server-attach")
+        host, port = parse_endpoint(endpoint, "api endpoint")
         self.main_address = get_tcp_uri(host, port)
         self._ctx = zmq.Context()
         self._socket = make_zmq_socket(
@@ -846,7 +845,7 @@ def create_frontend_registration_server(
     # configured ports must stay out of the band its frontends bind into.
     ports = {
         "api listen": _resolve_listen(args)[1],
-        "registration": parse_endpoint(plan.endpoint, "--api-server-rpc-port")[1],
+        "registration": parse_endpoint(plan.endpoint, "api endpoint")[1],
     }
     for name in ("master_port", "data_parallel_rpc_port"):
         if (value := getattr(args, name, None)) is not None:
@@ -925,7 +924,7 @@ def run_attach_api_server(args: Any) -> None:
             plan.api_bind_base_port,
             {
                 "api listen": _resolve_listen(args)[1],
-                "registration": parse_endpoint(plan.endpoint, "--api-server-attach")[1],
+                "registration": parse_endpoint(plan.endpoint, "api endpoint")[1],
             },
             f"attach frontend {plan.client_index}",
         )
@@ -1038,7 +1037,8 @@ def lwd_dispatch_attach_frontend(args: Any) -> bool:
 def prepare_attach_mode(
     args: Any, num_api_servers: int, is_ray_dp: bool
 ) -> tuple[bool, int, FrontendAttachServer | None]:
-    if getattr(args, "api_server_rpc_port", None) is None:
+    plan = resolve_attach_plan(args)
+    if plan is None or plan.mode != "primary":
         return False, num_api_servers, None
     if is_ray_dp:
         raise ValueError("[LWD] API attachment does not support the Ray DP backend")
